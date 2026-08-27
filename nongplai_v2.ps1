@@ -70,6 +70,8 @@ $script:LogFile   = $null
 $script:OK        = 0
 $script:Total     = 0
 $script:Failed    = New-Object System.Collections.Generic.List[string]
+$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v2.0"
+
 $script:DefenderPolicyValues = $null
 $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
 $script:DryRun = [bool]$DryRun
@@ -206,12 +208,12 @@ function Invoke-Step {
         [int]$Number, [int]$Total, [string]$Description, [scriptblock]$Action
     )
     $label = "[$Number/$Total] $Description"
-    Write-Host $label
+    Write-ProgressBar -Current ($Number - 1) -Total $Total -Label $Description
     Write-Log $label
     try {
         & $Action
     } catch {
-        Write-Host "  ! Step failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        Write-Bad "Step failed: $($_.Exception.Message)"
         Write-Log "  ! Step failed: $($_.Exception.Message)"
     }
     # Save after every step (not just at the very end) so that if the script is
@@ -389,9 +391,9 @@ function Get-ActiveAdapter {
 # ---------------------------------------------------------------------------
 function Invoke-ApplyUltra {
     Clear-Host
-    Write-Host "============================================================"
-    Write-Host "  APPLYING ULTRA PROFILE"
-    Write-Host "============================================================"
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  APPLYING ULTRA PROFILE" -ForegroundColor Magenta
+    Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Registry, services, network, GPU/input tuning for FiveM."
     Write-Host "Defender/Firewall stay ON (folder exclusion only). Update paused for"
@@ -866,9 +868,9 @@ function Invoke-ApplyUltra {
 
     # ---- Verify ----
     Write-Host ""
-    Write-Host "============================================================"
-    Write-Host "  DONE"
-    Write-Host "============================================================"
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  DONE" -ForegroundColor Green
+    Write-Host "============================================================" -ForegroundColor Cyan
     $checks = @(
         { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PowerThrottling' -Name PowerThrottlingOff -EA SilentlyContinue) -ne $null }
         { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FiveM.exe\PerfOptions' -Name CpuPriorityClass -EA SilentlyContinue) -ne $null }
@@ -893,19 +895,22 @@ function Invoke-ApplyUltra {
     for ($i = 0; $i -lt $checks.Count; $i++) {
         try { if (& $checks[$i]) { $ok++ } else { $failed += $names[$i] } } catch { $failed += $names[$i] }
     }
-    Write-Host "Checks passed: $ok/$($checks.Count)"
-    if ($failed.Count -gt 0) { Write-Host ("Not applied: " + ($failed -join ', ') + " - see backup folder or check manually.") }
-    Write-Host "Restart Windows, then test FiveM. Choose Reset if needed."
-    Write-Host "Log saved to: $script:LogFile"
-    Write-Host "============================================================"
+    Write-ProgressBar -Current 39 -Total 39 -Label 'Ultra profile applied'
+    Write-Host ""
+    $passColor = if ($ok -eq $checks.Count) { 'Green' } elseif ($ok -ge ($checks.Count * 0.7)) { 'Yellow' } else { 'Red' }
+    Write-Host "Checks passed: $ok/$($checks.Count)" -ForegroundColor $passColor
+    if ($failed.Count -gt 0) { Write-Warn2 ("Not applied: " + ($failed -join ', ') + " - see backup folder or check manually.") }
+    Write-Info2 "Restart Windows, then test FiveM. Choose Reset if needed."
+    Write-Host "Log saved to: $script:LogFile" -ForegroundColor DarkGray
+    Write-Host "============================================================" -ForegroundColor Cyan
     Write-Log "Apply finished. Checks passed: $ok/$($checks.Count). Not applied: $($failed -join ', ')"
 
     # ---- Auto-help for Defender exclusions that Tamper Protection blocked ----
     if ($script:PendingExclusions.Paths.Count -gt 0 -or $script:PendingExclusions.Processes.Count -gt 0) {
         Write-Host ""
-        Write-Host "============================================================"
-        Write-Host "  DEFENDER EXCLUSIONS NEED ONE MANUAL STEP"
-        Write-Host "============================================================"
+        Write-Host "============================================================" -ForegroundColor Cyan
+        Write-Host "  DEFENDER EXCLUSIONS NEED ONE MANUAL STEP" -ForegroundColor Yellow
+        Write-Host "============================================================" -ForegroundColor Cyan
         $reasons = Get-DefenderBlockReason
         Write-Host "Windows blocked these changes. Likely reason(s) detected on this PC:"
         foreach ($r in $reasons) { Write-Host "  - $r" }
@@ -978,9 +983,9 @@ function Invoke-ApplyUltra {
 # ---------------------------------------------------------------------------
 function Invoke-ResetUltra {
     Clear-Host
-    Write-Host "============================================================"
-    Write-Host "  RESET ULTRA PROFILE"
-    Write-Host "============================================================"
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  RESET ULTRA PROFILE" -ForegroundColor Magenta
+    Write-Host "============================================================" -ForegroundColor Cyan
     $dir = Find-LatestBackup
     if (-not $dir) {
         Write-Host "No backup folder found. Nothing to reset."
@@ -1119,9 +1124,9 @@ function Invoke-ResetUltra {
         Get-ChildItem -Path $desktop -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
     Write-Host ""
-    Write-Host "============================================================"
+    Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "RESET COMPLETE. Restart Windows."
-    Write-Host "============================================================"
+    Write-Host "============================================================" -ForegroundColor Cyan
     Read-Host "Press Enter to continue"
 }
 
@@ -1130,9 +1135,9 @@ function Invoke-ResetUltra {
 # ---------------------------------------------------------------------------
 function Invoke-ToggleDefenderRealtime {
     Clear-Host
-    Write-Host "============================================================"
-    Write-Host "  TEMPORARY DEFENDER REAL-TIME PROTECTION TOGGLE"
-    Write-Host "============================================================"
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  TEMPORARY DEFENDER REAL-TIME PROTECTION TOGGLE" -ForegroundColor Magenta
+    Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "This turns real-time protection OFF or ON using Windows' own supported switch"
     Write-Host "(Set-MpPreference). It does NOT uninstall or permanently disable Defender -"
@@ -1195,9 +1200,9 @@ function Invoke-ToggleDefenderRealtime {
 
 function Invoke-RemoveDefenderPolicy {
     Clear-Host
-    Write-Host "============================================================"
-    Write-Host "  REMOVE LEFTOVER DEFENDER MANAGEMENT POLICY (ADVANCED)"
-    Write-Host "============================================================"
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  REMOVE LEFTOVER DEFENDER MANAGEMENT POLICY (ADVANCED)" -ForegroundColor Magenta
+    Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
     $keyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
     if (-not (Test-Path $keyPath)) {
@@ -1281,9 +1286,9 @@ function Invoke-RemoveDefenderPolicy {
 
 function Invoke-HpetToggle {
     Clear-Host
-    Write-Host "============================================================"
-    Write-Host "  HPET TOGGLE - OPTIONAL, NOT PART OF ULTRA"
-    Write-Host "============================================================"
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  HPET TOGGLE - OPTIONAL, NOT PART OF ULTRA" -ForegroundColor Magenta
+    Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Results vary by system. This changes Boot Configuration Data (BCD),"
     Write-Host "not the registry, so Reset does not touch it."
@@ -1310,7 +1315,7 @@ function Invoke-HpetToggle {
 }
 
 # ===========================================================================
-# v2.0 — HARDWARE SCAN ENGINE
+# v2.0 â€” HARDWARE SCAN ENGINE
 # ===========================================================================
 function Get-HwCpu {
     $cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -1453,7 +1458,7 @@ function Show-HardwareSummary {
 }
 
 # ===========================================================================
-# v2.0 — CPU ADAPTIVE DEEP TWEAKS
+# v2.0 â€” CPU ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-CpuAdaptive {
     param([Parameter(Mandatory)]$Cpu)
@@ -1502,7 +1507,7 @@ function Invoke-CpuAdaptive {
 }
 
 # ===========================================================================
-# v2.0 — GPU ADAPTIVE DEEP TWEAKS
+# v2.0 â€” GPU ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-GpuAdaptive {
     param([Parameter(Mandatory)]$GpuList)
@@ -1547,7 +1552,7 @@ function Invoke-GpuAdaptive {
 }
 
 # ===========================================================================
-# v2.0 — RAM ADAPTIVE DEEP TWEAKS
+# v2.0 â€” RAM ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-RamAdaptive {
     param([Parameter(Mandatory)]$Ram)
@@ -1593,7 +1598,7 @@ public class MemUtil2 {
 }
 
 # ===========================================================================
-# v2.0 — STORAGE ADAPTIVE DEEP TWEAKS
+# v2.0 â€” STORAGE ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-StorageAdaptive {
     param([Parameter(Mandatory)]$StorageList)
@@ -1643,7 +1648,7 @@ function Invoke-StorageAdaptive {
 }
 
 # ===========================================================================
-# v2.0 — NETWORK ADAPTIVE DEEP TWEAKS
+# v2.0 â€” NETWORK ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-NetworkAdaptive {
     param([Parameter(Mandatory)]$NicList)
@@ -1699,7 +1704,7 @@ function Invoke-NetworkAdaptive {
 }
 
 # ===========================================================================
-# v2.0 — SMART APPLY (scan -> adaptive apply, with progress bar + DryRun)
+# v2.0 â€” SMART APPLY (scan -> adaptive apply, with progress bar + DryRun)
 # ===========================================================================
 function Invoke-SmartApply {
     Clear-Host
@@ -1825,7 +1830,7 @@ th{background:#161b22} tr:nth-child(even){background:#161b22}
 }
 
 # ===========================================================================
-# v2.0 — DO EVERYTHING (Legacy Apply Ultra + Hardware Scan + Adaptive Deep Tweaks, one shot)
+# v2.0 â€” DO EVERYTHING (Legacy Apply Ultra + Hardware Scan + Adaptive Deep Tweaks, one shot)
 # ===========================================================================
 function Invoke-DoEverything {
     Clear-Host
@@ -1889,24 +1894,36 @@ if ($HpetToggle) {
 :menu while ($true) {
     Clear-Host
     Write-Host ""
-    Write-Host "    _   _                 ____  _       _   ____  _"
-    Write-Host "   | \ | | ___  _ __   __ _|  _ \| | __ _| | / ___|| |__   ___  _ __"
-    Write-Host "   |  \| |/ _ \| '_ \ / _`` | |_) | |/ _`` | | \___ \| '_ \ / _ \| '_ \"
-    Write-Host "   | |\  | (_) | | | | (_| |  __/| | (_| | |  ___) | | | | (_) | |_) |"
-    Write-Host "   |_| \_|\___/|_| |_|\__, |_|   |_|\__,_|_| |____/|_| |_|\___/| .__/"
-    Write-Host "                        |___/                                      |_|"
-    Write-Host "   +--------------------------------------------------------------------------+"
-    Write-Host "   |              N O N G P L A I S H O P   P E R F O R M A N C E             |"
-    Write-Host "   |         Smart Adaptive Tuner v2.0 (Hardware Scan -> Deep Tweak)          |"
-    Write-Host "   +--------------------------------------------------------------------------+"
+    Write-Host "    _   _                 ____  _       _   ____  _" -ForegroundColor Cyan
+    Write-Host "   | \ | | ___  _ __   __ _|  _ \| | __ _| | / ___|| |__   ___  _ __" -ForegroundColor Cyan
+    Write-Host "   |  \| |/ _ \| '_ \ / _`` | |_) | |/ _`` | | \___ \| '_ \ / _ \| '_ \" -ForegroundColor Cyan
+    Write-Host "   | |\  | (_) | | | | (_| |  __/| | (_| | |  ___) | | | | (_) | |_) |" -ForegroundColor Cyan
+    Write-Host "   |_| \_|\___/|_| |_|\__, |_|   |_|\__,_|_| |____/|_| |_|\___/| .__/" -ForegroundColor Cyan
+    Write-Host "                        |___/                                      |_|" -ForegroundColor Cyan
+    Write-Host "   +--------------------------------------------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host "   |              " -NoNewline -ForegroundColor DarkCyan
+    Write-Host "N O N G P L A I S H O P   P E R F O R M A N C E" -NoNewline -ForegroundColor White
+    Write-Host "             |" -ForegroundColor DarkCyan
+    Write-Host "   |         " -NoNewline -ForegroundColor DarkCyan
+    Write-Host "Smart Adaptive Tuner v2.0 (Hardware Scan -> Deep Tweak)" -NoNewline -ForegroundColor Green
+    Write-Host "          |" -ForegroundColor DarkCyan
+    Write-Host "   +--------------------------------------------------------------------------+" -ForegroundColor DarkCyan
     if ($script:DryRun) {
         Write-Host "   |  *** DRY RUN MODE ACTIVE - preview only, nothing will be changed ***     |" -ForegroundColor Yellow
+        Write-Host "   +--------------------------------------------------------------------------+" -ForegroundColor DarkCyan
     }
-    Write-Host "   +---------------------------- MENU --------------------------------------+"
-    Write-Host "   |  [1] APPLY EVERYTHING  (scan + all optimizations, CPU/GPU/RAM/SSD/net)  |"
-    Write-Host "   |  [2] RESET ALL                                                          |"
-    Write-Host "   |  [3] Exit                                                                |"
-    Write-Host "   +--------------------------------------------------------------------------+"
+    Write-Host "   +---------------------------- MENU --------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host "   |  " -NoNewline -ForegroundColor DarkCyan
+    Write-Host "[1]" -NoNewline -ForegroundColor Green
+    Write-Host " APPLY EVERYTHING  (scan + all optimizations, CPU/GPU/RAM/SSD/net)  |" -ForegroundColor White
+    Write-Host "   |  " -NoNewline -ForegroundColor DarkCyan
+    Write-Host "[2]" -NoNewline -ForegroundColor Yellow
+    Write-Host " RESET ALL                                                          |" -ForegroundColor White
+    Write-Host "   |  " -NoNewline -ForegroundColor DarkCyan
+    Write-Host "[3]" -NoNewline -ForegroundColor Red
+    Write-Host " Exit                                                                |" -ForegroundColor White
+    Write-Host "   +--------------------------------------------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host ""
     $sel = Read-Host "Select option"
     switch ($sel) {
         '1' { Invoke-DoEverything }
