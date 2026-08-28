@@ -80,19 +80,25 @@ $script:HwInfo = $null
 # ---------------------------------------------------------------------------
 # v2: colored status output + progress bar
 # ---------------------------------------------------------------------------
-function Write-Ok    { param([string]$Message) Write-Host "  [+] $Message"   -ForegroundColor Green }
-function Write-Bad   { param([string]$Message) Write-Host "  [X] $Message"   -ForegroundColor Red }
-function Write-Warn2 { param([string]$Message) Write-Host "  [!] $Message"   -ForegroundColor Yellow }
-function Write-Info2 { param([string]$Message) Write-Host "  [>] $Message"   -ForegroundColor Magenta }
+function Write-Ok    { param([string]$Message) Write-Host "  [OK] $Message"   -ForegroundColor Green }
+function Write-Bad   { param([string]$Message) Write-Host "  [XX] $Message"   -ForegroundColor Red }
+function Write-Warn2 { param([string]$Message) Write-Host "  [!!] $Message"   -ForegroundColor Yellow }
+function Write-Info2 { param([string]$Message) Write-Host "  [->] $Message"   -ForegroundColor Cyan }
 
 function Write-ProgressBar {
     param([int]$Current, [int]$Total, [string]$Label = '')
-    $width = 30
+    $width = 34
     $filled = if ($Total -gt 0) { [int](($Current / $Total) * $width) } else { 0 }
     if ($filled -gt $width) { $filled = $width }
-    $bar = ('#' * $filled) + ('.' * ($width - $filled))
+    $bar = ('#' * $filled) + ('-' * ($width - $filled))
     $pct = if ($Total -gt 0) { [int](($Current / $Total) * 100) } else { 0 }
-    Write-Host ("  [{0}] {1}/{2} ({3}%) {4}" -f $bar, $Current, $Total, $pct, $Label) -ForegroundColor Magenta
+    $barColor = if ($pct -ge 100) { 'Green' } elseif ($pct -ge 50) { 'Cyan' } else { 'Magenta' }
+    Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+    Write-Host $bar -NoNewline -ForegroundColor $barColor
+    Write-Host "] " -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0,3}% " -f $pct) -NoNewline -ForegroundColor White
+    Write-Host ("({0}/{1}) " -f $Current, $Total) -NoNewline -ForegroundColor DarkGray
+    Write-Host $Label -ForegroundColor Magenta
 }
 
 function Write-Log {
@@ -391,9 +397,9 @@ function Get-ActiveAdapter {
 # ---------------------------------------------------------------------------
 function Invoke-ApplyUltra {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  APPLYING ULTRA PROFILE" -ForegroundColor Magenta
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Registry, services, network, GPU/input tuning for FiveM."
     Write-Host "Defender/Firewall stay ON (folder exclusion only). Update paused for"
@@ -878,9 +884,9 @@ function Invoke-ApplyUltra {
 
     # ---- Verify ----
     Write-Host ""
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  DONE" -ForegroundColor Green
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     $checks = @(
         { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PowerThrottling' -Name PowerThrottlingOff -EA SilentlyContinue) -ne $null }
         { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FiveM.exe\PerfOptions' -Name CpuPriorityClass -EA SilentlyContinue) -ne $null }
@@ -912,15 +918,15 @@ function Invoke-ApplyUltra {
     if ($failed.Count -gt 0) { Write-Warn2 ("Not applied: " + ($failed -join ', ') + " - see backup folder or check manually.") }
     Write-Info2 "Restart Windows, then test FiveM. Choose Reset if needed."
     Write-Host "Log saved to: $script:LogFile" -ForegroundColor DarkGray
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Log "Apply finished. Checks passed: $ok/$($checks.Count). Not applied: $($failed -join ', ')"
 
     # ---- Auto-help for Defender exclusions that Tamper Protection blocked ----
     if ($script:PendingExclusions.Paths.Count -gt 0 -or $script:PendingExclusions.Processes.Count -gt 0) {
         Write-Host ""
-        Write-Host "============================================================" -ForegroundColor Cyan
+        Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
         Write-Host "  DEFENDER EXCLUSIONS NEED ONE MANUAL STEP" -ForegroundColor Yellow
-        Write-Host "============================================================" -ForegroundColor Cyan
+        Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
         $reasons = Get-DefenderBlockReason
         Write-Host "Windows blocked these changes. Likely reason(s) detected on this PC:"
         foreach ($r in $reasons) { Write-Host "  - $r" }
@@ -993,9 +999,9 @@ function Invoke-ApplyUltra {
 # ---------------------------------------------------------------------------
 function Invoke-ResetUltra {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  RESET ULTRA PROFILE" -ForegroundColor Magenta
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     $dir = Find-LatestBackup
     if (-not $dir) {
         Write-Host "No backup folder found. Nothing to reset."
@@ -1134,9 +1140,9 @@ function Invoke-ResetUltra {
         Get-ChildItem -Path $desktop -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
     Write-Host ""
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "RESET COMPLETE. Restart Windows."
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Read-Host "Press Enter to continue"
 }
 
@@ -1145,9 +1151,9 @@ function Invoke-ResetUltra {
 # ---------------------------------------------------------------------------
 function Invoke-ToggleDefenderRealtime {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  TEMPORARY DEFENDER REAL-TIME PROTECTION TOGGLE" -ForegroundColor Magenta
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host ""
     Write-Host "This turns real-time protection OFF or ON using Windows' own supported switch"
     Write-Host "(Set-MpPreference). It does NOT uninstall or permanently disable Defender -"
@@ -1210,9 +1216,9 @@ function Invoke-ToggleDefenderRealtime {
 
 function Invoke-RemoveDefenderPolicy {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  REMOVE LEFTOVER DEFENDER MANAGEMENT POLICY (ADVANCED)" -ForegroundColor Magenta
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host ""
     $keyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
     if (-not (Test-Path $keyPath)) {
@@ -1296,9 +1302,9 @@ function Invoke-RemoveDefenderPolicy {
 
 function Invoke-HpetToggle {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  HPET TOGGLE - OPTIONAL, NOT PART OF ULTRA" -ForegroundColor Magenta
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Results vary by system. This changes Boot Configuration Data (BCD),"
     Write-Host "not the registry, so Reset does not touch it."
@@ -1938,9 +1944,9 @@ function Invoke-NetworkAdaptive {
 # ===========================================================================
 function Invoke-SmartApply {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  SMART ADAPTIVE TUNER v2.0 - HARDWARE SCAN -> DEEP TWEAK" -ForegroundColor Cyan
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     if ($script:DryRun) {
         Write-Warn2 "DRY RUN MODE - nothing will actually be changed, this is a preview only"
     }
@@ -1994,9 +2000,9 @@ function Invoke-SmartApply {
 
 function Invoke-HardwareScanOnly {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  HARDWARE SCAN ONLY - no changes will be made" -ForegroundColor Cyan
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     $hw = Invoke-HardwareScan
     Show-HardwareSummary -Hw $hw
     Read-Host "Press Enter to continue"
@@ -2004,9 +2010,9 @@ function Invoke-HardwareScanOnly {
 
 function Invoke-ExportReport {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  EXPORT HARDWARE + TWEAK REPORT (HTML)" -ForegroundColor Cyan
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     $hw = if ($script:HwInfo) { $script:HwInfo } else { Invoke-HardwareScan }
     Show-HardwareSummary -Hw $hw
 
@@ -2064,9 +2070,9 @@ th{background:#161b22} tr:nth-child(even){background:#161b22}
 # ===========================================================================
 function Invoke-DoEverything {
     Clear-Host
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  NONGPLAISHOP - APPLY EVERYTHING (Ultra + Adaptive Deep Tweak)" -ForegroundColor Cyan
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     if ($script:DryRun) { Write-Warn2 "DRY RUN MODE - preview only, nothing will actually be changed" }
     Write-Host ""
 
@@ -2075,9 +2081,9 @@ function Invoke-DoEverything {
 
     # --- Part 2: scan this PC's hardware and layer on adaptive CPU/GPU/RAM/Storage/Network tweaks ---
     Write-Host ""
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  HARDWARE SCAN -> ADAPTIVE DEEP TWEAK" -ForegroundColor Cyan
-    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     $hw = Invoke-HardwareScan
     Show-HardwareSummary -Hw $hw
 
@@ -2114,6 +2120,299 @@ function Invoke-DoEverything {
 }
 
 # ---------------------------------------------------------------------------
+# v2: prettier UI primitives - unicode box drawing, auto-padded so nothing
+# ever looks misaligned even if text lengths change later.
+# ---------------------------------------------------------------------------
+$script:BoxWidth = 78   # inner width between the vertical borders
+
+function Write-BoxTop {
+    Write-Host ("   +" + ("=" * $script:BoxWidth) + "+") -ForegroundColor DarkCyan
+}
+function Write-BoxDivider {
+    Write-Host ("   +" + ("-" * $script:BoxWidth) + "+") -ForegroundColor DarkCyan
+}
+function Write-BoxBottom {
+    Write-Host ("   +" + ("=" * $script:BoxWidth) + "+") -ForegroundColor DarkCyan
+}
+function Write-BoxCenter {
+    param([string]$Text, [ConsoleColor]$Color = 'White')
+    $pad = $script:BoxWidth - $Text.Length
+    if ($pad -lt 0) { $pad = 0 }
+    $left = [int][Math]::Floor($pad / 2)
+    $right = $pad - $left
+    Write-Host "   |" -NoNewline -ForegroundColor DarkCyan
+    Write-Host ((" " * $left) + $Text + (" " * $right)) -NoNewline -ForegroundColor $Color
+    Write-Host "|" -ForegroundColor DarkCyan
+}
+function Write-BoxLine {
+    # $Segments: array of @{ Text=''; Color='White' } rendered left to right, then padded/trimmed to width
+    param([Parameter(Mandatory)][array]$Segments, [int]$LeftPad = 2)
+    $plain = (" " * $LeftPad) + (($Segments | ForEach-Object { $_.Text }) -join '')
+    $pad = $script:BoxWidth - $plain.Length
+    if ($pad -lt 0) { $pad = 0 }
+    Write-Host "   |" -NoNewline -ForegroundColor DarkCyan
+    Write-Host (" " * $LeftPad) -NoNewline
+    foreach ($seg in $Segments) {
+        Write-Host $seg.Text -NoNewline -ForegroundColor $seg.Color
+    }
+    Write-Host (" " * $pad) -NoNewline
+    Write-Host "|" -ForegroundColor DarkCyan
+}
+function Write-MenuItem {
+    param([string]$Key, [string]$Label, [string]$Desc = '', [ConsoleColor]$KeyColor = 'Green')
+    $segs = @(
+        @{ Text = " [$Key] "; Color = $KeyColor },
+        @{ Text = $Label; Color = 'White' }
+    )
+    if ($Desc) { $segs += @{ Text = "  - $Desc"; Color = 'DarkGray' } }
+    Write-BoxLine -Segments $segs -LeftPad 1
+}
+
+# ---------------------------------------------------------------------------
+# v2: WPF card-style launcher (replaces the plain console menu)
+# The heavy-lifting functions (Invoke-DoEverything / Invoke-ResetUltra) still
+# run in THIS console window with all their colored Write-Ok/Write-Bad output
+# and Read-Host pauses - the WPF window just picks which one to run, then
+# gets out of the way and lets the console take over, exactly like a launcher.
+# ---------------------------------------------------------------------------
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+
+Add-Type -Name Win32ShowWindow -Namespace NongPlai -MemberDefinition @"
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    public static extern System.IntPtr GetConsoleWindow();
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(System.IntPtr hWnd);
+"@ -ErrorAction SilentlyContinue
+
+function Show-ConsoleWindow {
+    try {
+        $h = [NongPlai.Win32ShowWindow]::GetConsoleWindow()
+        [NongPlai.Win32ShowWindow]::ShowWindow($h, 5) | Out-Null   # SW_SHOW
+        [NongPlai.Win32ShowWindow]::SetForegroundWindow($h) | Out-Null
+    } catch {}
+}
+
+$script:MenuCards = @(
+    [PSCustomObject]@{
+        Key='1'; Glyph='⚡'; Title='APPLY EVERYTHING'; Accent='#F2C94C'
+        Desc='สแกนฮาร์ดแวร์เครื่องนี้ (CPU/GPU/RAM/SSD/เน็ต) แล้วปรับจูนทุกอย่างให้เหมาะกับสเปกที่ตรวจเจอโดยอัตโนมัติ ปลอดภัย ย้อนกลับได้เสมอ'
+    },
+    [PSCustomObject]@{
+        Key='2'; Glyph='↺'; Title='RESET ALL'; Accent='#56CCF2'
+        Desc='คืนค่าทุกอย่างที่เครื่องมือนี้เคยปรับกลับไปเป็นค่าเดิมทั้งหมด โดยอ่านจาก backup ล่าสุดที่บันทึกไว้อัตโนมัติทุกครั้งที่กด Apply'
+    },
+    [PSCustomObject]@{
+        Key='3'; Glyph='✕'; Title='EXIT'; Accent='#EB5757'
+        Desc='ปิดโปรแกรม NongPlaiShop Smart Adaptive Tuner โดยไม่ทำการเปลี่ยนแปลงใด ๆ เพิ่มเติม'
+    }
+)
+
+function Show-MainMenuWpf {
+    $lastBackup = Find-LatestBackup
+    $dryTxt = if ($script:DryRun) { 'DRY RUN: ON' } else { 'DRY RUN: OFF' }
+    $bkTxt  = if ($lastBackup) { 'Backup ล่าสุด: ' + (Split-Path $lastBackup -Leaf) } else { 'Backup ล่าสุด: ไม่พบ' }
+
+    [xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="NongPlaiShop" Height="640" Width="960"
+        WindowStartupLocation="CenterScreen" WindowStyle="None"
+        ResizeMode="NoResize" Background="Transparent" AllowsTransparency="True">
+  <Border CornerRadius="16" Background="#0A0A0D" BorderBrush="#242428" BorderThickness="1" ClipToBounds="True">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="52"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="150"/>
+        <RowDefinition Height="72"/>
+      </Grid.RowDefinitions>
+
+      <!-- decorative diagonal streaks in the background, like the reference art -->
+      <Canvas>
+        <Line X1="80"  Y1="0" X2="30"  Y2="640" Stroke="#14FFFFFF" StrokeThickness="1"/>
+        <Line X1="180" Y1="0" X2="120" Y2="640" Stroke="#0FFFFFFF" StrokeThickness="1"/>
+        <Line X1="760" Y1="0" X2="700" Y2="640" Stroke="#0FFFFFFF" StrokeThickness="1"/>
+        <Line X1="880" Y1="0" X2="830" Y2="640" Stroke="#14FFFFFF" StrokeThickness="1"/>
+      </Canvas>
+
+      <!-- Top bar -->
+      <Grid Grid.Row="0" Name="TopBar" Background="#0F0F12">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="60"/>
+        </Grid.ColumnDefinitions>
+        <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="20,0,0,0">
+          <TextBlock Text="⚡" FontSize="16" Foreground="#F2C94C" VerticalAlignment="Center"/>
+          <TextBlock Text="NongPlaiShop" Foreground="White" FontSize="15" FontWeight="Bold" Margin="8,0,0,0" VerticalAlignment="Center"/>
+        </StackPanel>
+        <TextBlock Grid.Column="1" Name="StatusText" Text="$dryTxt   |   $bkTxt" Foreground="#7d7d82" FontSize="11"
+                   VerticalAlignment="Center" Margin="0,0,20,0"/>
+        <Button Grid.Column="2" Name="CloseBtn" Content="✕" Width="40" Height="40" Background="Transparent"
+                Foreground="#7d7d82" BorderThickness="0" FontSize="14" Cursor="Hand"/>
+      </Grid>
+
+      <!-- Fanned card stage -->
+      <Grid Grid.Row="1">
+        <Border Name="Card0" Width="240" Height="290" CornerRadius="12" BorderThickness="0" Cursor="Hand"
+                HorizontalAlignment="Center" VerticalAlignment="Center">
+          <Border.Effect><DropShadowEffect Color="Black" BlurRadius="30" ShadowDepth="6" Opacity="0.6"/></Border.Effect>
+          <Border CornerRadius="12">
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Color="#3A2E13" Offset="0"/>
+                <GradientStop Color="#161318" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.Background>
+            <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+              <TextBlock Name="Glyph0" Text="⚡" FontSize="60" HorizontalAlignment="Center" Foreground="#F2C94C"/>
+              <TextBlock Text="APPLY" FontSize="18" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+              <TextBlock Text="EVERYTHING" FontSize="18" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center"/>
+            </StackPanel>
+          </Border>
+        </Border>
+        <Border Name="Card1" Width="240" Height="290" CornerRadius="12" BorderThickness="0" Cursor="Hand"
+                HorizontalAlignment="Center" VerticalAlignment="Center">
+          <Border.Effect><DropShadowEffect Color="Black" BlurRadius="30" ShadowDepth="6" Opacity="0.6"/></Border.Effect>
+          <Border CornerRadius="12">
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Color="#123A3E" Offset="0"/>
+                <GradientStop Color="#161318" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.Background>
+            <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+              <TextBlock Name="Glyph1" Text="↺" FontSize="60" HorizontalAlignment="Center" Foreground="#56CCF2"/>
+              <TextBlock Text="RESET ALL" FontSize="18" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+            </StackPanel>
+          </Border>
+        </Border>
+        <Border Name="Card2" Width="240" Height="290" CornerRadius="12" BorderThickness="0" Cursor="Hand"
+                HorizontalAlignment="Center" VerticalAlignment="Center">
+          <Border.Effect><DropShadowEffect Color="Black" BlurRadius="30" ShadowDepth="6" Opacity="0.6"/></Border.Effect>
+          <Border CornerRadius="12">
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Color="#3A1414" Offset="0"/>
+                <GradientStop Color="#161318" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.Background>
+            <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+              <TextBlock Name="Glyph2" Text="✕" FontSize="60" HorizontalAlignment="Center" Foreground="#EB5757"/>
+              <TextBlock Text="EXIT" FontSize="18" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+            </StackPanel>
+          </Border>
+        </Border>
+
+        <!-- fixed corner-bracket "viewfinder" frame that always frames whichever card is in front -->
+        <Grid Name="Bracket" Width="256" Height="306" HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False">
+          <Path Data="M0,26 L0,0 L26,0" Stroke="#F2C94C" StrokeThickness="3" HorizontalAlignment="Left" VerticalAlignment="Top"/>
+          <Path Data="M0,26 L0,0 L26,0" Stroke="#F2C94C" StrokeThickness="3" HorizontalAlignment="Right" VerticalAlignment="Top">
+            <Path.RenderTransform><ScaleTransform ScaleX="-1"/></Path.RenderTransform>
+          </Path>
+          <Path Data="M0,26 L0,0 L26,0" Stroke="#F2C94C" StrokeThickness="3" HorizontalAlignment="Left" VerticalAlignment="Bottom">
+            <Path.RenderTransform><ScaleTransform ScaleY="-1"/></Path.RenderTransform>
+          </Path>
+          <Path Data="M0,26 L0,0 L26,0" Stroke="#F2C94C" StrokeThickness="3" HorizontalAlignment="Right" VerticalAlignment="Bottom">
+            <Path.RenderTransform><ScaleTransform ScaleX="-1" ScaleY="-1"/></Path.RenderTransform>
+          </Path>
+        </Grid>
+
+        <!-- big title behind cards, like "LOW" in the reference -->
+        <TextBlock Name="BigTitle" Text="APPLY" FontSize="46" FontWeight="Bold" Foreground="#14FFFFFF"
+                   HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,-6" Panel.ZIndex="-1"/>
+      </Grid>
+
+      <!-- Description panel -->
+      <StackPanel Grid.Row="2" Margin="34,10,34,0">
+        <TextBlock Name="DescTitle" Text="APPLY EVERYTHING" Foreground="#F2C94C" FontSize="19" FontWeight="Bold"/>
+        <TextBlock Name="DescBody" TextWrapping="Wrap" Foreground="#c9c9cc" FontSize="13" Margin="0,8,0,0"/>
+      </StackPanel>
+
+      <!-- Bottom bar -->
+      <Grid Grid.Row="3" Margin="34,0,34,20">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <StackPanel Grid.Column="0" Orientation="Horizontal">
+          <Button Name="CycleLeftBtn" Content="◂" Width="42" Height="42" Background="#1c1c20" Foreground="White"
+                  FontSize="16" BorderThickness="0" Cursor="Hand" Margin="0,0,8,0"/>
+          <Button Name="RunBtn" Content="RUN ▸" Width="170" Height="42"
+                  Background="#F2C94C" Foreground="#111114" FontWeight="Bold" FontSize="14" BorderThickness="0" Cursor="Hand"/>
+          <Button Name="CycleRightBtn" Content="▸" Width="42" Height="42" Background="#1c1c20" Foreground="White"
+                  FontSize="16" BorderThickness="0" Cursor="Hand" Margin="8,0,0,0"/>
+        </StackPanel>
+        <TextBlock Grid.Column="1" Text="NongPlaiShop · Smart Adaptive Tuner v2.0"
+                   Foreground="#4a4a4e" FontSize="11" VerticalAlignment="Center" HorizontalAlignment="Right"/>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+"@
+    $reader = New-Object System.Xml.XmlNodeReader $xaml
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+
+    $cards = @($window.FindName('Card0'), $window.FindName('Card1'), $window.FindName('Card2'))
+    $descTitle = $window.FindName('DescTitle')
+    $descBody  = $window.FindName('DescBody')
+    $bigTitle  = $window.FindName('BigTitle')
+    $runBtn    = $window.FindName('RunBtn')
+    $closeBtn  = $window.FindName('CloseBtn')
+    $topBar    = $window.FindName('TopBar')
+    $leftBtn   = $window.FindName('CycleLeftBtn')
+    $rightBtn  = $window.FindName('CycleRightBtn')
+
+    $script:GuiSelectedIndex = 0
+    $script:GuiResult = $null
+    $bc = New-Object Windows.Media.BrushConverter
+
+    function Set-CardSlot {
+        param($Card, [double]$X, [double]$Rotate, [double]$Scale, [double]$Opacity, [int]$Z)
+        $grp = New-Object Windows.Media.TransformGroup
+        $grp.Children.Add((New-Object Windows.Media.ScaleTransform $Scale, $Scale))
+        $grp.Children.Add((New-Object Windows.Media.RotateTransform $Rotate))
+        $grp.Children.Add((New-Object Windows.Media.TranslateTransform $X, 0))
+        $Card.RenderTransformOrigin = '0.5,0.5'
+        $Card.RenderTransform = $grp
+        $Card.Opacity = $Opacity
+        [Windows.Controls.Panel]::SetZIndex($Card, $Z)
+    }
+
+    function Update-CardSelection {
+        $n = $cards.Count
+        $sel = $script:GuiSelectedIndex
+        $leftIdx  = ($sel - 1 + $n) % $n
+        $rightIdx = ($sel + 1) % $n
+        Set-CardSlot $cards[$leftIdx]  -220 -10 0.82 0.5 1
+        Set-CardSlot $cards[$sel]        0   0  1.0  1.0 10
+        Set-CardSlot $cards[$rightIdx]  220  10 0.82 0.5 1
+
+        $m = $script:MenuCards[$sel]
+        $descTitle.Text = $m.Title
+        $descTitle.Foreground = $bc.ConvertFromString($m.Accent)
+        $descBody.Text = $m.Desc
+        $bigTitle.Text = $m.Title.Split(' ')[0]
+    }
+
+    for ($i = 0; $i -lt $cards.Count; $i++) {
+        $idx = $i
+        $cards[$i].Add_MouseLeftButtonUp({ $script:GuiSelectedIndex = $idx; Update-CardSelection }.GetNewClosure())
+    }
+    $leftBtn.Add_Click({ $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection })
+    $rightBtn.Add_Click({ $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection })
+    $runBtn.Add_Click({ $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key; $window.Close() })
+    $closeBtn.Add_Click({ $script:GuiResult = '3'; $window.Close() })
+    $topBar.Add_MouseLeftButtonDown({ try { $window.DragMove() } catch {} })
+
+    Update-CardSelection
+    $window.ShowDialog() | Out-Null
+    return $script:GuiResult
+}
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if ($HpetToggle) {
@@ -2121,45 +2420,15 @@ if ($HpetToggle) {
     exit 0
 }
 
+
 :menu while ($true) {
-    Clear-Host
-    Write-Host ""
-    Write-Host "    _   _                 ____  _       _   ____  _" -ForegroundColor Cyan
-    Write-Host "   | \ | | ___  _ __   __ _|  _ \| | __ _| | / ___|| |__   ___  _ __" -ForegroundColor Cyan
-    Write-Host "   |  \| |/ _ \| '_ \ / _`` | |_) | |/ _`` | | \___ \| '_ \ / _ \| '_ \" -ForegroundColor Cyan
-    Write-Host "   | |\  | (_) | | | | (_| |  __/| | (_| | |  ___) | | | | (_) | |_) |" -ForegroundColor Cyan
-    Write-Host "   |_| \_|\___/|_| |_|\__, |_|   |_|\__,_|_| |____/|_| |_|\___/| .__/" -ForegroundColor Cyan
-    Write-Host "                        |___/                                      |_|" -ForegroundColor Cyan
-    Write-Host "   +--------------------------------------------------------------------------+" -ForegroundColor DarkCyan
-    Write-Host "   |              " -NoNewline -ForegroundColor DarkCyan
-    Write-Host "N O N G P L A I S H O P   P E R F O R M A N C E" -NoNewline -ForegroundColor White
-    Write-Host "             |" -ForegroundColor DarkCyan
-    Write-Host "   |         " -NoNewline -ForegroundColor DarkCyan
-    Write-Host "Smart Adaptive Tuner v2.0 (Hardware Scan -> Deep Tweak)" -NoNewline -ForegroundColor Green
-    Write-Host "          |" -ForegroundColor DarkCyan
-    Write-Host "   +--------------------------------------------------------------------------+" -ForegroundColor DarkCyan
-    if ($script:DryRun) {
-        Write-Host "   |  *** DRY RUN MODE ACTIVE - preview only, nothing will be changed ***     |" -ForegroundColor Yellow
-        Write-Host "   +--------------------------------------------------------------------------+" -ForegroundColor DarkCyan
-    }
-    Write-Host "   +---------------------------- MENU --------------------------------------+" -ForegroundColor DarkCyan
-    Write-Host "   |  " -NoNewline -ForegroundColor DarkCyan
-    Write-Host "[1]" -NoNewline -ForegroundColor Green
-    Write-Host " APPLY EVERYTHING  (scan + all optimizations, CPU/GPU/RAM/SSD/net)  |" -ForegroundColor White
-    Write-Host "   |  " -NoNewline -ForegroundColor DarkCyan
-    Write-Host "[2]" -NoNewline -ForegroundColor Yellow
-    Write-Host " RESET ALL                                                          |" -ForegroundColor White
-    Write-Host "   |  " -NoNewline -ForegroundColor DarkCyan
-    Write-Host "[3]" -NoNewline -ForegroundColor Red
-    Write-Host " Exit                                                                |" -ForegroundColor White
-    Write-Host "   +--------------------------------------------------------------------------+" -ForegroundColor DarkCyan
-    Write-Host ""
-    $sel = Read-Host "Select option"
+    $sel = Show-MainMenuWpf
+    Show-ConsoleWindow
     switch ($sel) {
         '1' { Invoke-DoEverything }
         '2' { Invoke-ResetUltra }
         '3' { break menu }
-        default { }
+        default { break menu }
     }
 }
 
