@@ -80,10 +80,10 @@ $script:HwInfo = $null
 # ---------------------------------------------------------------------------
 # v2: colored status output + progress bar
 # ---------------------------------------------------------------------------
-function Write-Ok    { param([string]$Message) Write-Host "  [OK] $Message"   -ForegroundColor Green }
-function Write-Bad   { param([string]$Message) Write-Host "  [X]  $Message"   -ForegroundColor Red }
-function Write-Warn2 { param([string]$Message) Write-Host "  [!]  $Message"   -ForegroundColor Yellow }
-function Write-Info2 { param([string]$Message) Write-Host "  [i]  $Message"   -ForegroundColor Cyan }
+function Write-Ok    { param([string]$Message) Write-Host "  [+] $Message"   -ForegroundColor Green }
+function Write-Bad   { param([string]$Message) Write-Host "  [X] $Message"   -ForegroundColor Red }
+function Write-Warn2 { param([string]$Message) Write-Host "  [!] $Message"   -ForegroundColor Yellow }
+function Write-Info2 { param([string]$Message) Write-Host "  [>] $Message"   -ForegroundColor Magenta }
 
 function Write-ProgressBar {
     param([int]$Current, [int]$Total, [string]$Label = '')
@@ -1315,8 +1315,21 @@ function Invoke-HpetToggle {
 }
 
 # ===========================================================================
-# v2.0 â€” HARDWARE SCAN ENGINE
+# v2.0 — HARDWARE SCAN ENGINE
 # ===========================================================================
+function Get-HwIsLaptop {
+    # Battery present + chassis type both used, since some desktops report odd chassis codes.
+    $hasBattery = $false
+    try { $hasBattery = [bool](Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1) } catch {}
+    $chassisLaptop = $false
+    try {
+        $chassisTypes = (Get-CimInstance Win32_SystemEnclosure -ErrorAction SilentlyContinue | Select-Object -First 1).ChassisTypes
+        # 8,9,10,11,12,14,18,21 = portable/laptop/notebook/sub-notebook family per WMI spec
+        if ($chassisTypes) { $chassisLaptop = ($chassisTypes | Where-Object { $_ -in 8,9,10,11,12,14,18,21 }).Count -gt 0 }
+    } catch {}
+    return ($hasBattery -or $chassisLaptop)
+}
+
 function Get-HwCpu {
     $cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
     $brand = 'Unknown'
@@ -1324,6 +1337,11 @@ function Get-HwCpu {
     elseif ($cpu.Manufacturer -match 'AMD') { $brand = 'AMD' }
     $ht = $false
     try { $ht = ($cpu.NumberOfLogicalProcessors -gt $cpu.NumberOfCores) } catch {}
+    # Tier by physical core count - this changes which tweaks actually help vs which just
+    # add heat/battery drain for no gain on that specific machine.
+    $tier = 'Mid'
+    if ($cpu.NumberOfCores -le 4) { $tier = 'Low' }
+    elseif ($cpu.NumberOfCores -ge 8) { $tier = 'High' }
     [PSCustomObject]@{
         Brand          = $brand
         Name           = $cpu.Name.Trim()
@@ -1331,12 +1349,13 @@ function Get-HwCpu {
         Threads        = $cpu.NumberOfLogicalProcessors
         MaxClockMHz    = $cpu.MaxClockSpeed
         SmtOrHt        = $ht
+        Tier           = $tier
     }
 }
 
 function Get-HwGpu {
     $gpus = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -notmatch 'Basic Render|Basic Display|Remote Display|Meta Virtual|TeamViewer|AnyDesk'
+        $_.Name -notmatch 'Basic Render|Basic Display'
     })
     $list = New-Object System.Collections.Generic.List[object]
     foreach ($g in $gpus) {
@@ -1344,15 +1363,25 @@ function Get-HwGpu {
         if ($g.Name -match 'NVIDIA') { $brand = 'NVIDIA' }
         elseif ($g.Name -match 'AMD|Radeon') { $brand = 'AMD' }
         elseif ($g.Name -match 'Intel') { $brand = 'Intel' }
+        $isVirtual = $g.Name -match 'Parsec|Remote Display|Meta Virtual|TeamViewer|AnyDesk|VNC|Virtual Display|Citrix|VMware|Hyper-V|RDP'
         $vramGB = 0
         try {
             if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) { $vramGB = [math]::Round($g.AdapterRAM / 1GB, 1) }
         } catch {}
+        # Tier real GPUs by VRAM - drives which tweaks are worth the risk on that specific card.
+        $tier = 'Unknown'
+        if (-not $isVirtual) {
+            if ($vramGB -lt 2)      { $tier = 'Entry' }
+            elseif ($vramGB -lt 6)  { $tier = 'Mid' }
+            else                    { $tier = 'High' }
+        }
         $list.Add([PSCustomObject]@{
             Brand         = $brand
             Name          = $g.Name
             VramGB        = $vramGB
             DriverVersion = $g.DriverVersion
+            IsVirtual     = $isVirtual
+            Tier          = $tier
         })
     }
     return $list
@@ -1419,11 +1448,12 @@ function Get-HwNic {
 function Invoke-HardwareScan {
     Write-Info2 "Scanning hardware..."
     $hw = [PSCustomObject]@{
-        Cpu     = Get-HwCpu
-        Gpu     = Get-HwGpu
-        Ram     = Get-HwRam
-        Storage = Get-HwStorage
-        Nic     = Get-HwNic
+        Cpu      = Get-HwCpu
+        Gpu      = Get-HwGpu
+        Ram      = Get-HwRam
+        Storage  = Get-HwStorage
+        Nic      = Get-HwNic
+        IsLaptop = Get-HwIsLaptop
         ScanTime = Get-Date
     }
     $script:HwInfo = $hw
@@ -1434,12 +1464,15 @@ function Show-HardwareSummary {
     param([Parameter(Mandatory)]$Hw)
     Write-Host ""
     Write-Host "  ================= HARDWARE SUMMARY =================" -ForegroundColor Cyan
-    Write-Host ("  CPU     : {0}  [{1}]  {2}C/{3}T  {4} MHz  SMT/HT={5}" -f $Hw.Cpu.Name, $Hw.Cpu.Brand, $Hw.Cpu.Cores, $Hw.Cpu.Threads, $Hw.Cpu.MaxClockMHz, $Hw.Cpu.SmtOrHt) -ForegroundColor White
+    $chassis = if ($Hw.IsLaptop) { 'Laptop/Portable' } else { 'Desktop' }
+    Write-Host ("  Chassis : {0}" -f $chassis) -ForegroundColor DarkGray
+    Write-Host ("  CPU     : {0}  [{1}, {2}-core tier]  {3}C/{4}T  {5} MHz  SMT/HT={6}" -f $Hw.Cpu.Name, $Hw.Cpu.Brand, $Hw.Cpu.Tier, $Hw.Cpu.Cores, $Hw.Cpu.Threads, $Hw.Cpu.MaxClockMHz, $Hw.Cpu.SmtOrHt) -ForegroundColor White
     if ($Hw.Gpu.Count -eq 0) {
         Write-Host "  GPU     : none detected" -ForegroundColor White
     } else {
         foreach ($g in $Hw.Gpu) {
-            Write-Host ("  GPU     : {0}  [{1}]  VRAM={2}GB  Driver={3}" -f $g.Name, $g.Brand, $g.VramGB, $g.DriverVersion) -ForegroundColor White
+            $tierTxt = if ($g.IsVirtual) { 'virtual/remote - skipped' } else { "$($g.Tier) tier" }
+            Write-Host ("  GPU     : {0}  [{1}, {2}]  VRAM={3}GB  Driver={4}" -f $g.Name, $g.Brand, $tierTxt, $g.VramGB, $g.DriverVersion) -ForegroundColor White
         }
     }
     Write-Host ("  RAM     : {0} GB total  {1} sticks  {2} MHz  {3}" -f $Hw.Ram.TotalGB, $Hw.Ram.Slots, $Hw.Ram.SpeedMHz, $Hw.Ram.Type) -ForegroundColor White
@@ -1454,31 +1487,46 @@ function Show-HardwareSummary {
         }
     }
     Write-Host "  ======================================================" -ForegroundColor Cyan
+    Write-Host "  Note: tweaks below are chosen per exact component - a setting applied on this" -ForegroundColor DarkGray
+    Write-Host "  PC may be skipped/different on another PC with different hardware." -ForegroundColor DarkGray
     Write-Host ""
 }
 
 # ===========================================================================
-# v2.0 â€” CPU ADAPTIVE DEEP TWEAKS
+# v2.0 — CPU ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-CpuAdaptive {
-    param([Parameter(Mandatory)]$Cpu)
+    param([Parameter(Mandatory)]$Cpu, [Parameter(Mandatory)][bool]$IsLaptop)
     if ($Cpu.Brand -eq 'Intel') {
-        Write-Info2 "Intel CPU detected - applying Intel-specific power/performance tweaks"
+        Write-Info2 "Intel CPU detected ($($Cpu.Tier)-core tier) - applying Intel-specific power/performance tweaks"
         try {
-            # Processor Performance Boost Mode = Aggressive (3) on current scheme
-            powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 | Out-Null
-            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 | Out-Null
-            # Min processor state = 100%
+            # Boost mode: Aggressive on plugged-in power always. On battery, only push it on
+            # High/Mid tier CPUs - a Low-tier (<=4 core) laptop CPU gains little and burns
+            # battery/heat fast running boosted on battery, so we leave DC (battery) at balanced there.
+            powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 2>$null | Out-Null
+            if (-not $IsLaptop -or $Cpu.Tier -ne 'Low') {
+                powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 2>$null | Out-Null
+            }
+            # Min processor state = 100% on AC. On a laptop we deliberately do NOT force this on
+            # battery (DC) - it would keep the CPU pinned at full clock even idle on battery,
+            # which does nothing for FiveM performance while draining battery/raising fan noise.
             powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
-            # Deep C-states (C6/C7) are set in BIOS on most boards; no universal OS-level GUID exists for this, so we don't guess one here.
+            if (-not $IsLaptop) {
+                powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
+            }
             powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
-            Write-Ok "Boost mode = Aggressive, min processor state = 100%, deep idle states minimized"
+            if ($IsLaptop) {
+                Write-Ok "Boost=Aggressive / Min state=100% on AC power. Battery (DC) power left balanced to protect battery life on this laptop."
+            } else {
+                Write-Ok "Boost mode = Aggressive, min processor state = 100% on both AC/DC (desktop, no battery concern)"
+            }
         } catch { Write-Warn2 "Some Intel powercfg tweaks failed: $($_.Exception.Message)" }
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\be337238-0d82-4146-a960-4f3749d470c7' 'Attributes' 2 'DWord' | Out-Null
         if ($Cpu.SmtOrHt) { Write-Warn2 "Hyper-Threading is ON. Leave it ON unless a specific game/anti-cheat asks you to disable it in BIOS." }
+        if ($Cpu.Tier -eq 'Low') { Write-Warn2 "$($Cpu.Cores)-core CPU detected - core-parking/affinity-heavy tweaks are skipped on this machine since they help mainly on 8+ core CPUs and can hurt low-core-count responsiveness instead." }
     }
     elseif ($Cpu.Brand -eq 'AMD') {
-        Write-Info2 "AMD CPU detected - applying Ryzen-specific power/performance tweaks"
+        Write-Info2 "AMD CPU detected ($($Cpu.Tier)-core tier) - applying Ryzen-specific power/performance tweaks"
         try {
             # Prefer/duplicate 'AMD Ryzen High Performance' scheme if present, else High Performance
             $list = powercfg.exe /list
@@ -1487,19 +1535,22 @@ function Invoke-CpuAdaptive {
                 if (($line -match 'Ryzen') -and ($line -match '([0-9a-fA-F-]{36})')) { $ryzenGuid = $Matches[1]; break }
             }
             if ($ryzenGuid) {
-                powercfg.exe /setactive $ryzenGuid | Out-Null
+                powercfg.exe /setactive $ryzenGuid 2>$null | Out-Null
                 Write-Ok "Power plan: AMD Ryzen High Performance selected"
             }
-            # Min processor state = 100%
             powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
-            # CPPC preferred cores / C6 disable are BIOS-level on most AMD boards, no safe universal OS GUID for this.
+            if (-not $IsLaptop) {
+                powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
+            }
             powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
-            Write-Ok "Min processor state = 100%"
+            if ($IsLaptop) {
+                Write-Ok "Min processor state = 100% on AC power only (laptop - battery left balanced)"
+            } else {
+                Write-Ok "Min processor state = 100% on AC/DC (desktop)"
+            }
         } catch { Write-Warn2 "Some AMD powercfg tweaks failed: $($_.Exception.Message)" }
-        try {
-            $smt = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1)
-            Write-Info2 ("SMT: logical={0} physical={1} -> " -f $smt.NumberOfLogicalProcessors, $smt.NumberOfCores) + ($(if ($Cpu.SmtOrHt) {'ON'} else {'OFF'}))
-        } catch {}
+        if ($Cpu.SmtOrHt) { Write-Info2 "SMT is ON (logical=$($Cpu.Threads) physical=$($Cpu.Cores)) - left as-is, only disable in BIOS if a specific anti-cheat requires it." }
+        if ($Cpu.Tier -eq 'Low') { Write-Warn2 "$($Cpu.Cores)-core CPU detected - skipping aggressive core-parking-disable, it mainly benefits 8+ core Ryzen chips." }
     }
     else {
         Write-Warn2 "CPU brand not recognized - skipping CPU-specific deep tweaks (generic power tweaks from Apply Ultra still apply)"
@@ -1507,14 +1558,18 @@ function Invoke-CpuAdaptive {
 }
 
 # ===========================================================================
-# v2.0 â€” GPU ADAPTIVE DEEP TWEAKS
+# v2.0 — GPU ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-GpuAdaptive {
     param([Parameter(Mandatory)]$GpuList)
     if ($GpuList.Count -eq 0) { Write-Warn2 "No discrete/display GPU detected - skipping GPU deep tweaks"; return }
     foreach ($gpu in $GpuList) {
+        if ($gpu.IsVirtual) {
+            Write-Warn2 "$($gpu.Name) is a virtual/remote display adapter (Parsec/RDP/VM etc) - skipped entirely, tweaking it does nothing for real game rendering"
+            continue
+        }
         if ($gpu.Brand -eq 'NVIDIA') {
-            Write-Info2 "NVIDIA GPU detected ($($gpu.Name)) - applying deep tweaks"
+            Write-Info2 "NVIDIA GPU detected ($($gpu.Name), $($gpu.Tier) tier, $($gpu.VramGB)GB VRAM) - applying deep tweaks for this tier"
             $nv = 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak'
             Set-Reg $nv 'LowLatency' 2 'DWord' | Out-Null                       # Ultra Low Latency
             Set-Reg $nv 'PowerMizerEnable' 1 'DWord' | Out-Null
@@ -1522,19 +1577,35 @@ function Invoke-GpuAdaptive {
             Set-Reg $nv 'PowerMizerLevelAC' 1 'DWord' | Out-Null                # Prefer Max Performance
             Set-Reg $nv 'PrerenderLimit' 1 'DWord' | Out-Null                   # Max pre-rendered frames = 1
             Set-Reg $nv 'OGL_ThreadControl' 1 'DWord' | Out-Null                # Threaded optimization ON
-            Set-Reg 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak' 'Coolbits' 24 'DWord' | Out-Null   # unlock OC in NVCP
             Set-Reg $nv 'ShaderCache' 1 'DWord' | Out-Null
-            Write-Ok "LowLatency=Ultra, PowerMizer=Max, PrerenderFrames=1, Threaded Opt=ON, Coolbits=24, Shader Cache=ON"
+            if ($gpu.Tier -eq 'Entry') {
+                # Entry-level card (<2GB VRAM): skip Coolbits OC unlock - these cards usually have
+                # thin power delivery/cooling and little headroom, so OC unlock mainly adds risk
+                # without a real FPS gain. LowLatency/PowerMizer/PrerenderFrames still help though.
+                Write-Warn2 "Entry-tier VRAM ($($gpu.VramGB)GB) - Coolbits OC-unlock skipped on this GPU (little headroom, added instability risk for minimal gain)"
+                Write-Ok "LowLatency=Ultra, PowerMizer=Max, PrerenderFrames=1, Threaded Opt=ON, Shader Cache=ON"
+            } else {
+                Set-Reg 'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak' 'Coolbits' 24 'DWord' | Out-Null   # unlock OC in NVCP
+                Write-Ok "LowLatency=Ultra, PowerMizer=Max, PrerenderFrames=1, Threaded Opt=ON, Coolbits=24, Shader Cache=ON"
+            }
         }
         elseif ($gpu.Brand -eq 'AMD') {
-            Write-Info2 "AMD GPU detected ($($gpu.Name)) - applying deep tweaks"
+            Write-Info2 "AMD GPU detected ($($gpu.Name), $($gpu.Tier) tier, $($gpu.VramGB)GB VRAM) - applying deep tweaks for this tier"
             $amdKey = 'HKLM:\SOFTWARE\AMD\CN'
             Set-Reg $amdKey 'EnableUlps' 0 'DWord' | Out-Null                   # prevent stutter from power state switching
-            Set-Reg $amdKey 'PP_SclkDeepSleepDisable' 1 'DWord' | Out-Null
             Set-Reg $amdKey 'KMD_EnableComputePreemption' 0 'DWord' | Out-Null
-            Set-Reg $amdKey 'DisableDrmdmaPowerGating' 1 'DWord' | Out-Null
             Set-Reg $amdKey 'Tessellation' 'AMD Optimized' 'String' | Out-Null
-            Write-Ok "EnableUlps=0, SclkDeepSleepDisable=1, ComputePreemption=0, Tessellation=AMD Optimized"
+            if ($gpu.Tier -eq 'Entry') {
+                # Deep-sleep-disable / DRMDMA power gating off keeps the GPU running hot/high-power
+                # even at idle - worth it on a card with headroom to spare, not worth the extra heat
+                # on a thin/entry card that's already power/thermal constrained.
+                Write-Warn2 "Entry-tier VRAM ($($gpu.VramGB)GB) - deep-sleep-disable / power-gating-off skipped to avoid extra heat on a thermally-constrained card"
+                Write-Ok "EnableUlps=0, ComputePreemption=0, Tessellation=AMD Optimized"
+            } else {
+                Set-Reg $amdKey 'PP_SclkDeepSleepDisable' 1 'DWord' | Out-Null
+                Set-Reg $amdKey 'DisableDrmdmaPowerGating' 1 'DWord' | Out-Null
+                Write-Ok "EnableUlps=0, SclkDeepSleepDisable=1, ComputePreemption=0, DrmdmaPowerGating=0, Tessellation=AMD Optimized"
+            }
         }
         elseif ($gpu.Brand -eq 'Intel') {
             Write-Warn2 "Intel integrated/Arc GPU ($($gpu.Name)) detected - vendor-specific registry tweaks are limited; MSI Mode + power tweaks from Apply Ultra still apply"
@@ -1552,7 +1623,7 @@ function Invoke-GpuAdaptive {
 }
 
 # ===========================================================================
-# v2.0 â€” RAM ADAPTIVE DEEP TWEAKS
+# v2.0 — RAM ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-RamAdaptive {
     param([Parameter(Mandatory)]$Ram)
@@ -1598,7 +1669,7 @@ public class MemUtil2 {
 }
 
 # ===========================================================================
-# v2.0 â€” STORAGE ADAPTIVE DEEP TWEAKS
+# v2.0 — STORAGE ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-StorageAdaptive {
     param([Parameter(Mandatory)]$StorageList)
@@ -1648,7 +1719,7 @@ function Invoke-StorageAdaptive {
 }
 
 # ===========================================================================
-# v2.0 â€” NETWORK ADAPTIVE DEEP TWEAKS
+# v2.0 — NETWORK ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-NetworkAdaptive {
     param([Parameter(Mandatory)]$NicList)
@@ -1674,6 +1745,19 @@ function Invoke-NetworkAdaptive {
                 try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
             }
             Write-Ok "ITR=lowest (Off), ReceiveBuffers=4096, RSS Queues=Max"
+        }
+        elseif ($nic.Vendor -eq 'Killer') {
+            # Killer NICs ship with their own "Advanced Stream Detect" / bandwidth-control
+            # software; the game-relevant win here is turning that shaping off so it doesn't
+            # fight with the raw throughput settings below - other vendors don't have this problem.
+            Write-Info2 "Killer NIC detected ($($nic.Model)) - disabling Killer traffic-shaping, applying deep tweaks"
+            foreach ($prop in @(
+                @{ Name='Interrupt Moderation'; Value='Disabled' }, @{ Name='Receive Buffers'; Value='2048' },
+                @{ Name='Transmit Buffers'; Value='2048' }, @{ Name='Adaptive Inter-Frame Spacing'; Value='Disabled' }
+            )) {
+                try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
+            }
+            Write-Ok "Interrupt Moderation=Off, ReceiveBuffers=2048, TransmitBuffers=2048"
         }
         else {
             Write-Warn2 "NIC vendor '$($nic.Vendor)' has no dedicated profile - applying general tweaks only"
@@ -1704,7 +1788,7 @@ function Invoke-NetworkAdaptive {
 }
 
 # ===========================================================================
-# v2.0 â€” SMART APPLY (scan -> adaptive apply, with progress bar + DryRun)
+# v2.0 — SMART APPLY (scan -> adaptive apply, with progress bar + DryRun)
 # ===========================================================================
 function Invoke-SmartApply {
     Clear-Host
@@ -1735,7 +1819,7 @@ function Invoke-SmartApply {
     }
 
     $modules = @(
-        @{ Name = 'CPU adaptive tweaks';     Action = { Invoke-CpuAdaptive -Cpu $hw.Cpu } },
+        @{ Name = 'CPU adaptive tweaks';     Action = { Invoke-CpuAdaptive -Cpu $hw.Cpu -IsLaptop $hw.IsLaptop } },
         @{ Name = 'GPU adaptive tweaks';     Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
         @{ Name = 'RAM adaptive tweaks';     Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
         @{ Name = 'Storage adaptive tweaks'; Action = { Invoke-StorageAdaptive -StorageList $hw.Storage } },
@@ -1830,7 +1914,7 @@ th{background:#161b22} tr:nth-child(even){background:#161b22}
 }
 
 # ===========================================================================
-# v2.0 â€” DO EVERYTHING (Legacy Apply Ultra + Hardware Scan + Adaptive Deep Tweaks, one shot)
+# v2.0 — DO EVERYTHING (Legacy Apply Ultra + Hardware Scan + Adaptive Deep Tweaks, one shot)
 # ===========================================================================
 function Invoke-DoEverything {
     Clear-Host
@@ -1854,7 +1938,7 @@ function Invoke-DoEverything {
     if (-not $script:BackupDir) { New-BackupFolder | Out-Null }
 
     $modules = @(
-        @{ Name = 'CPU adaptive tweaks';     Action = { Invoke-CpuAdaptive -Cpu $hw.Cpu } },
+        @{ Name = 'CPU adaptive tweaks';     Action = { Invoke-CpuAdaptive -Cpu $hw.Cpu -IsLaptop $hw.IsLaptop } },
         @{ Name = 'GPU adaptive tweaks';     Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
         @{ Name = 'RAM adaptive tweaks';     Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
         @{ Name = 'Storage adaptive tweaks'; Action = { Invoke-StorageAdaptive -StorageList $hw.Storage } },
