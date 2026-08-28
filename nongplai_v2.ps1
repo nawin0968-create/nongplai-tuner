@@ -491,8 +491,15 @@ function Invoke-ApplyUltra {
                 }
             }
         } catch {}
-        try { netsh.exe int tcp set global autotuninglevel=normal | Out-Null } catch {}
+        try { netsh.exe int tcp set global autotuninglevel=experimental | Out-Null } catch {}
         try { netsh.exe int tcp set global congestionprovider=ctcp | Out-Null } catch {}
+        try { netsh.exe int tcp set global ecncapability=disabled | Out-Null } catch {}
+        try { netsh.exe int tcp set global timestamps=disabled | Out-Null } catch {}
+        try { netsh.exe int tcp set global rsc=disabled | Out-Null } catch {}
+        try { netsh.exe int tcp set global fastopen=enabled | Out-Null } catch {}
+        try { netsh.exe int tcp set global fastopenfallback=enabled | Out-Null } catch {}
+        try { netsh.exe int tcp set supplemental template=internet icw=10 | Out-Null } catch {}
+        try { netsh.exe int tcp set heuristics disabled | Out-Null } catch {}
         try {
             Remove-NetQosPolicy -Name "FiveMUltraQoS" -Confirm:$false -ErrorAction SilentlyContinue
             New-NetQosPolicy -Name "FiveMUltraQoS" -AppPathNameMatchCondition "FiveM.exe" -DSCPAction 46 -NetworkProfile All -ErrorAction Stop | Out-Null
@@ -723,7 +730,10 @@ function Invoke-ApplyUltra {
     Invoke-Step (++$n) $Total "Tuning TCP ephemeral port range and TIME_WAIT delay..." {
         # Reduces socket exhaustion / port reuse stalls, which show up as periodic connection hitching.
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'MaxUserPort' 65534 'DWord' | Out-Null
-        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'TcpTimedWaitDelay' 30 'DWord' | Out-Null
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'TcpTimedWaitDelay' 10 'DWord' | Out-Null
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'MaxFreeTcbs' 65535 'DWord' | Out-Null
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'MaxHashTableSize' 65536 'DWord' | Out-Null
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'TcpMaxDataRetransmissions' 3 'DWord' | Out-Null
     }
 
     Invoke-Step (++$n) $Total "Extra Nagle/ACK tuning (TcpDelAckTicks) on active interfaces..." {
@@ -1842,11 +1852,12 @@ function Invoke-NetworkAdaptive {
         # adding real latency even though throughput looks fine). On a fast wired link there's
         # enough headroom that bigger buffers mainly help avoid drops, not add delay. So the
         # SAME vendor gets smaller buffers on a slow/Wi-Fi link and bigger ones on a fast wired link.
-        $bufMult = switch ($nic.SpeedTier) { 'Slow' { 0.5 }; 'Fast' { 1.5 }; default { 1.0 } }
-        if ($nic.IsWireless -and $bufMult -gt 1.0) { $bufMult = 1.0 }   # never oversize buffers on Wi-Fi even if link reports "fast"
+        $bufMult = switch ($nic.SpeedTier) { 'Slow' { 0.75 }; 'Fast' { 2.0 }; default { 1.5 } }
+        if ($nic.IsWireless -and $bufMult -gt 1.25) { $bufMult = 1.25 }   # cap oversizing on Wi-Fi even if link reports "fast"
 
         if ($nic.Vendor -eq 'Realtek') {
-            $rx = [int](512 * $bufMult); $tx = [int](512 * $bufMult)
+            $rx = [int](1024 * $bufMult); $tx = [int](1024 * $bufMult)
+            if ($rx -gt 4096) { $rx = 4096 }; if ($tx -gt 4096) { $tx = 4096 }
             Write-Info2 "Realtek NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - applying Realtek deep tweaks scaled for this link"
             foreach ($prop in @(
                 @{ Name='Receive Buffers'; Value="$rx" }, @{ Name='Transmit Buffers'; Value="$tx" },
@@ -1857,7 +1868,8 @@ function Invoke-NetworkAdaptive {
             Write-Ok "ReceiveBuffers=$rx, TransmitBuffers=$tx (scaled for $($nic.SpeedTier)-tier link), SpeedDuplex=Auto, Interrupt Moderation=Disabled"
         }
         elseif ($nic.Vendor -eq 'Intel') {
-            $rx = [int](4096 * $bufMult)
+            $rx = [int](8192 * $bufMult)
+            if ($rx -gt 16384) { $rx = 16384 }
             Write-Info2 "Intel NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - applying Intel deep tweaks scaled for this link"
             foreach ($prop in @(
                 @{ Name='Interrupt Moderation Rate'; Value='Off' }, @{ Name='Receive Buffers'; Value="$rx" },
@@ -1868,7 +1880,8 @@ function Invoke-NetworkAdaptive {
             Write-Ok "ITR=lowest (Off), ReceiveBuffers=$rx (scaled for $($nic.SpeedTier)-tier link), RSS Queues=Max"
         }
         elseif ($nic.Vendor -eq 'Killer') {
-            $rx = [int](2048 * $bufMult); $tx = [int](2048 * $bufMult)
+            $rx = [int](4096 * $bufMult); $tx = [int](4096 * $bufMult)
+            if ($rx -gt 8192) { $rx = 8192 }; if ($tx -gt 8192) { $tx = 8192 }
             # Killer NICs ship with their own "Advanced Stream Detect" / bandwidth-control
             # software; the game-relevant win here is turning that shaping off so it doesn't
             # fight with the raw throughput settings below - other vendors don't have this problem.
@@ -1912,7 +1925,12 @@ function Invoke-NetworkAdaptive {
     }
     try { netsh.exe int tcp set global rss=enabled | Out-Null } catch {}
     try { netsh.exe int tcp set global ecncapability=disabled | Out-Null } catch {}
-    Write-Ok "Global: RSS=ON, ECN=Off"
+    try { netsh.exe int tcp set global autotuninglevel=experimental | Out-Null } catch {}
+    try { netsh.exe int tcp set global timestamps=disabled | Out-Null } catch {}
+    try { netsh.exe int tcp set global rsc=disabled | Out-Null } catch {}
+    try { netsh.exe int tcp set global fastopen=enabled | Out-Null } catch {}
+    try { netsh.exe int tcp set supplemental template=internet icw=10 | Out-Null } catch {}
+    Write-Ok "Global: RSS=ON, ECN=Off, AutoTuning=Experimental, Timestamps=Off, RSC=Off, TCP Fast Open=On, ICW=10"
 }
 
 # ===========================================================================
