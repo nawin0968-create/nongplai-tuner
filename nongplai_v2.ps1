@@ -1332,6 +1332,7 @@ function Get-HwIsLaptop {
 
 function Get-HwCpu {
     $cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+    $name = $cpu.Name.Trim()
     $brand = 'Unknown'
     if ($cpu.Manufacturer -match 'Intel') { $brand = 'Intel' }
     elseif ($cpu.Manufacturer -match 'AMD') { $brand = 'AMD' }
@@ -1342,14 +1343,46 @@ function Get-HwCpu {
     $tier = 'Mid'
     if ($cpu.NumberOfCores -le 4) { $tier = 'Low' }
     elseif ($cpu.NumberOfCores -ge 8) { $tier = 'High' }
+
+    # Model-specific parsing so two CPUs of the SAME brand still get different tweaks -
+    # an unlocked i9-13900K and a locked i3-12100 are both "Intel" but should not be tuned the same.
+    $generation = 0
+    $unlocked   = $false     # Intel K/KF/KS (unlocked multiplier), AMD non-G "X"/no-suffix desktop parts
+    $hybrid     = $false     # Intel 12th gen+ Performance+Efficient core design
+    $isX3D      = $false     # AMD 3D V-Cache part - responds very differently to boost/OC tweaks
+    $isApu      = $false     # AMD "G" suffix / Intel "with Radeon/UHD Graphics"-only laptop chip - no room to assume a discrete-GPU cooling budget
+
+    if ($brand -eq 'Intel') {
+        if ($name -match '(?:Core\(TM\)\s*[iI][3579]|Core\s*[iI][3579]|Ultra\s*[579])[- ](\d{4,5})([A-Z]{0,3})') {
+            $modelNum = $Matches[1]; $suffix = $Matches[2]
+            $generation = [int]($modelNum.Substring(0, $modelNum.Length - 3))
+            if ($suffix -match 'K|KS|KF|X') { $unlocked = $true }
+        }
+        if ($generation -ge 12) { $hybrid = $true }
+    }
+    elseif ($brand -eq 'AMD') {
+        if ($name -match 'Ryzen\s*[3579]\s*(\d{3,4})([A-Z]{0,3})') {
+            $modelNum = $Matches[1]; $suffix = $Matches[2]
+            $generation = [int]$modelNum.Substring(0,1)   # Ryzen series digit: 3000/5000/7000/9000 -> 3/5/7/9
+            if ($suffix -match 'X(?!3D)|XT') { $unlocked = $true }
+            if ($suffix -match 'G') { $isApu = $true }
+        }
+        if ($name -match 'X3D') { $isX3D = $true; $unlocked = $false }
+    }
+
     [PSCustomObject]@{
         Brand          = $brand
-        Name           = $cpu.Name.Trim()
+        Name           = $name
         Cores          = $cpu.NumberOfCores
         Threads        = $cpu.NumberOfLogicalProcessors
         MaxClockMHz    = $cpu.MaxClockSpeed
         SmtOrHt        = $ht
         Tier           = $tier
+        Generation     = $generation
+        Unlocked       = $unlocked
+        Hybrid         = $hybrid
+        IsX3D          = $isX3D
+        IsApu          = $isApu
     }
 }
 
@@ -1398,16 +1431,39 @@ function Get-HwRam {
         $smbiosType = ($sticks | Select-Object -First 1).SMBIOSMemoryType
         switch ($smbiosType) { 26 { $type = 'DDR4' } 34 { $type = 'DDR5' } 24 { $type = 'DDR3' } default { $type = "Type $smbiosType" } }
     } catch {}
+    # Channel config: 2+ sticks of matching capacity = likely dual/multi-channel (real bandwidth
+    # difference vs a single stick - single-channel is the #1 silent FPS killer on many PCs).
+    $channelConfig = 'Single-channel'
+    if ($slots -ge 2) {
+        $caps = $sticks | ForEach-Object { $_.Capacity } | Sort-Object -Unique
+        $channelConfig = if ($caps.Count -le 1) { 'Dual/Multi-channel (matched sticks)' } else { 'Mismatched capacity - may fall back to single-channel-like bandwidth' }
+    }
+    # Speed tier drives how hard it's worth pushing IoPageLockLimit/standby-list aggressiveness.
+    $speedTier = 'Mid'
+    if ($speed -gt 0 -and $speed -lt 2667) { $speedTier = 'Slow' }
+    elseif ($speed -ge 3600) { $speedTier = 'Fast' }
     [PSCustomObject]@{
-        TotalGB = $totalGB
-        Slots   = $slots
-        SpeedMHz = $speed
-        Type    = $type
+        TotalGB       = $totalGB
+        Slots         = $slots
+        SpeedMHz      = $speed
+        Type          = $type
+        ChannelConfig = $channelConfig
+        SpeedTier     = $speedTier
     }
 }
 
 function Get-HwStorage {
     $disks = @(Get-PhysicalDisk -ErrorAction SilentlyContinue)
+    $volumesByDisk = @{}
+    try {
+        Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter } | ForEach-Object {
+            $vol = Get-Volume -Partition $_ -ErrorAction SilentlyContinue
+            if ($vol) {
+                if (-not $volumesByDisk.ContainsKey($_.DiskNumber)) { $volumesByDisk[$_.DiskNumber] = New-Object System.Collections.Generic.List[object] }
+                $volumesByDisk[$_.DiskNumber].Add($vol)
+            }
+        }
+    } catch {}
     $list = New-Object System.Collections.Generic.List[object]
     foreach ($d in $disks) {
         $kind = 'HDD'
@@ -1415,11 +1471,24 @@ function Get-HwStorage {
         elseif ($d.MediaType -eq 'SSD') { $kind = 'SATA SSD' }
         elseif ($d.MediaType -eq 'HDD') { $kind = 'HDD' }
         $sizeGB = [math]::Round($d.Size / 1GB, 0)
+        $freePctMin = 100
+        try {
+            $vols = $volumesByDisk[[int]$d.DeviceId]
+            if ($vols) {
+                foreach ($v in $vols) {
+                    if ($v.Size -gt 0) {
+                        $pct = [math]::Round(($v.SizeRemaining / $v.Size) * 100, 0)
+                        if ($pct -lt $freePctMin) { $freePctMin = $pct }
+                    }
+                }
+            }
+        } catch {}
         $list.Add([PSCustomObject]@{
-            FriendlyName = $d.FriendlyName
-            Kind         = $kind
-            SizeGB       = $sizeGB
-            BusType      = $d.BusType
+            FriendlyName  = $d.FriendlyName
+            Kind          = $kind
+            SizeGB        = $sizeGB
+            BusType       = $d.BusType
+            FreePercent   = $freePctMin
         })
     }
     return $list
@@ -1434,11 +1503,26 @@ function Get-HwNic {
         elseif ($a.InterfaceDescription -match 'Intel') { $vendor = 'Intel' }
         elseif ($a.InterfaceDescription -match 'Killer') { $vendor = 'Killer' }
         elseif ($a.InterfaceDescription -match 'Broadcom') { $vendor = 'Broadcom' }
+        $isWireless = ($a.PhysicalMediaType -match 'Native 802.11|Wireless' -or $a.InterfaceDescription -match 'Wi-?Fi|Wireless|802\.11')
+        # Parse the numeric link speed (e.g. "866.7 Mbps", "1 Gbps", "2.5 Gbps") into Mbps for tiering.
+        $linkMbps = 0
+        try {
+            if ($a.LinkSpeed -match '([\d\.]+)\s*(Gbps|Mbps)') {
+                $val = [double]$Matches[1]
+                $linkMbps = if ($Matches[2] -eq 'Gbps') { $val * 1000 } else { $val }
+            }
+        } catch {}
+        $speedTier = 'Mid'
+        if ($linkMbps -gt 0 -and $linkMbps -lt 200) { $speedTier = 'Slow' }
+        elseif ($linkMbps -ge 1000) { $speedTier = 'Fast' }
         $list.Add([PSCustomObject]@{
             Name         = $a.Name
             Vendor       = $vendor
             Model        = $a.InterfaceDescription
             LinkSpeed    = $a.LinkSpeed
+            LinkMbps     = $linkMbps
+            SpeedTier    = $speedTier
+            IsWireless   = $isWireless
             IfIndex      = $a.IfIndex
         })
     }
@@ -1466,7 +1550,14 @@ function Show-HardwareSummary {
     Write-Host "  ================= HARDWARE SUMMARY =================" -ForegroundColor Cyan
     $chassis = if ($Hw.IsLaptop) { 'Laptop/Portable' } else { 'Desktop' }
     Write-Host ("  Chassis : {0}" -f $chassis) -ForegroundColor DarkGray
-    Write-Host ("  CPU     : {0}  [{1}, {2}-core tier]  {3}C/{4}T  {5} MHz  SMT/HT={6}" -f $Hw.Cpu.Name, $Hw.Cpu.Brand, $Hw.Cpu.Tier, $Hw.Cpu.Cores, $Hw.Cpu.Threads, $Hw.Cpu.MaxClockMHz, $Hw.Cpu.SmtOrHt) -ForegroundColor White
+    $cpuBadges = New-Object System.Collections.Generic.List[string]
+    if ($Hw.Cpu.Generation -gt 0) { $cpuBadges.Add($(if ($Hw.Cpu.Brand -eq 'Intel') { "$($Hw.Cpu.Generation)th Gen" } else { "$($Hw.Cpu.Generation)000-series" })) }
+    if ($Hw.Cpu.Unlocked) { $cpuBadges.Add('unlocked') }
+    if ($Hw.Cpu.Hybrid) { $cpuBadges.Add('hybrid P+E-core') }
+    if ($Hw.Cpu.IsX3D) { $cpuBadges.Add('3D V-Cache') }
+    if ($Hw.Cpu.IsApu) { $cpuBadges.Add('APU') }
+    $cpuBadgeTxt = if ($cpuBadges.Count -gt 0) { ", " + ($cpuBadges -join ', ') } else { '' }
+    Write-Host ("  CPU     : {0}  [{1}, {2}-core tier{3}]  {4}C/{5}T  {6} MHz  SMT/HT={7}" -f $Hw.Cpu.Name, $Hw.Cpu.Brand, $Hw.Cpu.Tier, $cpuBadgeTxt, $Hw.Cpu.Cores, $Hw.Cpu.Threads, $Hw.Cpu.MaxClockMHz, $Hw.Cpu.SmtOrHt) -ForegroundColor White
     if ($Hw.Gpu.Count -eq 0) {
         Write-Host "  GPU     : none detected" -ForegroundColor White
     } else {
@@ -1475,15 +1566,16 @@ function Show-HardwareSummary {
             Write-Host ("  GPU     : {0}  [{1}, {2}]  VRAM={3}GB  Driver={4}" -f $g.Name, $g.Brand, $tierTxt, $g.VramGB, $g.DriverVersion) -ForegroundColor White
         }
     }
-    Write-Host ("  RAM     : {0} GB total  {1} sticks  {2} MHz  {3}" -f $Hw.Ram.TotalGB, $Hw.Ram.Slots, $Hw.Ram.SpeedMHz, $Hw.Ram.Type) -ForegroundColor White
+    Write-Host ("  RAM     : {0} GB total  {1} sticks  {2} MHz [{3} tier]  {4}  [{5}]" -f $Hw.Ram.TotalGB, $Hw.Ram.Slots, $Hw.Ram.SpeedMHz, $Hw.Ram.SpeedTier, $Hw.Ram.Type, $Hw.Ram.ChannelConfig) -ForegroundColor White
     foreach ($s in $Hw.Storage) {
-        Write-Host ("  Storage : {0}  [{1}]  {2} GB" -f $s.FriendlyName, $s.Kind, $s.SizeGB) -ForegroundColor White
+        Write-Host ("  Storage : {0}  [{1}]  {2} GB  Free={3}%" -f $s.FriendlyName, $s.Kind, $s.SizeGB, $s.FreePercent) -ForegroundColor White
     }
     if ($Hw.Nic.Count -eq 0) {
         Write-Host "  NIC     : none up/detected" -ForegroundColor White
     } else {
         foreach ($n in $Hw.Nic) {
-            Write-Host ("  NIC     : {0}  [{1}]  {2}  Link={3}" -f $n.Name, $n.Vendor, $n.Model, $n.LinkSpeed) -ForegroundColor White
+            $mediaTxt = if ($n.IsWireless) { 'Wireless' } else { 'Wired' }
+            Write-Host ("  NIC     : {0}  [{1}, {2}, {3} tier]  {4}  Link={5}" -f $n.Name, $n.Vendor, $mediaTxt, $n.SpeedTier, $n.Model, $n.LinkSpeed) -ForegroundColor White
         }
     }
     Write-Host "  ======================================================" -ForegroundColor Cyan
@@ -1498,35 +1590,34 @@ function Show-HardwareSummary {
 function Invoke-CpuAdaptive {
     param([Parameter(Mandatory)]$Cpu, [Parameter(Mandatory)][bool]$IsLaptop)
     if ($Cpu.Brand -eq 'Intel') {
-        Write-Info2 "Intel CPU detected ($($Cpu.Tier)-core tier) - applying Intel-specific power/performance tweaks"
+        $genTxt = if ($Cpu.Generation -gt 0) { "$($Cpu.Generation)th Gen" } else { 'Gen unknown' }
+        $lockTxt = if ($Cpu.Unlocked) { 'unlocked (K/KS/KF)' } else { 'locked SKU' }
+        Write-Info2 "Intel CPU detected: $genTxt, $lockTxt, $($Cpu.Tier)-core tier - removing OS-level power limits"
         try {
-            # Boost mode: Aggressive on plugged-in power always. On battery, only push it on
-            # High/Mid tier CPUs - a Low-tier (<=4 core) laptop CPU gains little and burns
-            # battery/heat fast running boosted on battery, so we leave DC (battery) at balanced there.
+            # Boost mode = Aggressive (3) and min processor state = 100% on BOTH AC and battery,
+            # on every SKU (locked or unlocked). This is the OS-level power-limit ceiling Windows
+            # itself controls; locked SKUs are still hard-capped in hardware by Intel underneath
+            # this (PL1/PL2), so this setting won't let a locked chip exceed its silicon limit, but
+            # it removes every OS-side throttle so nothing is held back from what the chip can do.
             powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 2>$null | Out-Null
-            if (-not $IsLaptop -or $Cpu.Tier -ne 'Low') {
-                powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 2>$null | Out-Null
-            }
-            # Min processor state = 100% on AC. On a laptop we deliberately do NOT force this on
-            # battery (DC) - it would keep the CPU pinned at full clock even idle on battery,
-            # which does nothing for FiveM performance while draining battery/raising fan noise.
+            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 2>$null | Out-Null
             powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
-            if (-not $IsLaptop) {
-                powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
-            }
+            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
             powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
-            if ($IsLaptop) {
-                Write-Ok "Boost=Aggressive / Min state=100% on AC power. Battery (DC) power left balanced to protect battery life on this laptop."
-            } else {
-                Write-Ok "Boost mode = Aggressive, min processor state = 100% on both AC/DC (desktop, no battery concern)"
-            }
+            Write-Ok "Boost=Aggressive, min processor state=100% on AC AND battery - no OS-level power limit held back on this CPU"
+            if ($IsLaptop) { Write-Warn2 "This is a laptop - battery drains faster and fans run louder with power limits removed on battery too. That's intentional per your request." }
         } catch { Write-Warn2 "Some Intel powercfg tweaks failed: $($_.Exception.Message)" }
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\be337238-0d82-4146-a960-4f3749d470c7' 'Attributes' 2 'DWord' | Out-Null
+        if (-not $Cpu.Unlocked) { Write-Info2 "Locked SKU note: Windows-side limits are now fully open, but Intel's hardware PL1/PL2 power cap on a locked chip can only be raised further from BIOS/motherboard UEFI (Enable MCE / raise Power Limits), not from Windows." }
         if ($Cpu.SmtOrHt) { Write-Warn2 "Hyper-Threading is ON. Leave it ON unless a specific game/anti-cheat asks you to disable it in BIOS." }
-        if ($Cpu.Tier -eq 'Low') { Write-Warn2 "$($Cpu.Cores)-core CPU detected - core-parking/affinity-heavy tweaks are skipped on this machine since they help mainly on 8+ core CPUs and can hurt low-core-count responsiveness instead." }
+        if ($Cpu.Hybrid) {
+            Write-Info2 "$genTxt is a hybrid Performance+Efficient core design. Windows 11's built-in Thread Director already schedules FiveM onto P-cores automatically - we deliberately do NOT force manual core affinity here, since a wrong manual pin is worse than the default scheduler on hybrid chips."
+        }
     }
     elseif ($Cpu.Brand -eq 'AMD') {
-        Write-Info2 "AMD CPU detected ($($Cpu.Tier)-core tier) - applying Ryzen-specific power/performance tweaks"
+        $genTxt = if ($Cpu.Generation -gt 0) { "Ryzen $($Cpu.Generation)000-series" } else { 'Ryzen (series unknown)' }
+        $skuTxt = if ($Cpu.IsX3D) { '3D V-Cache (X3D)' } elseif ($Cpu.Unlocked) { 'unlocked (X)' } elseif ($Cpu.IsApu) { 'APU (G-series)' } else { 'locked SKU' }
+        Write-Info2 "AMD CPU detected: $genTxt, $skuTxt, $($Cpu.Tier)-core tier - removing OS-level power limits"
         try {
             # Prefer/duplicate 'AMD Ryzen High Performance' scheme if present, else High Performance
             $list = powercfg.exe /list
@@ -1538,19 +1629,17 @@ function Invoke-CpuAdaptive {
                 powercfg.exe /setactive $ryzenGuid 2>$null | Out-Null
                 Write-Ok "Power plan: AMD Ryzen High Performance selected"
             }
+            # Min processor state = 100% on AC AND battery, on every SKU including X3D, per your request.
             powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
-            if (-not $IsLaptop) {
-                powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
-            }
+            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
             powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
-            if ($IsLaptop) {
-                Write-Ok "Min processor state = 100% on AC power only (laptop - battery left balanced)"
-            } else {
-                Write-Ok "Min processor state = 100% on AC/DC (desktop)"
-            }
+            Write-Ok "Min processor state = 100% on AC AND battery - no OS-level power limit held back on this CPU"
+            if ($Cpu.IsX3D) { Write-Warn2 "3D V-Cache part - this will run hotter at idle than X3D's default power profile. Watch temps; PBO/curve-optimizer tuning in BIOS is the next step if you want to push further." }
+            if ($IsLaptop) { Write-Warn2 "This is a laptop - battery drains faster and fans run louder with power limits removed on battery too. That's intentional per your request." }
         } catch { Write-Warn2 "Some AMD powercfg tweaks failed: $($_.Exception.Message)" }
+        if (-not $Cpu.Unlocked -and -not $Cpu.IsX3D) { Write-Info2 "Locked SKU note: Windows-side limits are now fully open, but the hardware PPT/TDC/EDC power limit on this chip can only be raised further via PBO settings in BIOS, not from Windows." }
         if ($Cpu.SmtOrHt) { Write-Info2 "SMT is ON (logical=$($Cpu.Threads) physical=$($Cpu.Cores)) - left as-is, only disable in BIOS if a specific anti-cheat requires it." }
-        if ($Cpu.Tier -eq 'Low') { Write-Warn2 "$($Cpu.Cores)-core CPU detected - skipping aggressive core-parking-disable, it mainly benefits 8+ core Ryzen chips." }
+        if ($Cpu.IsApu) { Write-Info2 "G-series APU detected - if you're using the integrated GPU (not a discrete card), keep an eye on shared-memory/VRAM allocation in BIOS for the best FiveM headroom." }
     }
     else {
         Write-Warn2 "CPU brand not recognized - skipping CPU-specific deep tweaks (generic power tweaks from Apply Ultra still apply)"
@@ -1643,12 +1732,26 @@ function Invoke-RamAdaptive {
     else {
         Write-Info2 "RAM >= 16GB ($($Ram.TotalGB)GB) - applying high-memory profile"
         Set-Reg $mm 'DisablePagingExecutive' 1 'DWord' | Out-Null   # keep kernel code resident
-        Set-Reg $mm 'IoPageLockLimit' 0x8000000 'DWord' | Out-Null  # 512MB
+        # Speed tier drives how large a lock limit is actually worth reserving - fast RAM can
+        # move data in/out of that reserve fast enough to make a bigger limit worthwhile, slow
+        # RAM just reserves memory it can't service any quicker with.
+        $lockLimit = switch ($Ram.SpeedTier) { 'Fast' { 0xC000000 }; 'Slow' { 0x6000000 }; default { 0x8000000 } }  # 192MB fast / 96MB slow / 128MB mid
+        Set-Reg $mm 'IoPageLockLimit' $lockLimit 'DWord' | Out-Null
         try {
-            $ram = $Ram.TotalGB
-            if ($ram -ge 15) { Disable-MMAgent -mc -ErrorAction SilentlyContinue; Write-Ok "Memory compression disabled" }
+            if ($Ram.TotalGB -ge 15) { Disable-MMAgent -mc -ErrorAction SilentlyContinue; Write-Ok "Memory compression disabled" }
         } catch {}
-        Write-Ok "DisablePagingExecutive=1, IoPageLockLimit=512MB, memory compression off"
+        $lockMB = [math]::Round($lockLimit / 1MB, 0)
+        Write-Ok "DisablePagingExecutive=1, IoPageLockLimit=${lockMB}MB (scaled for $($Ram.SpeedTier)-tier $($Ram.SpeedMHz)MHz RAM), memory compression off"
+    }
+    if ($Ram.ChannelConfig -eq 'Single-channel') {
+        Write-Warn2 "Single-channel RAM detected ($($Ram.Slots) stick installed) - this halves memory bandwidth vs dual-channel and is one of the biggest silent FPS killers on a PC like this. No registry tweak can fix this - adding a second matched stick in the other slot is the actual fix."
+    } elseif ($Ram.ChannelConfig -like 'Mismatched*') {
+        Write-Warn2 "RAM sticks have mismatched capacity - may not be running true dual-channel on this PC. Matched-capacity sticks would help."
+    } else {
+        Write-Ok "Dual/multi-channel RAM confirmed on this PC - bandwidth is not the bottleneck here"
+    }
+    if ($Ram.SpeedTier -eq 'Slow') {
+        Write-Warn2 "RAM speed is $($Ram.SpeedMHz)MHz (below 2667MHz) on this PC - if the motherboard/CPU supports faster RAM, enabling XMP/DOCP in BIOS would give a bigger real-world FPS gain here than any OS tweak."
     }
     # Clear standby memory list so cached pages don't compete with the game for free RAM
     try {
@@ -1716,6 +1819,14 @@ function Invoke-StorageAdaptive {
         Set-Reg $storKey 'TreatAsInternalPort' '1' 'String' | Out-Null
         Write-Ok "StorAHCI TreatAsInternal hint applied"
     } catch {}
+    # Per-drive free-space check: an SSD/NVMe with little free space left has fewer blocks for the
+    # controller to wear-level/TRIM against, which measurably raises write latency on THAT specific
+    # drive - this is a per-drive fact, not something a registry tweak can fix.
+    foreach ($disk in $StorageList) {
+        if ($disk.Kind -ne 'HDD' -and $disk.FreePercent -lt 15) {
+            Write-Warn2 "$($disk.FriendlyName) ($($disk.Kind)) is only $($disk.FreePercent)% free - SSD/NVMe write latency rises as a drive fills up, since the controller has less spare space to work with. Freeing space on this specific drive would help more than any tweak here."
+        }
+    }
 }
 
 # ===========================================================================
@@ -1724,43 +1835,60 @@ function Invoke-StorageAdaptive {
 function Invoke-NetworkAdaptive {
     param([Parameter(Mandatory)]$NicList)
     if ($NicList.Count -eq 0) { Write-Warn2 "No active physical NIC detected - skipping network deep tweaks"; return }
-    $usedCore0Skip = $false
     foreach ($nic in $NicList) {
+        $mediaTxt = if ($nic.IsWireless) { 'Wi-Fi' } else { 'wired' }
+        # Buffer sizing is latency-aware, not just "bigger = better": on a slow/wireless link,
+        # large NIC ring buffers cause bufferbloat (packets queue up before they can go out,
+        # adding real latency even though throughput looks fine). On a fast wired link there's
+        # enough headroom that bigger buffers mainly help avoid drops, not add delay. So the
+        # SAME vendor gets smaller buffers on a slow/Wi-Fi link and bigger ones on a fast wired link.
+        $bufMult = switch ($nic.SpeedTier) { 'Slow' { 0.5 }; 'Fast' { 1.5 }; default { 1.0 } }
+        if ($nic.IsWireless -and $bufMult -gt 1.0) { $bufMult = 1.0 }   # never oversize buffers on Wi-Fi even if link reports "fast"
+
         if ($nic.Vendor -eq 'Realtek') {
-            Write-Info2 "Realtek NIC detected ($($nic.Model)) - applying Realtek deep tweaks"
+            $rx = [int](512 * $bufMult); $tx = [int](512 * $bufMult)
+            Write-Info2 "Realtek NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - applying Realtek deep tweaks scaled for this link"
             foreach ($prop in @(
-                @{ Name='Receive Buffers'; Value='512' }, @{ Name='Transmit Buffers'; Value='512' },
+                @{ Name='Receive Buffers'; Value="$rx" }, @{ Name='Transmit Buffers'; Value="$tx" },
                 @{ Name='Speed & Duplex'; Value='Auto Negotiation' }, @{ Name='Interrupt Moderation'; Value='Disabled' }
             )) {
                 try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
             }
-            Write-Ok "ReceiveBuffers=512, TransmitBuffers=512, SpeedDuplex=Auto, Interrupt Moderation=Disabled"
+            Write-Ok "ReceiveBuffers=$rx, TransmitBuffers=$tx (scaled for $($nic.SpeedTier)-tier link), SpeedDuplex=Auto, Interrupt Moderation=Disabled"
         }
         elseif ($nic.Vendor -eq 'Intel') {
-            Write-Info2 "Intel NIC detected ($($nic.Model)) - applying Intel deep tweaks"
+            $rx = [int](4096 * $bufMult)
+            Write-Info2 "Intel NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - applying Intel deep tweaks scaled for this link"
             foreach ($prop in @(
-                @{ Name='Interrupt Moderation Rate'; Value='Off' }, @{ Name='Receive Buffers'; Value='4096' },
+                @{ Name='Interrupt Moderation Rate'; Value='Off' }, @{ Name='Receive Buffers'; Value="$rx" },
                 @{ Name='Receive Side Scaling Queues'; Value='Maximum' }
             )) {
                 try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
             }
-            Write-Ok "ITR=lowest (Off), ReceiveBuffers=4096, RSS Queues=Max"
+            Write-Ok "ITR=lowest (Off), ReceiveBuffers=$rx (scaled for $($nic.SpeedTier)-tier link), RSS Queues=Max"
         }
         elseif ($nic.Vendor -eq 'Killer') {
+            $rx = [int](2048 * $bufMult); $tx = [int](2048 * $bufMult)
             # Killer NICs ship with their own "Advanced Stream Detect" / bandwidth-control
             # software; the game-relevant win here is turning that shaping off so it doesn't
             # fight with the raw throughput settings below - other vendors don't have this problem.
-            Write-Info2 "Killer NIC detected ($($nic.Model)) - disabling Killer traffic-shaping, applying deep tweaks"
+            Write-Info2 "Killer NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - disabling Killer traffic-shaping, scaling buffers for this link"
             foreach ($prop in @(
-                @{ Name='Interrupt Moderation'; Value='Disabled' }, @{ Name='Receive Buffers'; Value='2048' },
-                @{ Name='Transmit Buffers'; Value='2048' }, @{ Name='Adaptive Inter-Frame Spacing'; Value='Disabled' }
+                @{ Name='Interrupt Moderation'; Value='Disabled' }, @{ Name='Receive Buffers'; Value="$rx" },
+                @{ Name='Transmit Buffers'; Value="$tx" }, @{ Name='Adaptive Inter-Frame Spacing'; Value='Disabled' }
             )) {
                 try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
             }
-            Write-Ok "Interrupt Moderation=Off, ReceiveBuffers=2048, TransmitBuffers=2048"
+            Write-Ok "Interrupt Moderation=Off, ReceiveBuffers=$rx, TransmitBuffers=$tx (scaled for $($nic.SpeedTier)-tier link)"
         }
         else {
             Write-Warn2 "NIC vendor '$($nic.Vendor)' has no dedicated profile - applying general tweaks only"
+        }
+        if ($nic.SpeedTier -eq 'Slow') {
+            Write-Warn2 "$($nic.Name) link is only $($nic.LinkSpeed) - this link speed itself is the biggest input/ping-latency factor here, bigger than any buffer tweak. A wired gigabit connection (or moving closer to the router for Wi-Fi) would help more than further OS tuning."
+        }
+        if ($nic.IsWireless) {
+            Write-Info2 "$($nic.Name) is a wireless adapter - power-saving disabled below to stop Wi-Fi radio sleep from adding random latency spikes, but a wired connection is still lower and more consistent latency than any Wi-Fi tuning can fully match."
         }
         # General, all vendors
         try { Set-NetAdapterRss -Name $nic.Name -Enabled $true -ErrorAction SilentlyContinue } catch {}
