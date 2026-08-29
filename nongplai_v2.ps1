@@ -29,7 +29,7 @@ param(
     [switch]$HpetToggle,
     [switch]$DryRun,
     [switch]$Worker,
-    [ValidateSet('Apply','Reset','Scan','Hpet')][string]$WorkerAction = '',
+    [ValidateSet('', 'Apply','Reset','Scan','Hpet')][string]$WorkerAction = '',
     [string]$GuiLogPath = ''
 )
 
