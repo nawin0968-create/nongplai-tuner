@@ -27,8 +27,15 @@
 
 param(
     [switch]$HpetToggle,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Worker,
+    [ValidateSet('Apply','Reset','Scan','Hpet')][string]$WorkerAction = '',
+    [string]$GuiLogPath = ''
 )
+
+$script:ScriptPath = $MyInvocation.MyCommand.Path
+
+# The companion launcher can start this script with a hidden PowerShell window.
 
 # Self-elevate: relaunch as Administrator if not already, then stop this non-elevated instance.
 # NOTE: when run via `irm <url> | iex`, there is no on-disk script file, so
@@ -46,14 +53,19 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
         $runPath = Join-Path $env:TEMP "nongplai_v2_$([guid]::NewGuid().ToString('N')).ps1"
         Set-Content -Path $runPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8
     }
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$runPath`"")
+    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $runPath)
     if ($HpetToggle) { $argList += '-HpetToggle' }
     if ($DryRun) { $argList += '-DryRun' }
+    if ($Worker) { $argList += '-Worker' }
+    if ($WorkerAction) { $argList += @('-WorkerAction', $WorkerAction) }
+    if ($GuiLogPath) { $argList += @('-GuiLogPath', $GuiLogPath) }
     try {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs | Out-Null
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -WindowStyle Hidden | Out-Null
     } catch {
-        Write-Host "Elevation was cancelled or failed. This tool needs to run as Administrator." -ForegroundColor Yellow
-        Read-Host "Press Enter to exit"
+        try {
+            Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+            [System.Windows.MessageBox]::Show('ยกเลิกหรือยกระดับสิทธิ์ไม่สำเร็จ โปรแกรมนี้ต้องทำงานด้วยสิทธิ์ Administrator', 'NongPlaiShop', 'OK', 'Warning') | Out-Null
+        } catch {}
     }
     exit 0
 }
@@ -70,17 +82,86 @@ $script:LogFile   = $null
 $script:OK        = 0
 $script:Total     = 0
 $script:Failed    = New-Object System.Collections.Generic.List[string]
-$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v2.0"
+$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v1.0"
 
 $script:DefenderPolicyValues = $null
 $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
 $script:DryRun = [bool]$DryRun
+$script:GuiWorker = [bool]$Worker
+$script:GuiLogPath = $GuiLogPath
+$script:GuiStage = 'startup'
+$script:LegacyStepCount = 0
+$script:LegacyStepTotal = 40
 $script:HwInfo = $null
+
+function Write-GuiEvent {
+    param(
+        [Parameter(Mandatory)][string]$Type,
+        [int]$Current = 0,
+        [int]$Total = 0,
+        [string]$Label = '',
+        [string]$Message = ''
+    )
+    if (-not $script:GuiLogPath) { return }
+    try {
+        $payload = [ordered]@{
+            type      = $Type
+            stage     = $script:GuiStage
+            current   = $Current
+            total     = $Total
+            label     = $Label
+            message   = $Message
+            timestamp = (Get-Date).ToString('o')
+        }
+        $line = '__NONGPLAI_EVENT__' + ($payload | ConvertTo-Json -Compress)
+        [System.IO.File]::AppendAllText($script:GuiLogPath, $line + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+    } catch {
+        try {
+            $dbgPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
+            $dbgLine = "[{0}] GuiLogPath='{1}' error={2}" -f (Get-Date -Format 'o'), $script:GuiLogPath, $_.Exception.Message
+            [System.IO.File]::AppendAllText($dbgPath, $dbgLine + [Environment]::NewLine)
+        } catch {}
+    }
+}
+
+# In worker mode the child process has no visible console. Redirect Write-Host output
+# to the event log so the GUI can show the latest stage without opening PowerShell.
+if ($script:GuiWorker) {
+    try {
+        if ($script:GuiLogPath) {
+            New-Item -ItemType File -Path $script:GuiLogPath -Force | Out-Null
+        }
+    } catch {}
+    function global:Write-Host {
+        param(
+            [Parameter(Position=0)] [object]$Object,
+            [switch]$NoNewline,
+            [object]$Separator,
+            [ConsoleColor]$ForegroundColor,
+            [ConsoleColor]$BackgroundColor
+        )
+        try {
+            $sep = if ($PSBoundParameters.ContainsKey('Separator')) { [string]$Separator } else { ' ' }
+            $text = [string]::Join($sep, @($Object | ForEach-Object { [string]$_ }))
+            $ending = if ($NoNewline) { '' } else { [Environment]::NewLine }
+            if ($script:GuiLogPath) {
+                [System.IO.File]::AppendAllText($script:GuiLogPath, $text + $ending, [System.Text.UTF8Encoding]::new($false))
+            }
+        } catch {}
+    }
+}
 
 # ---------------------------------------------------------------------------
 # v2: colored status output + progress bar
 # ---------------------------------------------------------------------------
-function Write-Ok    { param([string]$Message) Write-Host "  [OK] $Message"   -ForegroundColor Green }
+function Write-Ok    {
+    param([string]$Message)
+    Write-Host "  [OK] $Message"   -ForegroundColor Green
+    if ($script:GuiWorker -and $script:GuiStage -eq 'legacy') {
+        $script:LegacyStepCount++
+        Write-GuiEvent -Type 'progress' -Current $script:LegacyStepCount -Total $script:LegacyStepTotal -Label $Message
+    }
+}
 function Write-Bad   { param([string]$Message) Write-Host "  [XX] $Message"   -ForegroundColor Red }
 function Write-Warn2 { param([string]$Message) Write-Host "  [!!] $Message"   -ForegroundColor Yellow }
 function Write-Info2 { param([string]$Message) Write-Host "  [->] $Message"   -ForegroundColor Cyan }
@@ -99,6 +180,7 @@ function Write-ProgressBar {
     Write-Host ("{0,3}% " -f $pct) -NoNewline -ForegroundColor White
     Write-Host ("({0}/{1}) " -f $Current, $Total) -NoNewline -ForegroundColor DarkGray
     Write-Host $Label -ForegroundColor Magenta
+    Write-GuiEvent -Type 'progress' -Current $Current -Total $Total -Label $Label
 }
 
 function Write-Log {
@@ -110,8 +192,8 @@ function Write-Log {
 }
 
 function New-BackupFolder {
-    $ts = Get-Date -Format "yyyyMMdd_HHmmss"
-    $dir = Join-Path $env:TEMP "FiveM_Ultra_Backup_$ts"
+    $ts = Get-Date -Format "yyMMdd_HHmmss"
+    $dir = Join-Path $env:TEMP "NPBK_$ts"
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
     $script:BackupDir = $dir
     $script:LogFile = Join-Path $dir "apply.log"
@@ -131,10 +213,10 @@ function Save-Changes {
 }
 
 function Find-LatestBackup {
-    $dirs = @(Get-ChildItem -Path $env:TEMP -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue)
+    $dirs = @(Get-ChildItem -Path $env:TEMP -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue)
     $desktop = [Environment]::GetFolderPath('Desktop')
     if (Test-Path $desktop) {
-        $dirs += @(Get-ChildItem -Path $desktop -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue)
+        $dirs += @(Get-ChildItem -Path $desktop -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue)
     }
     if ($dirs.Count -eq 0) { return $null }
     return ($dirs | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
@@ -405,13 +487,14 @@ function Invoke-ApplyUltra {
     Write-Host "Defender/Firewall stay ON (folder exclusion only). Update paused for"
     Write-Host "this session. HPET is NOT touched - use -HpetToggle separately."
     Write-Host ""
-    $confirm = Read-Host "Continue? [Y/N]"
+    $confirm = if ($script:GuiWorker) { 'Y' } else { Read-Host "Continue? [Y/N]" }
     if ($confirm -notmatch '^[Yy]') { Write-Host "Cancelled."; return }
 
     New-BackupFolder | Out-Null
     $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
 
     Write-Host "Checking system..."
+    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังตรวจสอบสเปกเครื่อง...'
     try {
         $os = Get-CimInstance Win32_OperatingSystem
         $cs = Get-CimInstance Win32_ComputerSystem
@@ -426,14 +509,29 @@ function Invoke-ApplyUltra {
     if ($gtaName) { Write-Host "GTA process file: $gtaName" }
 
     Write-Host "Creating restore point..."
+    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังสร้างจุดคืนค่าระบบ (อาจใช้เวลาถึง 1 นาที)...'
     try {
-        Checkpoint-Computer -Description 'FiveM Ultra Before Apply' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
-        Write-Host "Restore point: created"
+        $rpJob = Start-Job -ScriptBlock {
+            param($desc)
+            Checkpoint-Computer -Description $desc -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+        } -ArgumentList 'FiveM Ultra Before Apply'
+        if (Wait-Job $rpJob -Timeout 45) {
+            if ($rpJob.State -eq 'Completed' -and -not (Receive-Job $rpJob -ErrorAction SilentlyContinue -Keep | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })) {
+                Write-Host "Restore point: created"
+            } else {
+                Write-Host "Restore point: skipped (see job errors)"
+            }
+        } else {
+            Write-Host "Restore point: skipped - timed out after 45s (Windows System Restore is slow/stuck on this PC)"
+            Stop-Job $rpJob -ErrorAction SilentlyContinue
+        }
+        Remove-Job $rpJob -Force -ErrorAction SilentlyContinue
     } catch {
         Write-Host ("Restore point: skipped - " + $_.Exception.Message)
     }
 
     Write-Host "Testing network baseline..."
+    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย...'
     try { Test-Connection -ComputerName 1.1.1.1 -Count 4 | Format-Table -AutoSize | Out-Host } catch {}
 
     $script:Total = 39
@@ -998,6 +1096,7 @@ function Invoke-ApplyUltra {
 # RESET
 # ---------------------------------------------------------------------------
 function Invoke-ResetUltra {
+    $script:GuiStage = 'reset'
     Clear-Host
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  RESET ULTRA PROFILE" -ForegroundColor Magenta
@@ -1005,19 +1104,20 @@ function Invoke-ResetUltra {
     $dir = Find-LatestBackup
     if (-not $dir) {
         Write-Host "No backup folder found. Nothing to reset."
-        Read-Host "Press Enter to continue"
+        if (-not $script:GuiWorker) { Read-Host "Press Enter to continue" }
         return
     }
     $changesFile = Join-Path $dir "changes.json"
     if (-not (Test-Path $changesFile)) {
         Write-Host "No changes.json found in $dir. Nothing to reset."
-        Read-Host "Press Enter to continue"
+        if (-not $script:GuiWorker) { Read-Host "Press Enter to continue" }
         return
     }
     Write-Host "Restoring from: $dir"
     $list = @(Get-Content $changesFile -Raw | ConvertFrom-Json)
     [array]::Reverse($list)
     $count = 0
+    Write-GuiEvent -Type 'progress' -Current 0 -Total ([math]::Max($list.Count, 1)) -Label 'กำลังคืนค่าการตั้งค่าเดิม'
     foreach ($c in $list) {
         try {
             switch ($c.Kind) {
@@ -1083,6 +1183,7 @@ function Invoke-ResetUltra {
                 }
             }
             $count++
+            Write-GuiEvent -Type 'progress' -Current $count -Total ([math]::Max($list.Count, 1)) -Label "กำลังคืนค่า: $($c.Kind)"
         } catch {
             Write-Host "  ! Could not undo one change ($($c.Kind)): $($_.Exception.Message)"
         }
@@ -1134,16 +1235,17 @@ function Invoke-ResetUltra {
 
     Write-Host "Undid $count tracked changes, plus global network/power defaults."
     Write-Host "Removing temporary backup folders..."
-    Get-ChildItem -Path $env:TEMP -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $env:TEMP -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     $desktop = [Environment]::GetFolderPath('Desktop')
     if (Test-Path $desktop) {
-        Get-ChildItem -Path $desktop -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $desktop -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
     Write-Host ""
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "RESET COMPLETE. Restart Windows."
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    Read-Host "Press Enter to continue"
+    Write-GuiEvent -Type 'progress' -Current ([math]::Max($list.Count, 1)) -Total ([math]::Max($list.Count, 1)) -Label 'รีเซ็ตเสร็จสมบูรณ์'
+    if (-not $script:GuiWorker) { Read-Host "Press Enter to continue" }
 }
 
 # ---------------------------------------------------------------------------
@@ -1273,7 +1375,7 @@ function Invoke-RemoveDefenderPolicy {
         return
     }
 
-    $backupDir = Join-Path $env:TEMP ("FiveM_Ultra_Backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $backupDir = Join-Path $env:TEMP ("NPBK_" + (Get-Date -Format "yyMMdd_HHmmss"))
     New-Item -Path $backupDir -ItemType Directory -Force | Out-Null
     $regBackup = Join-Path $backupDir "WindowsDefenderPolicy_backup.reg"
     try {
@@ -1769,22 +1871,8 @@ function Invoke-RamAdaptive {
     if ($Ram.SpeedTier -eq 'Slow') {
         Write-Warn2 "RAM speed is $($Ram.SpeedMHz)MHz (below 2667MHz) on this PC - if the motherboard/CPU supports faster RAM, enabling XMP/DOCP in BIOS would give a bigger real-world FPS gain here than any OS tweak."
     }
-    # Clear standby memory list so cached pages don't compete with the game for free RAM
-    try {
-        Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class MemUtil2 {
-    [DllImport("ntdll.dll")]
-    public static extern int NtSetSystemInformation(int SystemInformationClass, IntPtr SystemInformation, int SystemInformationLength);
-}
-"@ -ErrorAction SilentlyContinue
-        $classInfo = 80  # SystemMemoryListInformation
-        $cmd = 4          # MemoryPurgeStandbyList
-        $handle = [IntPtr]::new($cmd)
-        [MemUtil2]::NtSetSystemInformation($classInfo, $handle, 4) | Out-Null
-        Write-Ok "Standby memory list cleared"
-    } catch { Write-Warn2 "Could not clear standby list (needs elevation, which we already have, or is unsupported on this build)" }
+    # Standby-list purge was intentionally removed for Windows PowerShell 5.1 parser compatibility.
+    # The RAM registry tuning above remains active; skipping this optional purge is harmless.
 }
 
 # ===========================================================================
@@ -1849,8 +1937,20 @@ function Invoke-StorageAdaptive {
 # v2.0 — NETWORK ADAPTIVE DEEP TWEAKS
 # ===========================================================================
 function Invoke-NetworkAdaptive {
-    param([Parameter(Mandatory)]$NicList)
+    param([Parameter(Mandatory)]$NicList, $Cpu = $null)
     if ($NicList.Count -eq 0) { Write-Warn2 "No active physical NIC detected - skipping network deep tweaks"; return }
+
+    # RSS queue count scales with actual CPU thread count on THIS machine - more queues just
+    # means more threads doing nothing on a 4-thread CPU, but genuinely spreads interrupt load
+    # on an 8+ thread CPU. Cross-references the CPU scan result, not a fixed number for everyone.
+    $rssQueues = 2
+    if ($Cpu -and $Cpu.Threads) {
+        if ($Cpu.Threads -ge 16) { $rssQueues = 8 }
+        elseif ($Cpu.Threads -ge 8) { $rssQueues = 4 }
+        elseif ($Cpu.Threads -ge 4) { $rssQueues = 2 }
+        else { $rssQueues = 1 }
+    }
+
     foreach ($nic in $NicList) {
         $mediaTxt = if ($nic.IsWireless) { 'Wi-Fi' } else { 'wired' }
         # Buffer sizing is latency-aware, not just "bigger = better": on a slow/wireless link,
@@ -1867,23 +1967,28 @@ function Invoke-NetworkAdaptive {
             Write-Info2 "Realtek NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - applying Realtek deep tweaks scaled for this link"
             foreach ($prop in @(
                 @{ Name='Receive Buffers'; Value="$rx" }, @{ Name='Transmit Buffers'; Value="$tx" },
-                @{ Name='Speed & Duplex'; Value='Auto Negotiation' }, @{ Name='Interrupt Moderation'; Value='Disabled' }
+                @{ Name='Speed & Duplex'; Value='Auto Negotiation' }, @{ Name='Interrupt Moderation'; Value='Disabled' },
+                @{ Name='Flow Control'; Value='Disabled' }, @{ Name='Energy-Efficient Ethernet'; Value='Disabled' },
+                @{ Name='Green Ethernet'; Value='Disabled' }, @{ Name='Gigabit Lite'; Value='Disabled' },
+                @{ Name='Power Saving Mode'; Value='Disabled' }
             )) {
                 try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
             }
-            Write-Ok "ReceiveBuffers=$rx, TransmitBuffers=$tx (scaled for $($nic.SpeedTier)-tier link), SpeedDuplex=Auto, Interrupt Moderation=Disabled"
+            Write-Ok "ReceiveBuffers=$rx, TransmitBuffers=$tx (scaled for $($nic.SpeedTier)-tier link), FlowControl/EEE/GreenEthernet/GigabitLite=Off"
         }
         elseif ($nic.Vendor -eq 'Intel') {
             $rx = [int](8192 * $bufMult)
             if ($rx -gt 16384) { $rx = 16384 }
-            Write-Info2 "Intel NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - applying Intel deep tweaks scaled for this link"
+            Write-Info2 "Intel NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - applying Intel deep tweaks scaled for this link, RSS Queues=$rssQueues (matched to this CPU's $($Cpu.Threads) threads)"
             foreach ($prop in @(
                 @{ Name='Interrupt Moderation Rate'; Value='Off' }, @{ Name='Receive Buffers'; Value="$rx" },
-                @{ Name='Receive Side Scaling Queues'; Value='Maximum' }
+                @{ Name='Receive Side Scaling Queues'; Value="$rssQueues" }, @{ Name='Flow Control'; Value='Disabled' },
+                @{ Name='Energy Efficient Ethernet'; Value='Disabled' }, @{ Name='Green Ethernet'; Value='Disabled' },
+                @{ Name='Reduce Speed On Power Down'; Value='Disabled' }, @{ Name='System Idle Power Saver'; Value='Disabled' }
             )) {
                 try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
             }
-            Write-Ok "ITR=lowest (Off), ReceiveBuffers=$rx (scaled for $($nic.SpeedTier)-tier link), RSS Queues=Max"
+            Write-Ok "ITR=lowest (Off), ReceiveBuffers=$rx (scaled for $($nic.SpeedTier)-tier link), RSS Queues=$rssQueues, EEE/GreenEthernet/PowerDown=Off"
         }
         elseif ($nic.Vendor -eq 'Killer') {
             $rx = [int](4096 * $bufMult); $tx = [int](4096 * $bufMult)
@@ -1894,11 +1999,25 @@ function Invoke-NetworkAdaptive {
             Write-Info2 "Killer NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - disabling Killer traffic-shaping, scaling buffers for this link"
             foreach ($prop in @(
                 @{ Name='Interrupt Moderation'; Value='Disabled' }, @{ Name='Receive Buffers'; Value="$rx" },
-                @{ Name='Transmit Buffers'; Value="$tx" }, @{ Name='Adaptive Inter-Frame Spacing'; Value='Disabled' }
+                @{ Name='Transmit Buffers'; Value="$tx" }, @{ Name='Adaptive Inter-Frame Spacing'; Value='Disabled' },
+                @{ Name='Energy-Efficient Ethernet'; Value='Disabled' }, @{ Name='Green Ethernet'; Value='Disabled' }
             )) {
                 try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
             }
-            Write-Ok "Interrupt Moderation=Off, ReceiveBuffers=$rx, TransmitBuffers=$tx (scaled for $($nic.SpeedTier)-tier link)"
+            Write-Ok "Interrupt Moderation=Off, ReceiveBuffers=$rx, TransmitBuffers=$tx (scaled for $($nic.SpeedTier)-tier link), EEE/GreenEthernet=Off"
+        }
+        elseif ($nic.Vendor -eq 'Broadcom') {
+            $rx = [int](2048 * $bufMult); $tx = [int](2048 * $bufMult)
+            if ($rx -gt 4096) { $rx = 4096 }; if ($tx -gt 4096) { $tx = 4096 }
+            Write-Info2 "Broadcom NIC detected ($($nic.Model), $mediaTxt, $($nic.SpeedTier)-tier link) - applying Broadcom deep tweaks scaled for this link"
+            foreach ($prop in @(
+                @{ Name='Receive Buffers'; Value="$rx" }, @{ Name='Transmit Buffers'; Value="$tx" },
+                @{ Name='Interrupt Moderation'; Value='Disabled' }, @{ Name='Flow Control'; Value='Disabled' },
+                @{ Name='Energy Efficient Ethernet'; Value='Disabled' }, @{ Name='Wake on Magic Packet'; Value='Disabled' }
+            )) {
+                try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
+            }
+            Write-Ok "ReceiveBuffers=$rx, TransmitBuffers=$tx (scaled for $($nic.SpeedTier)-tier link), FlowControl/EEE=Off"
         }
         else {
             Write-Warn2 "NIC vendor '$($nic.Vendor)' has no dedicated profile - applying general tweaks only"
@@ -1909,10 +2028,16 @@ function Invoke-NetworkAdaptive {
         if ($nic.IsWireless) {
             Write-Info2 "$($nic.Name) is a wireless adapter - power-saving disabled below to stop Wi-Fi radio sleep from adding random latency spikes, but a wired connection is still lower and more consistent latency than any Wi-Fi tuning can fully match."
         }
-        # General, all vendors
+        # General, all vendors: turn off every offload/power-save path that trades latency for
+        # throughput or battery - none of that trade is worth it for a real-time game connection.
         try { Set-NetAdapterRss -Name $nic.Name -Enabled $true -ErrorAction SilentlyContinue } catch {}
         try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName 'Jumbo Packet' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue } catch {}
+        try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName 'Large Send Offload V2 (IPv4)' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue } catch {}
+        try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName 'Large Send Offload V2 (IPv6)' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue } catch {}
+        try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName 'ARP Offload' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue } catch {}
+        try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName 'NS Offload' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue } catch {}
         try { Disable-NetAdapterPowerManagement -Name $nic.Name -ErrorAction SilentlyContinue } catch {}
+        try { Disable-NetAdapterLso -Name $nic.Name -ErrorAction SilentlyContinue } catch {}
         # IRQ affinity: point this NIC's interrupts away from Core 0 (index 1) so it doesn't
         # compete with the core Windows/game threads default onto.
         try {
@@ -1928,6 +2053,18 @@ function Invoke-NetworkAdaptive {
                 Write-Ok "IRQ affinity for $($nic.Name) steered away from Core 0"
             }
         } catch { Write-Warn2 "IRQ affinity step skipped for $($nic.Name)" }
+        # Per-adapter TCP registry tuning (Tcpip\Parameters\Interfaces\<GUID>) - disables Nagle's
+        # algorithm on THIS interface specifically, the single biggest per-packet latency win for
+        # small, frequent game packets (FiveM sends lots of tiny state updates).
+        try {
+            $ifPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{$((Get-NetAdapter -Name $nic.Name -ErrorAction SilentlyContinue).InterfaceGuid)}"
+            if (Test-Path $ifPath) {
+                Set-Reg $ifPath 'TcpAckFrequency' 1 'DWord' | Out-Null       # ACK immediately, don't batch
+                Set-Reg $ifPath 'TCPNoDelay' 1 'DWord' | Out-Null           # Nagle OFF on this interface
+                Set-Reg $ifPath 'TcpDelAckTicks' 0 'DWord' | Out-Null       # 0 delay before ACK
+                Write-Ok "Nagle disabled + immediate ACK on $($nic.Name) specifically (per-interface, not just global)"
+            }
+        } catch { Write-Warn2 "Per-interface Nagle/ACK tuning skipped for $($nic.Name)" }
     }
     try { netsh.exe int tcp set global rss=enabled | Out-Null } catch {}
     try { netsh.exe int tcp set global ecncapability=disabled | Out-Null } catch {}
@@ -1936,7 +2073,14 @@ function Invoke-NetworkAdaptive {
     try { netsh.exe int tcp set global rsc=disabled | Out-Null } catch {}
     try { netsh.exe int tcp set global fastopen=enabled | Out-Null } catch {}
     try { netsh.exe int tcp set supplemental template=internet icw=10 | Out-Null } catch {}
-    Write-Ok "Global: RSS=ON, ECN=Off, AutoTuning=Experimental, Timestamps=Off, RSC=Off, TCP Fast Open=On, ICW=10"
+    try { netsh.exe int udp set global uro=disabled | Out-Null } catch {}    # UDP Receive Offload off - FiveM traffic is mostly UDP, offload batching adds latency here
+    try {
+        $tcpParams = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+        Set-Reg $tcpParams 'TcpTimedWaitDelay' 30 'DWord' | Out-Null
+        Set-Reg $tcpParams 'MaxUserPort' 65534 'DWord' | Out-Null
+        Set-Reg $tcpParams 'FastSendDatagramThreshold' 1500 'DWord' | Out-Null   # send small UDP datagrams (like game packets) immediately, not queued
+    } catch {}
+    Write-Ok "Global: RSS=ON, ECN/Timestamps/RSC=Off, AutoTuning=Experimental, TCP Fast Open=On, ICW=10, UDP receive offload off, fast small-datagram send path"
 }
 
 # ===========================================================================
@@ -1945,7 +2089,7 @@ function Invoke-NetworkAdaptive {
 function Invoke-SmartApply {
     Clear-Host
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    Write-Host "  SMART ADAPTIVE TUNER v2.0 - HARDWARE SCAN -> DEEP TWEAK" -ForegroundColor Cyan
+    Write-Host "  SMART ADAPTIVE TUNER v1.0 - HARDWARE SCAN -> DEEP TWEAK" -ForegroundColor Cyan
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     if ($script:DryRun) {
         Write-Warn2 "DRY RUN MODE - nothing will actually be changed, this is a preview only"
@@ -1975,7 +2119,7 @@ function Invoke-SmartApply {
         @{ Name = 'GPU adaptive tweaks';     Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
         @{ Name = 'RAM adaptive tweaks';     Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
         @{ Name = 'Storage adaptive tweaks'; Action = { Invoke-StorageAdaptive -StorageList $hw.Storage } },
-        @{ Name = 'Network adaptive tweaks'; Action = { Invoke-NetworkAdaptive -NicList $hw.Nic } }
+        @{ Name = 'Network adaptive tweaks'; Action = { Invoke-NetworkAdaptive -NicList $hw.Nic -Cpu $hw.Cpu } }
     )
     $total = $modules.Count
     $i = 0
@@ -2010,59 +2154,23 @@ function Invoke-HardwareScanOnly {
 
 function Invoke-ExportReport {
     Clear-Host
-    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  EXPORT HARDWARE + TWEAK REPORT (HTML)" -ForegroundColor Cyan
-    Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    $hw = if ($script:HwInfo) { $script:HwInfo } else { Invoke-HardwareScan }
-    Show-HardwareSummary -Hw $hw
-
-    $gpuRows = ($hw.Gpu | ForEach-Object { "<tr><td>$($_.Name)</td><td>$($_.Brand)</td><td>$($_.VramGB) GB</td><td>$($_.DriverVersion)</td></tr>" }) -join "`n"
-    $diskRows = ($hw.Storage | ForEach-Object { "<tr><td>$($_.FriendlyName)</td><td>$($_.Kind)</td><td>$($_.SizeGB) GB</td></tr>" }) -join "`n"
-    $nicRows = ($hw.Nic | ForEach-Object { "<tr><td>$($_.Name)</td><td>$($_.Vendor)</td><td>$($_.Model)</td><td>$($_.LinkSpeed)</td></tr>" }) -join "`n"
-    $changesRows = if ($script:Changes.Count -gt 0) { ($script:Changes | ForEach-Object { "<tr><td>$($_.Kind)</td><td>$($_.Path)$($_.Name)</td></tr>" }) -join "`n" } else { "<tr><td colspan=2>No changes recorded this session (scan-only or dry run)</td></tr>" }
-
-    $html = @"
-<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>NongPlaiShop Smart Tuner Report</title>
-<style>
-body{font-family:Segoe UI,Arial,sans-serif;background:#0f1117;color:#e6e6e6;padding:24px}
-h1{color:#7ee787} h2{color:#79c0ff;border-bottom:1px solid #30363d;padding-bottom:4px}
-table{border-collapse:collapse;width:100%;margin-bottom:24px}
-td,th{border:1px solid #30363d;padding:6px 10px;text-align:left}
-th{background:#161b22} tr:nth-child(even){background:#161b22}
-.meta{color:#8b949e;font-size:0.9em}
-</style></head><body>
-<h1>NongPlaiShop Smart Adaptive Tuner - Report</h1>
-<p class="meta">Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss") | Computer: $env:COMPUTERNAME</p>
-
-<h2>CPU</h2>
-<table><tr><th>Name</th><th>Brand</th><th>Cores/Threads</th><th>Max MHz</th><th>SMT/HT</th></tr>
-<tr><td>$($hw.Cpu.Name)</td><td>$($hw.Cpu.Brand)</td><td>$($hw.Cpu.Cores)/$($hw.Cpu.Threads)</td><td>$($hw.Cpu.MaxClockMHz)</td><td>$($hw.Cpu.SmtOrHt)</td></tr></table>
-
-<h2>GPU</h2>
-<table><tr><th>Name</th><th>Brand</th><th>VRAM</th><th>Driver</th></tr>$gpuRows</table>
-
-<h2>RAM</h2>
-<table><tr><th>Total</th><th>Slots</th><th>Speed</th><th>Type</th></tr>
-<tr><td>$($hw.Ram.TotalGB) GB</td><td>$($hw.Ram.Slots)</td><td>$($hw.Ram.SpeedMHz) MHz</td><td>$($hw.Ram.Type)</td></tr></table>
-
-<h2>Storage</h2>
-<table><tr><th>Drive</th><th>Kind</th><th>Size</th></tr>$diskRows</table>
-
-<h2>Network</h2>
-<table><tr><th>Adapter</th><th>Vendor</th><th>Model</th><th>Link Speed</th></tr>$nicRows</table>
-
-<h2>Changes applied this session</h2>
-<table><tr><th>Kind</th><th>Target</th></tr>$changesRows</table>
-</body></html>
-"@
-    $outPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "NongPlai_Tuner_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+    $outPath = Join-Path ([Environment]::GetFolderPath('Desktop')) ("NongPlai_Tuner_Report_{0}.html" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $html = @(
+        '<!doctype html><html><head><meta charset="utf-8"><title>NongPlaiShop Report</title></head><body>'
+        '<h1>NongPlaiShop Smart Adaptive Tuner</h1>'
+        ("<p>Generated: {0}</p>" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+        '</body></html>'
+    ) -join [Environment]::NewLine
     try {
         Set-Content -Path $outPath -Value $html -Encoding UTF8
         Write-Ok "Report saved: $outPath"
-        try { Start-Process $outPath } catch {}
-    } catch { Write-Bad "Could not save report: $($_.Exception.Message)" }
-    Read-Host "Press Enter to continue"
+        Start-Process -FilePath $outPath -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Bad "Could not save report: $($_.Exception.Message)"
+    }
+    if (-not $script:GuiWorker) { Read-Host "Press Enter to continue" }
 }
 
 # ===========================================================================
@@ -2077,9 +2185,12 @@ function Invoke-DoEverything {
     Write-Host ""
 
     # --- Part 1: full legacy 39-step Apply Ultra (creates backup folder + restore point) ---
+    $script:GuiStage = 'legacy'
+    $script:LegacyStepCount = 0
     Invoke-ApplyUltra
 
     # --- Part 2: scan this PC's hardware and layer on adaptive CPU/GPU/RAM/Storage/Network tweaks ---
+    $script:GuiStage = 'adaptive'
     Write-Host ""
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  HARDWARE SCAN -> ADAPTIVE DEEP TWEAK" -ForegroundColor Cyan
@@ -2094,7 +2205,7 @@ function Invoke-DoEverything {
         @{ Name = 'GPU adaptive tweaks';     Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
         @{ Name = 'RAM adaptive tweaks';     Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
         @{ Name = 'Storage adaptive tweaks'; Action = { Invoke-StorageAdaptive -StorageList $hw.Storage } },
-        @{ Name = 'Network adaptive tweaks'; Action = { Invoke-NetworkAdaptive -NicList $hw.Nic } }
+        @{ Name = 'Network adaptive tweaks'; Action = { Invoke-NetworkAdaptive -NicList $hw.Nic -Cpu $hw.Cpu } }
     )
     $total = $modules.Count
     $i = 0
@@ -2116,7 +2227,7 @@ function Invoke-DoEverything {
         Write-Info2 "Restart Windows for all changes (services, power plan, network) to fully take effect."
         Write-Info2 "Use menu option [2] RESET ALL any time to undo everything."
     }
-    Read-Host "Press Enter to return to menu"
+    if (-not $script:GuiWorker) { Read-Host "Press Enter to return to menu" }
 }
 
 # ---------------------------------------------------------------------------
@@ -2145,7 +2256,7 @@ function Write-BoxCenter {
     Write-Host "|" -ForegroundColor DarkCyan
 }
 function Write-BoxLine {
-    # $Segments: array of @{ Text=''; Color='White' } rendered left to right, then padded/trimmed to width
+    # Segments array of text/color objects, rendered left to right and padded to width
     param([Parameter(Mandatory)][array]$Segments, [int]$LeftPad = 2)
     $plain = (" " * $LeftPad) + (($Segments | ForEach-Object { $_.Text }) -join '')
     $pad = $script:BoxWidth - $plain.Length
@@ -2170,29 +2281,20 @@ function Write-MenuItem {
 
 # ---------------------------------------------------------------------------
 # v2: WPF card-style launcher (replaces the plain console menu)
-# The heavy-lifting functions (Invoke-DoEverything / Invoke-ResetUltra) still
-# run in THIS console window with all their colored Write-Ok/Write-Bad output
-# and Read-Host pauses - the WPF window just picks which one to run, then
-# gets out of the way and lets the console take over, exactly like a launcher.
+# The heavy-lifting functions run in a hidden worker process. The WPF window remains
+# visible and receives progress events from the worker, so no PowerShell console is shown.
 # ---------------------------------------------------------------------------
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-
-Add-Type -Name Win32ShowWindow -Namespace NongPlai -MemberDefinition @"
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    public static extern System.IntPtr GetConsoleWindow();
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(System.IntPtr hWnd);
-"@ -ErrorAction SilentlyContinue
-
-function Show-ConsoleWindow {
+try {
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
+} catch {
     try {
-        $h = [NongPlai.Win32ShowWindow]::GetConsoleWindow()
-        [NongPlai.Win32ShowWindow]::ShowWindow($h, 5) | Out-Null   # SW_SHOW
-        [NongPlai.Win32ShowWindow]::SetForegroundWindow($h) | Out-Null
+        $popup = New-Object -ComObject WScript.Shell
+        $popup.Popup('ไม่สามารถโหลดส่วน GUI ได้ กรุณาใช้ Windows PowerShell 5.1 (powershell.exe) และคลิกขวาเลือก Run with PowerShell', 0, 'NongPlaiShop', 16) | Out-Null
     } catch {}
+    exit 1
 }
+
+# No console window is re-shown by the GUI entry point.
 
 $script:MenuCards = @(
     [PSCustomObject]@{
@@ -2220,7 +2322,13 @@ function Show-MainMenuWpf {
         Title="NongPlaiShop" Height="640" Width="960"
         WindowStartupLocation="CenterScreen" WindowStyle="None"
         ResizeMode="NoResize" Background="Transparent" AllowsTransparency="True">
-  <Border CornerRadius="16" Background="#0A0A0D" BorderBrush="#242428" BorderThickness="1" ClipToBounds="True">
+  <Border CornerRadius="16" BorderBrush="#2A2A30" BorderThickness="1" ClipToBounds="True">
+    <Border.Background>
+      <RadialGradientBrush Center="0.5,0.15" RadiusX="0.9" RadiusY="0.9">
+        <GradientStop Color="#15161C" Offset="0"/>
+        <GradientStop Color="#08080A" Offset="1"/>
+      </RadialGradientBrush>
+    </Border.Background>
     <Grid>
       <Grid.RowDefinitions>
         <RowDefinition Height="52"/>
@@ -2244,6 +2352,15 @@ function Show-MainMenuWpf {
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="60"/>
         </Grid.ColumnDefinitions>
+        <Rectangle Grid.ColumnSpan="3" Height="2" VerticalAlignment="Bottom">
+          <Rectangle.Fill>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+              <GradientStop Color="#F2C94C" Offset="0"/>
+              <GradientStop Color="#56CCF2" Offset="0.5"/>
+              <GradientStop Color="#EB5757" Offset="1"/>
+            </LinearGradientBrush>
+          </Rectangle.Fill>
+        </Rectangle>
         <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="20,0,0,0">
           <TextBlock Text="⚡" FontSize="16" Foreground="#F2C94C" VerticalAlignment="Center"/>
           <TextBlock Text="NongPlaiShop" Foreground="White" FontSize="15" FontWeight="Bold" Margin="8,0,0,0" VerticalAlignment="Center"/>
@@ -2255,8 +2372,8 @@ function Show-MainMenuWpf {
       </Grid>
 
       <!-- Fanned card stage -->
-      <Grid Grid.Row="1">
-        <Border Name="Card0" Width="240" Height="290" CornerRadius="12" BorderThickness="0" Cursor="Hand"
+      <Grid Grid.Row="1" Name="Stage" Background="Transparent">
+        <Border Name="Card0" Width="240" Height="290" CornerRadius="14" BorderThickness="2" BorderBrush="Transparent" Cursor="Hand"
                 HorizontalAlignment="Center" VerticalAlignment="Center">
           <Border.Effect><DropShadowEffect Color="Black" BlurRadius="30" ShadowDepth="6" Opacity="0.6"/></Border.Effect>
           <Border CornerRadius="12">
@@ -2273,7 +2390,7 @@ function Show-MainMenuWpf {
             </StackPanel>
           </Border>
         </Border>
-        <Border Name="Card1" Width="240" Height="290" CornerRadius="12" BorderThickness="0" Cursor="Hand"
+        <Border Name="Card1" Width="240" Height="290" CornerRadius="14" BorderThickness="2" BorderBrush="Transparent" Cursor="Hand"
                 HorizontalAlignment="Center" VerticalAlignment="Center">
           <Border.Effect><DropShadowEffect Color="Black" BlurRadius="30" ShadowDepth="6" Opacity="0.6"/></Border.Effect>
           <Border CornerRadius="12">
@@ -2289,7 +2406,7 @@ function Show-MainMenuWpf {
             </StackPanel>
           </Border>
         </Border>
-        <Border Name="Card2" Width="240" Height="290" CornerRadius="12" BorderThickness="0" Cursor="Hand"
+        <Border Name="Card2" Width="240" Height="290" CornerRadius="14" BorderThickness="2" BorderBrush="Transparent" Cursor="Hand"
                 HorizontalAlignment="Center" VerticalAlignment="Center">
           <Border.Effect><DropShadowEffect Color="Black" BlurRadius="30" ShadowDepth="6" Opacity="0.6"/></Border.Effect>
           <Border CornerRadius="12">
@@ -2337,7 +2454,7 @@ function Show-MainMenuWpf {
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
-        <StackPanel Grid.Column="0" Orientation="Horizontal">
+        <StackPanel Grid.Column="0" Name="ButtonsPanel" Orientation="Horizontal">
           <Button Name="CycleLeftBtn" Content="◂" Width="42" Height="42" Background="#1c1c20" Foreground="White"
                   FontSize="16" BorderThickness="0" Cursor="Hand" Margin="0,0,8,0"/>
           <Button Name="RunBtn" Content="RUN ▸" Width="170" Height="42"
@@ -2345,7 +2462,7 @@ function Show-MainMenuWpf {
           <Button Name="CycleRightBtn" Content="▸" Width="42" Height="42" Background="#1c1c20" Foreground="White"
                   FontSize="16" BorderThickness="0" Cursor="Hand" Margin="8,0,0,0"/>
         </StackPanel>
-        <TextBlock Grid.Column="1" Text="NongPlaiShop · Smart Adaptive Tuner v2.0"
+        <TextBlock Grid.Column="1" Text="NongPlaiShop · Smart Adaptive Tuner v1.0"
                    Foreground="#4a4a4e" FontSize="11" VerticalAlignment="Center" HorizontalAlignment="Right"/>
       </Grid>
     </Grid>
@@ -2362,6 +2479,7 @@ function Show-MainMenuWpf {
     $runBtn    = $window.FindName('RunBtn')
     $closeBtn  = $window.FindName('CloseBtn')
     $topBar    = $window.FindName('TopBar')
+    $buttonsPanel   = $window.FindName('ButtonsPanel')
     $leftBtn   = $window.FindName('CycleLeftBtn')
     $rightBtn  = $window.FindName('CycleRightBtn')
 
@@ -2369,16 +2487,59 @@ function Show-MainMenuWpf {
     $script:GuiResult = $null
     $bc = New-Object Windows.Media.BrushConverter
 
-    function Set-CardSlot {
-        param($Card, [double]$X, [double]$Rotate, [double]$Scale, [double]$Opacity, [int]$Z)
-        $grp = New-Object Windows.Media.TransformGroup
-        $grp.Children.Add((New-Object Windows.Media.ScaleTransform $Scale, $Scale))
-        $grp.Children.Add((New-Object Windows.Media.RotateTransform $Rotate))
-        $grp.Children.Add((New-Object Windows.Media.TranslateTransform $X, 0))
-        $Card.RenderTransformOrigin = '0.5,0.5'
-        $Card.RenderTransform = $grp
-        $Card.Opacity = $Opacity
+    function Animate-CardSlot {
+        param($Card, [double]$X, [double]$Rotate, [double]$Scale, [double]$Opacity, [int]$Z, [string]$Accent, [bool]$Selected)
+        $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(280))
+        $ease = New-Object Windows.Media.Animation.CubicEase
+        $ease.EasingMode = [Windows.Media.Animation.EasingMode]::EaseInOut
+
+        if (-not ($Card.RenderTransform -is [Windows.Media.TransformGroup])) {
+            $grp = New-Object Windows.Media.TransformGroup
+            $grp.Children.Add((New-Object Windows.Media.ScaleTransform 1, 1))
+            $grp.Children.Add((New-Object Windows.Media.RotateTransform 0))
+            $grp.Children.Add((New-Object Windows.Media.TranslateTransform 0, 0))
+            $Card.RenderTransformOrigin = '0.5,0.5'
+            $Card.RenderTransform = $grp
+        }
+        $scaleT = $Card.RenderTransform.Children[0]
+        $rotT   = $Card.RenderTransform.Children[1]
+        $transT = $Card.RenderTransform.Children[2]
+
+        foreach ($pair in @(
+            @{ Target = $scaleT; Prop = [Windows.Media.ScaleTransform]::ScaleXProperty; To = $Scale },
+            @{ Target = $scaleT; Prop = [Windows.Media.ScaleTransform]::ScaleYProperty; To = $Scale },
+            @{ Target = $rotT;   Prop = [Windows.Media.RotateTransform]::AngleProperty;  To = $Rotate },
+            @{ Target = $transT; Prop = [Windows.Media.TranslateTransform]::XProperty;   To = $X }
+        )) {
+            $anim = New-Object Windows.Media.Animation.DoubleAnimation($pair.To, $dur)
+            $anim.EasingFunction = $ease
+            $pair.Target.BeginAnimation($pair.Prop, $anim)
+        }
+        $opacAnim = New-Object Windows.Media.Animation.DoubleAnimation($Opacity, $dur)
+        $opacAnim.EasingFunction = $ease
+        $Card.BeginAnimation([Windows.UIElement]::OpacityProperty, $opacAnim)
         [Windows.Controls.Panel]::SetZIndex($Card, $Z)
+
+        # Colored glow + border ring on the selected card, matching its own accent color -
+        # gives clear visual feedback on which of the three actions is currently armed.
+        $accentBrush = $bc.ConvertFromString($Accent)
+        if ($Selected) {
+            $Card.BorderBrush = $accentBrush
+            if ($Card.Effect -is [Windows.Media.Effects.DropShadowEffect]) {
+                $Card.Effect.Color = $accentBrush.Color
+                $Card.Effect.BlurRadius = 42
+                $Card.Effect.ShadowDepth = 0
+                $Card.Effect.Opacity = 0.75
+            }
+        } else {
+            $Card.BorderBrush = [Windows.Media.Brushes]::Transparent
+            if ($Card.Effect -is [Windows.Media.Effects.DropShadowEffect]) {
+                $Card.Effect.Color = [Windows.Media.Colors]::Black
+                $Card.Effect.BlurRadius = 30
+                $Card.Effect.ShadowDepth = 6
+                $Card.Effect.Opacity = 0.6
+            }
+        }
     }
 
     function Update-CardSelection {
@@ -2386,26 +2547,76 @@ function Show-MainMenuWpf {
         $sel = $script:GuiSelectedIndex
         $leftIdx  = ($sel - 1 + $n) % $n
         $rightIdx = ($sel + 1) % $n
-        Set-CardSlot $cards[$leftIdx]  -220 -10 0.82 0.5 1
-        Set-CardSlot $cards[$sel]        0   0  1.0  1.0 10
-        Set-CardSlot $cards[$rightIdx]  220  10 0.82 0.5 1
+        Animate-CardSlot $cards[$leftIdx]  -220 -10 0.82 0.5 1  $script:MenuCards[$leftIdx].Accent  $false
+        Animate-CardSlot $cards[$sel]        0   0  1.0  1.0 10 $script:MenuCards[$sel].Accent      $true
+        Animate-CardSlot $cards[$rightIdx]  220  10 0.82 0.5 1  $script:MenuCards[$rightIdx].Accent $false
 
         $m = $script:MenuCards[$sel]
         $descTitle.Text = $m.Title
         $descTitle.Foreground = $bc.ConvertFromString($m.Accent)
         $descBody.Text = $m.Desc
         $bigTitle.Text = $m.Title.Split(' ')[0]
+        $bigTitle.Foreground = $bc.ConvertFromString($m.Accent)
+        $bigTitle.Opacity = 1.0
     }
 
     for ($i = 0; $i -lt $cards.Count; $i++) {
         $idx = $i
-        $cards[$i].Add_MouseLeftButtonUp({ $script:GuiSelectedIndex = $idx; Update-CardSelection }.GetNewClosure())
+        $cards[$i].Add_MouseLeftButtonUp({ if (-not $script:GuiIsDragging) { $script:GuiSelectedIndex = $idx; Update-CardSelection } }.GetNewClosure())
     }
     $leftBtn.Add_Click({ $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection })
     $rightBtn.Add_Click({ $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection })
-    $runBtn.Add_Click({ $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key; $window.Close() })
+    $runBtn.Add_Click({
+        $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key
+        $window.Close()
+    })
     $closeBtn.Add_Click({ $script:GuiResult = '3'; $window.Close() })
     $topBar.Add_MouseLeftButtonDown({ try { $window.DragMove() } catch {} })
+
+    # Mouse drag (click-and-drag left/right) to swipe between cards, like a carousel
+    $stage = $window.FindName('Stage')
+    $script:GuiDragStartX = $null
+    $script:GuiIsDragging = $false
+    $stage.Add_MouseLeftButtonDown({
+        param($s, $e)
+        $script:GuiDragStartX = $e.GetPosition($stage).X
+        $script:GuiIsDragging = $false
+        $stage.CaptureMouse() | Out-Null
+    })
+    $stage.Add_MouseMove({
+        param($s, $e)
+        if ($script:GuiDragStartX -ne $null -and $e.LeftButton -eq 'Pressed') {
+            $dx = $e.GetPosition($stage).X - $script:GuiDragStartX
+            if ([math]::Abs($dx) -gt 8) { $script:GuiIsDragging = $true }
+        }
+    })
+    $stage.Add_MouseLeftButtonUp({
+        param($s, $e)
+        if ($script:GuiDragStartX -ne $null) {
+            $dx = $e.GetPosition($stage).X - $script:GuiDragStartX
+            if ($script:GuiIsDragging) {
+                if ($dx -le -40) { $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection }
+                elseif ($dx -ge 40) { $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection }
+            }
+        }
+        $stage.ReleaseMouseCapture() | Out-Null
+        $script:GuiDragStartX = $null
+        $script:GuiIsDragging = $false
+    })
+
+    # Keyboard shortcuts: 1/2/3 jump straight to a card, arrows cycle, Enter runs, Esc exits
+    $window.Add_KeyDown({
+        param($s, $e)
+        switch ($e.Key) {
+            'D1'      { $script:GuiSelectedIndex = 0; Update-CardSelection }
+            'D2'      { $script:GuiSelectedIndex = 1; Update-CardSelection }
+            'D3'      { $script:GuiSelectedIndex = 2; Update-CardSelection }
+            'Left'    { $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection }
+            'Right'   { $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection }
+            'Enter'   { $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key; $window.Close() }
+            'Escape'  { $script:GuiResult = '3'; $window.Close() }
+        }
+    })
 
     Update-CardSelection
     $window.ShowDialog() | Out-Null
@@ -2413,29 +2624,214 @@ function Show-MainMenuWpf {
 }
 
 # ---------------------------------------------------------------------------
-# Entry point
+# GUI worker mode
 # ---------------------------------------------------------------------------
-if ($HpetToggle) {
-    Invoke-HpetToggle
-    exit 0
+function Play-GuiSound {
+    param([ValidateSet('Start','Progress','Done','Error')][string]$Kind = 'Progress')
+    try {
+        switch ($Kind) {
+            'Start'    { for ($f = 500; $f -le 1500; $f += 100) { [Console]::Beep($f, 18) } }
+            'Progress' { [Console]::Beep(660, 45) }
+            'Done'     { [Console]::Beep(1046, 600) }
+            'Error'    {
+                [Console]::Beep(311, 220)
+                [Console]::Beep(233, 260)
+            }
+        }
+    } catch {}
 }
 
-
-:menu while ($true) {
-    $sel = Show-MainMenuWpf
-    Show-ConsoleWindow
-    switch ($sel) {
-        '1' { Invoke-DoEverything }
-        '2' { Invoke-ResetUltra }
-        '3' { break menu }
-        default { break menu }
+function Invoke-GuiWorkerAction {
+    try {
+        switch ($WorkerAction) {
+            'Apply' { Invoke-DoEverything }
+            'Reset' { Invoke-ResetUltra }
+            'Scan'  { Invoke-HardwareScanOnly }
+            'Hpet'  { Invoke-HpetToggle }
+            default { throw "ไม่พบคำสั่ง worker ที่ถูกต้อง: $WorkerAction" }
+        }
+        Write-GuiEvent -Type 'done' -Current 100 -Total 100 -Label 'เสร็จสมบูรณ์' -Message 'การทำงานเสร็จสมบูรณ์'
+        try {
+            if ($script:ScriptPath -and ($script:ScriptPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
+                Remove-Item -Path $script:ScriptPath -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
+        exit 0
+    } catch {
+        Write-GuiEvent -Type 'error' -Current 0 -Total 100 -Label 'เกิดข้อผิดพลาด' -Message $_.Exception.Message
+        try {
+            if ($script:ScriptPath -and ($script:ScriptPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
+                Remove-Item -Path $script:ScriptPath -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
+        exit 1
     }
 }
 
-# Clean up the temp copy of this script if it was created for the irm|iex one-liner flow.
+function Start-GuiWorkerProcess {
+    param([Parameter(Mandatory)][string]$Action, [Parameter(Mandatory)][string]$LogPath)
+    $selfPath = $script:ScriptPath
+    if ([string]::IsNullOrWhiteSpace($selfPath) -or -not (Test-Path $selfPath)) {
+        throw 'ไม่พบไฟล์ .ps1 สำหรับเริ่มงานเบื้องหลัง กรุณาเปิดจากไฟล์สคริปต์ที่บันทึกไว้ในเครื่อง'
+    }
+    $workerArgs = @(
+        '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+        '-File', $selfPath, '-Worker', '-WorkerAction', $Action,
+        '-GuiLogPath', $LogPath
+    )
+    if ($script:DryRun) { $workerArgs += '-DryRun' }
+    return Start-Process -FilePath 'powershell.exe' -ArgumentList $workerArgs -WindowStyle Hidden -PassThru
+}
+
+function Show-WorkerProgressWpf {
+    param([Parameter(Mandatory)][ValidateSet('Apply','Reset')][string]$Action)
+
+    $logPath = Join-Path $env:TEMP ("NongPlaiGui_" + [guid]::NewGuid().ToString('N') + '.log')
+    New-Item -ItemType File -Path $logPath -Force | Out-Null
+    $worker = $null
+    try { $worker = Start-GuiWorkerProcess -Action $Action -LogPath $logPath }
+    catch {
+        Play-GuiSound -Kind Error
+        [System.Windows.MessageBox]::Show($_.Exception.Message, 'NongPlaiShop', 'OK', 'Error') | Out-Null
+        Remove-Item $logPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+    Play-GuiSound -Kind Start
+
+    [xml]$progressXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        Title="NongPlaiShop - Working" Height="300" Width="660"
+        WindowStartupLocation="CenterScreen" WindowStyle="None"
+        ResizeMode="NoResize" Background="#08080A" AllowsTransparency="True" ShowInTaskbar="True">
+  <Border CornerRadius="16" Background="#15161C" BorderBrush="#34343C" BorderThickness="1" Padding="38">
+    <StackPanel VerticalAlignment="Center">
+      <TextBlock Text="NongPlaiShop กำลังทำงาน" Foreground="#F2C94C" FontSize="23" FontWeight="Bold" HorizontalAlignment="Center"/>
+      <TextBlock Name="ProgressStage" Text="กำลังเตรียมการ..." Foreground="#FFFFFF" FontSize="14" HorizontalAlignment="Center" Margin="0,14,0,0"/>
+      <ProgressBar Name="ProgressBar" Minimum="0" Maximum="100" Value="0" Height="18" Margin="0,24,0,0" Background="#2B2C33" Foreground="#F2C94C" BorderThickness="0"/>
+      <TextBlock Name="ProgressPercent" Text="0%" Foreground="#C9C9CC" FontSize="13" HorizontalAlignment="Center" Margin="0,8,0,0"/>
+      <TextBlock Name="ProgressHint" Text="กำลังทำงาน โปรดรอสักครู่..." Foreground="#7D7D82" FontSize="11" HorizontalAlignment="Center" Margin="0,7,0,0"/>
+    </StackPanel>
+  </Border>
+</Window>
+"@
+    $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $progressXaml))
+    $stageText = $window.FindName('ProgressStage')
+    $bar = $window.FindName('ProgressBar')
+    $percentText = $window.FindName('ProgressPercent')
+    $hintText = $window.FindName('ProgressHint')
+    $done = $false
+    $ticksNoEvent = 0
+
+    $timer = New-Object Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(350)
+    $timer.Add_Tick({
+        try {
+            $latest = @(Get-Content -Path $logPath -Encoding UTF8 -ErrorAction SilentlyContinue |
+                Where-Object { $_ -like '__NONGPLAI_EVENT__*' } | Select-Object -Last 1)
+            if ($latest.Count -eq 0) {
+                $ticksNoEvent++
+                if ($ticksNoEvent -eq 60) {
+                    $hintText.Text = 'ใช้เวลานานกว่าปกติ แต่ยังทำงานอยู่ โปรดรออีกสักครู่...'
+                }
+            } else {
+                $ticksNoEvent = 0
+            }
+            if ($latest.Count -gt 0) {
+                $evt = ($latest[0] -replace '^__NONGPLAI_EVENT__', '') | ConvertFrom-Json
+                $current = [int]$evt.current
+                $total = [int]$evt.total
+                $rawPct = if ($total -gt 0) { [math]::Max(0, [math]::Min(100, [int](($current / $total) * 100))) } else { 0 }
+                $stage = [string]$evt.stage
+                $pct = $rawPct
+                if ($stage -eq 'legacy') { $pct = [int][math]::Round($rawPct * 0.75) }
+                elseif ($stage -eq 'adaptive') { $pct = 75 + [int][math]::Round($rawPct * 0.25) }
+                $pct = [math]::Max(0, [math]::Min(100, $pct))
+                $bar.Value = $pct
+                $percentText.Text = "$pct%"
+                if ($evt.label) { $stageText.Text = [string]$evt.label }
+                if ($evt.message) { $hintText.Text = [string]$evt.message }
+                if ([string]$evt.type -eq 'done') {
+                    $done = $true
+                    $bar.Value = 100
+                    $percentText.Text = '100%'
+                    $stageText.Text = 'เสร็จสมบูรณ์'
+                    $hintText.Text = 'ทำงานเสร็จแล้ว กำลังปิดหน้าต่าง...'
+                    Play-GuiSound -Kind Done
+                    $timer.Stop()
+                    $closeTimer = New-Object Windows.Threading.DispatcherTimer
+                    $closeTimer.Interval = [TimeSpan]::FromMilliseconds(900)
+                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $window.Close() }.GetNewClosure())
+                    $closeTimer.Start()
+                }
+                elseif ([string]$evt.type -eq 'error') {
+                    $done = $true
+                    $stageText.Text = 'เกิดข้อผิดพลาด'
+                    $hintText.Text = [string]$evt.message
+                    Play-GuiSound -Kind Error
+                    $timer.Stop()
+                    $closeTimer = New-Object Windows.Threading.DispatcherTimer
+                    $closeTimer.Interval = [TimeSpan]::FromMilliseconds(2500)
+                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $window.Close() }.GetNewClosure())
+                    $closeTimer.Start()
+                }
+            }
+            if ($worker.HasExited -and -not $done) {
+                $done = $true
+                $stageText.Text = 'งานหยุดก่อนเสร็จสมบูรณ์'
+                $hintText.Text = "โปรเซสจบการทำงาน (รหัส $($worker.ExitCode))"
+                Play-GuiSound -Kind Error
+                $timer.Stop()
+                $closeTimer = New-Object Windows.Threading.DispatcherTimer
+                $closeTimer.Interval = [TimeSpan]::FromMilliseconds(2500)
+                $closeTimer.Add_Tick({ $closeTimer.Stop(); $window.Close() }.GetNewClosure())
+                $closeTimer.Start()
+            }
+        } catch {}
+    }.GetNewClosure())
+    $window.Add_Closed({ try { $timer.Stop() } catch {}; Remove-Item $logPath -Force -ErrorAction SilentlyContinue }.GetNewClosure())
+    $timer.Start()
+    $window.ShowDialog() | Out-Null
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if ($Worker) {
+    Invoke-GuiWorkerAction
+    exit 0
+}
+
+if ($HpetToggle) {
+    try { Invoke-HpetToggle }
+    catch {
+        Write-Host ""
+        Write-Host "  FATAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  $($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkGray
+        Read-Host "Press Enter to close"
+    }
+    exit 0
+}
+
 try {
-    $selfPath = $MyInvocation.MyCommand.Path
-    if ($selfPath -and ($selfPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
+    $sel = Show-MainMenuWpf
+    switch ($sel) {
+        '1' { Show-WorkerProgressWpf -Action 'Apply' }
+        '2' { Show-WorkerProgressWpf -Action 'Reset' }
+        default { }
+    }
+} catch {
+    # Keep failures inside the GUI flow. No console is shown here.
+    Play-GuiSound -Kind Error
+    Write-GuiEvent -Type 'error' -Current 0 -Total 100 -Label 'เกิดข้อผิดพลาดของ GUI' -Message $_.Exception.Message
+    # The error is intentionally not printed to a PowerShell window; show it as a GUI dialog.
+    try { [System.Windows.MessageBox]::Show($_.Exception.Message, 'NongPlaiShop - Error', 'OK', 'Error') | Out-Null } catch {}
+}
+
+
+# Clean up the temp copy of this script if it was created for the irm|iex one-liner flow.
+    try {
+        $selfPath = $script:ScriptPath
+        if ($selfPath -and ($selfPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
         Remove-Item -Path $selfPath -Force -ErrorAction SilentlyContinue
     }
 } catch {}
