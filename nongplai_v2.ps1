@@ -53,12 +53,16 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
         $runPath = Join-Path $env:TEMP "nongplai_v2_$([guid]::NewGuid().ToString('N')).ps1"
         Set-Content -Path $runPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8
     }
-    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $runPath)
+    $quotedRunPath = '"' + $runPath + '"'
+    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $quotedRunPath)
     if ($HpetToggle) { $argList += '-HpetToggle' }
     if ($DryRun) { $argList += '-DryRun' }
     if ($Worker) { $argList += '-Worker' }
     if ($WorkerAction) { $argList += @('-WorkerAction', $WorkerAction) }
-    if ($GuiLogPath) { $argList += @('-GuiLogPath', $GuiLogPath) }
+    if ($GuiLogPath) {
+        $quotedGuiLogPath = '"' + $GuiLogPath + '"'
+        $argList += @('-GuiLogPath', $quotedGuiLogPath)
+    }
     try {
         Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -WindowStyle Hidden | Out-Null
     } catch {
@@ -82,7 +86,7 @@ $script:LogFile   = $null
 $script:OK        = 0
 $script:Total     = 0
 $script:Failed    = New-Object System.Collections.Generic.List[string]
-$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v1.0"
+$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v2.0"
 
 $script:DefenderPolicyValues = $null
 $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
@@ -90,8 +94,6 @@ $script:DryRun = [bool]$DryRun
 $script:GuiWorker = [bool]$Worker
 $script:GuiLogPath = $GuiLogPath
 $script:GuiStage = 'startup'
-$script:LegacyStepCount = 0
-$script:LegacyStepTotal = 40
 $script:HwInfo = $null
 
 function Write-GuiEvent {
@@ -115,13 +117,7 @@ function Write-GuiEvent {
         }
         $line = '__NONGPLAI_EVENT__' + ($payload | ConvertTo-Json -Compress)
         [System.IO.File]::AppendAllText($script:GuiLogPath, $line + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
-    } catch {
-        try {
-            $dbgPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
-            $dbgLine = "[{0}] GuiLogPath='{1}' error={2}" -f (Get-Date -Format 'o'), $script:GuiLogPath, $_.Exception.Message
-            [System.IO.File]::AppendAllText($dbgPath, $dbgLine + [Environment]::NewLine)
-        } catch {}
-    }
+    } catch {}
 }
 
 # In worker mode the child process has no visible console. Redirect Write-Host output
@@ -154,14 +150,7 @@ if ($script:GuiWorker) {
 # ---------------------------------------------------------------------------
 # v2: colored status output + progress bar
 # ---------------------------------------------------------------------------
-function Write-Ok    {
-    param([string]$Message)
-    Write-Host "  [OK] $Message"   -ForegroundColor Green
-    if ($script:GuiWorker -and $script:GuiStage -eq 'legacy') {
-        $script:LegacyStepCount++
-        Write-GuiEvent -Type 'progress' -Current $script:LegacyStepCount -Total $script:LegacyStepTotal -Label $Message
-    }
-}
+function Write-Ok    { param([string]$Message) Write-Host "  [OK] $Message"   -ForegroundColor Green }
 function Write-Bad   { param([string]$Message) Write-Host "  [XX] $Message"   -ForegroundColor Red }
 function Write-Warn2 { param([string]$Message) Write-Host "  [!!] $Message"   -ForegroundColor Yellow }
 function Write-Info2 { param([string]$Message) Write-Host "  [->] $Message"   -ForegroundColor Cyan }
@@ -192,8 +181,8 @@ function Write-Log {
 }
 
 function New-BackupFolder {
-    $ts = Get-Date -Format "yyMMdd_HHmmss"
-    $dir = Join-Path $env:TEMP "NPBK_$ts"
+    $ts = Get-Date -Format "yyyyMMdd_HHmmss"
+    $dir = Join-Path $env:TEMP "FiveM_Ultra_Backup_$ts"
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
     $script:BackupDir = $dir
     $script:LogFile = Join-Path $dir "apply.log"
@@ -213,10 +202,10 @@ function Save-Changes {
 }
 
 function Find-LatestBackup {
-    $dirs = @(Get-ChildItem -Path $env:TEMP -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue)
+    $dirs = @(Get-ChildItem -Path $env:TEMP -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue)
     $desktop = [Environment]::GetFolderPath('Desktop')
     if (Test-Path $desktop) {
-        $dirs += @(Get-ChildItem -Path $desktop -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue)
+        $dirs += @(Get-ChildItem -Path $desktop -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue)
     }
     if ($dirs.Count -eq 0) { return $null }
     return ($dirs | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
@@ -494,7 +483,6 @@ function Invoke-ApplyUltra {
     $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
 
     Write-Host "Checking system..."
-    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังตรวจสอบสเปกเครื่อง...'
     try {
         $os = Get-CimInstance Win32_OperatingSystem
         $cs = Get-CimInstance Win32_ComputerSystem
@@ -509,29 +497,14 @@ function Invoke-ApplyUltra {
     if ($gtaName) { Write-Host "GTA process file: $gtaName" }
 
     Write-Host "Creating restore point..."
-    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังสร้างจุดคืนค่าระบบ (อาจใช้เวลาถึง 1 นาที)...'
     try {
-        $rpJob = Start-Job -ScriptBlock {
-            param($desc)
-            Checkpoint-Computer -Description $desc -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
-        } -ArgumentList 'FiveM Ultra Before Apply'
-        if (Wait-Job $rpJob -Timeout 45) {
-            if ($rpJob.State -eq 'Completed' -and -not (Receive-Job $rpJob -ErrorAction SilentlyContinue -Keep | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })) {
-                Write-Host "Restore point: created"
-            } else {
-                Write-Host "Restore point: skipped (see job errors)"
-            }
-        } else {
-            Write-Host "Restore point: skipped - timed out after 45s (Windows System Restore is slow/stuck on this PC)"
-            Stop-Job $rpJob -ErrorAction SilentlyContinue
-        }
-        Remove-Job $rpJob -Force -ErrorAction SilentlyContinue
+        Checkpoint-Computer -Description 'FiveM Ultra Before Apply' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+        Write-Host "Restore point: created"
     } catch {
         Write-Host ("Restore point: skipped - " + $_.Exception.Message)
     }
 
     Write-Host "Testing network baseline..."
-    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย...'
     try { Test-Connection -ComputerName 1.1.1.1 -Count 4 | Format-Table -AutoSize | Out-Host } catch {}
 
     $script:Total = 39
@@ -1235,10 +1208,10 @@ function Invoke-ResetUltra {
 
     Write-Host "Undid $count tracked changes, plus global network/power defaults."
     Write-Host "Removing temporary backup folders..."
-    Get-ChildItem -Path $env:TEMP -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $env:TEMP -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     $desktop = [Environment]::GetFolderPath('Desktop')
     if (Test-Path $desktop) {
-        Get-ChildItem -Path $desktop -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $desktop -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
     Write-Host ""
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
@@ -1375,7 +1348,7 @@ function Invoke-RemoveDefenderPolicy {
         return
     }
 
-    $backupDir = Join-Path $env:TEMP ("NPBK_" + (Get-Date -Format "yyMMdd_HHmmss"))
+    $backupDir = Join-Path $env:TEMP ("FiveM_Ultra_Backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
     New-Item -Path $backupDir -ItemType Directory -Force | Out-Null
     $regBackup = Join-Path $backupDir "WindowsDefenderPolicy_backup.reg"
     try {
@@ -2089,7 +2062,7 @@ function Invoke-NetworkAdaptive {
 function Invoke-SmartApply {
     Clear-Host
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    Write-Host "  SMART ADAPTIVE TUNER v1.0 - HARDWARE SCAN -> DEEP TWEAK" -ForegroundColor Cyan
+    Write-Host "  SMART ADAPTIVE TUNER v2.0 - HARDWARE SCAN -> DEEP TWEAK" -ForegroundColor Cyan
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     if ($script:DryRun) {
         Write-Warn2 "DRY RUN MODE - nothing will actually be changed, this is a preview only"
@@ -2186,7 +2159,6 @@ function Invoke-DoEverything {
 
     # --- Part 1: full legacy 39-step Apply Ultra (creates backup folder + restore point) ---
     $script:GuiStage = 'legacy'
-    $script:LegacyStepCount = 0
     Invoke-ApplyUltra
 
     # --- Part 2: scan this PC's hardware and layer on adaptive CPU/GPU/RAM/Storage/Network tweaks ---
@@ -2372,7 +2344,7 @@ function Show-MainMenuWpf {
       </Grid>
 
       <!-- Fanned card stage -->
-      <Grid Grid.Row="1" Name="Stage" Background="Transparent">
+      <Grid Grid.Row="1">
         <Border Name="Card0" Width="240" Height="290" CornerRadius="14" BorderThickness="2" BorderBrush="Transparent" Cursor="Hand"
                 HorizontalAlignment="Center" VerticalAlignment="Center">
           <Border.Effect><DropShadowEffect Color="Black" BlurRadius="30" ShadowDepth="6" Opacity="0.6"/></Border.Effect>
@@ -2454,7 +2426,7 @@ function Show-MainMenuWpf {
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
-        <StackPanel Grid.Column="0" Name="ButtonsPanel" Orientation="Horizontal">
+        <StackPanel Grid.Column="0" Orientation="Horizontal">
           <Button Name="CycleLeftBtn" Content="◂" Width="42" Height="42" Background="#1c1c20" Foreground="White"
                   FontSize="16" BorderThickness="0" Cursor="Hand" Margin="0,0,8,0"/>
           <Button Name="RunBtn" Content="RUN ▸" Width="170" Height="42"
@@ -2462,8 +2434,23 @@ function Show-MainMenuWpf {
           <Button Name="CycleRightBtn" Content="▸" Width="42" Height="42" Background="#1c1c20" Foreground="White"
                   FontSize="16" BorderThickness="0" Cursor="Hand" Margin="8,0,0,0"/>
         </StackPanel>
-        <TextBlock Grid.Column="1" Text="NongPlaiShop · Smart Adaptive Tuner v1.0"
+        <TextBlock Grid.Column="1" Text="NongPlaiShop · Smart Adaptive Tuner v2.0"
                    Foreground="#4a4a4e" FontSize="11" VerticalAlignment="Center" HorizontalAlignment="Right"/>
+      </Grid>
+
+      <!-- Work overlay: the worker runs hidden while this remains the only visible window. -->
+      <Grid Name="WorkOverlay" Grid.RowSpan="4" Visibility="Collapsed" Background="#E608080A" Panel.ZIndex="100">
+        <Border Width="610" Height="230" CornerRadius="16" Background="#191A20" BorderBrush="#3A3A42" BorderThickness="1"
+                HorizontalAlignment="Center" VerticalAlignment="Center" Padding="34">
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Text="NongPlaiShop กำลังทำงาน" Foreground="#F2C94C" FontSize="22" FontWeight="Bold" HorizontalAlignment="Center"/>
+            <TextBlock Name="WorkStage" Text="กำลังเตรียมการ..." Foreground="#FFFFFF" FontSize="14" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+            <ProgressBar Name="WorkProgress" Minimum="0" Maximum="100" Value="0" Height="18" Margin="0,22,0,0"
+                         Background="#2B2C33" Foreground="#F2C94C" BorderThickness="0"/>
+            <TextBlock Name="WorkPercent" Text="0%" Foreground="#C9C9CC" FontSize="13" HorizontalAlignment="Center" Margin="0,8,0,0"/>
+            <TextBlock Name="WorkHint" Text="โปรดรอสักครู่ ห้ามปิดหน้าต่างระหว่างทำงาน" Foreground="#7D7D82" FontSize="11" HorizontalAlignment="Center" Margin="0,8,0,0"/>
+          </StackPanel>
+        </Border>
       </Grid>
     </Grid>
   </Border>
@@ -2479,7 +2466,6 @@ function Show-MainMenuWpf {
     $runBtn    = $window.FindName('RunBtn')
     $closeBtn  = $window.FindName('CloseBtn')
     $topBar    = $window.FindName('TopBar')
-    $buttonsPanel   = $window.FindName('ButtonsPanel')
     $leftBtn   = $window.FindName('CycleLeftBtn')
     $rightBtn  = $window.FindName('CycleRightBtn')
 
@@ -2562,61 +2548,13 @@ function Show-MainMenuWpf {
 
     for ($i = 0; $i -lt $cards.Count; $i++) {
         $idx = $i
-        $cards[$i].Add_MouseLeftButtonUp({ if (-not $script:GuiIsDragging) { $script:GuiSelectedIndex = $idx; Update-CardSelection } }.GetNewClosure())
+        $cards[$i].Add_MouseLeftButtonUp({ $script:GuiSelectedIndex = $idx; Update-CardSelection }.GetNewClosure())
     }
     $leftBtn.Add_Click({ $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection })
     $rightBtn.Add_Click({ $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection })
-    $runBtn.Add_Click({
-        $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key
-        $window.Close()
-    })
+    $runBtn.Add_Click({ $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key; $window.Close() })
     $closeBtn.Add_Click({ $script:GuiResult = '3'; $window.Close() })
     $topBar.Add_MouseLeftButtonDown({ try { $window.DragMove() } catch {} })
-
-    # Mouse drag (click-and-drag left/right) to swipe between cards, like a carousel
-    $stage = $window.FindName('Stage')
-    $script:GuiDragStartX = $null
-    $script:GuiIsDragging = $false
-    $stage.Add_MouseLeftButtonDown({
-        param($s, $e)
-        $script:GuiDragStartX = $e.GetPosition($stage).X
-        $script:GuiIsDragging = $false
-        $stage.CaptureMouse() | Out-Null
-    })
-    $stage.Add_MouseMove({
-        param($s, $e)
-        if ($script:GuiDragStartX -ne $null -and $e.LeftButton -eq 'Pressed') {
-            $dx = $e.GetPosition($stage).X - $script:GuiDragStartX
-            if ([math]::Abs($dx) -gt 8) { $script:GuiIsDragging = $true }
-        }
-    })
-    $stage.Add_MouseLeftButtonUp({
-        param($s, $e)
-        if ($script:GuiDragStartX -ne $null) {
-            $dx = $e.GetPosition($stage).X - $script:GuiDragStartX
-            if ($script:GuiIsDragging) {
-                if ($dx -le -40) { $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection }
-                elseif ($dx -ge 40) { $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection }
-            }
-        }
-        $stage.ReleaseMouseCapture() | Out-Null
-        $script:GuiDragStartX = $null
-        $script:GuiIsDragging = $false
-    })
-
-    # Keyboard shortcuts: 1/2/3 jump straight to a card, arrows cycle, Enter runs, Esc exits
-    $window.Add_KeyDown({
-        param($s, $e)
-        switch ($e.Key) {
-            'D1'      { $script:GuiSelectedIndex = 0; Update-CardSelection }
-            'D2'      { $script:GuiSelectedIndex = 1; Update-CardSelection }
-            'D3'      { $script:GuiSelectedIndex = 2; Update-CardSelection }
-            'Left'    { $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection }
-            'Right'   { $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection }
-            'Enter'   { $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key; $window.Close() }
-            'Escape'  { $script:GuiResult = '3'; $window.Close() }
-        }
-    })
 
     Update-CardSelection
     $window.ShowDialog() | Out-Null
@@ -2630,13 +2568,10 @@ function Play-GuiSound {
     param([ValidateSet('Start','Progress','Done','Error')][string]$Kind = 'Progress')
     try {
         switch ($Kind) {
-            'Start'    { for ($f = 500; $f -le 1500; $f += 100) { [Console]::Beep($f, 18) } }
-            'Progress' { [Console]::Beep(660, 45) }
-            'Done'     { [Console]::Beep(1046, 600) }
-            'Error'    {
-                [Console]::Beep(311, 220)
-                [Console]::Beep(233, 260)
-            }
+            'Start'    { [System.Media.SystemSounds]::Asterisk.Play() }
+            'Progress' { [System.Media.SystemSounds]::Beep.Play() }
+            'Done'     { [System.Media.SystemSounds]::Exclamation.Play() }
+            'Error'    { [System.Media.SystemSounds]::Hand.Play() }
         }
     } catch {}
 }
@@ -2674,17 +2609,19 @@ function Start-GuiWorkerProcess {
     if ([string]::IsNullOrWhiteSpace($selfPath) -or -not (Test-Path $selfPath)) {
         throw 'ไม่พบไฟล์ .ps1 สำหรับเริ่มงานเบื้องหลัง กรุณาเปิดจากไฟล์สคริปต์ที่บันทึกไว้ในเครื่อง'
     }
+    $quotedSelfPath = '"' + $selfPath + '"'
+    $quotedLogPath = '"' + $LogPath + '"'
     $workerArgs = @(
         '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-        '-File', $selfPath, '-Worker', '-WorkerAction', $Action,
-        '-GuiLogPath', $LogPath
+        '-File', $quotedSelfPath, '-Worker', '-WorkerAction', $Action,
+        '-GuiLogPath', $quotedLogPath
     )
     if ($script:DryRun) { $workerArgs += '-DryRun' }
     return Start-Process -FilePath 'powershell.exe' -ArgumentList $workerArgs -WindowStyle Hidden -PassThru
 }
 
 function Show-WorkerProgressWpf {
-    param([Parameter(Mandatory)][ValidateSet('Apply','Reset')][string]$Action)
+    param([Parameter(Mandatory)][ValidateSet('Apply','Reset','Scan','Hpet')][string]$Action)
 
     $logPath = Join-Path $env:TEMP ("NongPlaiGui_" + [guid]::NewGuid().ToString('N') + '.log')
     New-Item -ItemType File -Path $logPath -Force | Out-Null
@@ -2710,6 +2647,8 @@ function Show-WorkerProgressWpf {
       <ProgressBar Name="ProgressBar" Minimum="0" Maximum="100" Value="0" Height="18" Margin="0,24,0,0" Background="#2B2C33" Foreground="#F2C94C" BorderThickness="0"/>
       <TextBlock Name="ProgressPercent" Text="0%" Foreground="#C9C9CC" FontSize="13" HorizontalAlignment="Center" Margin="0,8,0,0"/>
       <TextBlock Name="ProgressHint" Text="กำลังทำงาน โปรดรอสักครู่..." Foreground="#7D7D82" FontSize="11" HorizontalAlignment="Center" Margin="0,7,0,0"/>
+      <Button Name="ProgressClose" Content="ปิด" Width="120" Height="34" IsEnabled="False" Visibility="Collapsed"
+              HorizontalAlignment="Center" Margin="0,17,0,0" Background="#F2C94C" Foreground="#111114" FontWeight="Bold" BorderThickness="0"/>
     </StackPanel>
   </Border>
 </Window>
@@ -2719,8 +2658,9 @@ function Show-WorkerProgressWpf {
     $bar = $window.FindName('ProgressBar')
     $percentText = $window.FindName('ProgressPercent')
     $hintText = $window.FindName('ProgressHint')
+    $close = $window.FindName('ProgressClose')
     $done = $false
-    $ticksNoEvent = 0
+    $lastSoundBucket = 0
 
     $timer = New-Object Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromMilliseconds(350)
@@ -2728,14 +2668,6 @@ function Show-WorkerProgressWpf {
         try {
             $latest = @(Get-Content -Path $logPath -Encoding UTF8 -ErrorAction SilentlyContinue |
                 Where-Object { $_ -like '__NONGPLAI_EVENT__*' } | Select-Object -Last 1)
-            if ($latest.Count -eq 0) {
-                $ticksNoEvent++
-                if ($ticksNoEvent -eq 60) {
-                    $hintText.Text = 'ใช้เวลานานกว่าปกติ แต่ยังทำงานอยู่ โปรดรออีกสักครู่...'
-                }
-            } else {
-                $ticksNoEvent = 0
-            }
             if ($latest.Count -gt 0) {
                 $evt = ($latest[0] -replace '^__NONGPLAI_EVENT__', '') | ConvertFrom-Json
                 $current = [int]$evt.current
@@ -2750,47 +2682,45 @@ function Show-WorkerProgressWpf {
                 $percentText.Text = "$pct%"
                 if ($evt.label) { $stageText.Text = [string]$evt.label }
                 if ($evt.message) { $hintText.Text = [string]$evt.message }
+                $bucket = [int]([math]::Floor($pct / 10) * 10)
+                if ($bucket -gt $lastSoundBucket -and $pct -lt 100) {
+                    Play-GuiSound -Kind Progress
+                    $lastSoundBucket = $bucket
+                }
                 if ([string]$evt.type -eq 'done') {
                     $done = $true
                     $bar.Value = 100
                     $percentText.Text = '100%'
                     $stageText.Text = 'เสร็จสมบูรณ์'
-                    $hintText.Text = 'ทำงานเสร็จแล้ว กำลังปิดหน้าต่าง...'
+                    $hintText.Text = 'ทำงานเสร็จแล้ว กดปิดเพื่อกลับไปหน้าหลัก'
+                    $close.Visibility = 'Visible'
+                    $close.IsEnabled = $true
                     Play-GuiSound -Kind Done
-                    $timer.Stop()
-                    $closeTimer = New-Object Windows.Threading.DispatcherTimer
-                    $closeTimer.Interval = [TimeSpan]::FromMilliseconds(900)
-                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $window.Close() }.GetNewClosure())
-                    $closeTimer.Start()
                 }
                 elseif ([string]$evt.type -eq 'error') {
                     $done = $true
                     $stageText.Text = 'เกิดข้อผิดพลาด'
                     $hintText.Text = [string]$evt.message
+                    $close.Visibility = 'Visible'
+                    $close.IsEnabled = $true
                     Play-GuiSound -Kind Error
-                    $timer.Stop()
-                    $closeTimer = New-Object Windows.Threading.DispatcherTimer
-                    $closeTimer.Interval = [TimeSpan]::FromMilliseconds(2500)
-                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $window.Close() }.GetNewClosure())
-                    $closeTimer.Start()
                 }
             }
             if ($worker.HasExited -and -not $done) {
                 $done = $true
                 $stageText.Text = 'งานหยุดก่อนเสร็จสมบูรณ์'
                 $hintText.Text = "โปรเซสจบการทำงาน (รหัส $($worker.ExitCode))"
+                $close.Visibility = 'Visible'
+                $close.IsEnabled = $true
                 Play-GuiSound -Kind Error
-                $timer.Stop()
-                $closeTimer = New-Object Windows.Threading.DispatcherTimer
-                $closeTimer.Interval = [TimeSpan]::FromMilliseconds(2500)
-                $closeTimer.Add_Tick({ $closeTimer.Stop(); $window.Close() }.GetNewClosure())
-                $closeTimer.Start()
             }
         } catch {}
     }.GetNewClosure())
-    $window.Add_Closed({ try { $timer.Stop() } catch {}; Remove-Item $logPath -Force -ErrorAction SilentlyContinue }.GetNewClosure())
+    $close.Add_Click({ $window.Close() })
+    $window.Add_Closed({ $timer.Stop() })
     $timer.Start()
     $window.ShowDialog() | Out-Null
+    Remove-Item $logPath -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------
@@ -2813,11 +2743,14 @@ if ($HpetToggle) {
 }
 
 try {
-    $sel = Show-MainMenuWpf
-    switch ($sel) {
-        '1' { Show-WorkerProgressWpf -Action 'Apply' }
-        '2' { Show-WorkerProgressWpf -Action 'Reset' }
-        default { }
+    :menu while ($true) {
+        $sel = Show-MainMenuWpf
+        switch ($sel) {
+            '1' { Show-WorkerProgressWpf -Action 'Apply' }
+            '2' { Show-WorkerProgressWpf -Action 'Reset' }
+            '3' { break menu }
+            default { break menu }
+        }
     }
 } catch {
     # Keep failures inside the GUI flow. No console is shown here.
