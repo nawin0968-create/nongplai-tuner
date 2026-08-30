@@ -1,4 +1,4 @@
-﻿<#
+<#
     NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
     Rewritten from the original .cmd to fix reliability issues caused by
     batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -60,7 +60,7 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     # known-good .ps1 path to relaunch itself with - this must not depend on the child
     # re-detecting $MyInvocation.MyCommand.Path on its own.
     $script:ScriptPath = $runPath
-    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $runPath)
+    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$runPath`"")
     if ($HpetToggle) { $argList += '-HpetToggle' }
     if ($DryRun) { $argList += '-DryRun' }
     if ($Worker) { $argList += '-Worker' }
@@ -100,7 +100,7 @@ if ([string]::IsNullOrWhiteSpace($script:ScriptPath) -or -not (Test-Path $script
 # relaunch to hide the original console. Relaunch the persisted copy hidden so
 # the user sees only the GUI. Worker and WorkerUi processes are excluded.
 if ($script:InvokedFromPipe -and -not $Worker -and -not $WorkerUi -and -not $HpetToggle) {
-    $pipeArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath)
+    $pipeArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
     if ($DryRun) { $pipeArgs += '-DryRun' }
     Start-Process -FilePath 'powershell.exe' -ArgumentList $pipeArgs -WindowStyle Hidden | Out-Null
     exit 0
@@ -118,7 +118,7 @@ $script:LogFile   = $null
 $script:OK        = 0
 $script:Total     = 0
 $script:Failed    = New-Object System.Collections.Generic.List[string]
-$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v1.0"
+$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v2.1"
 
 $script:DefenderPolicyValues = $null
 $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
@@ -127,7 +127,7 @@ $script:GuiWorker = [bool]$Worker
 $script:GuiLogPath = $GuiLogPath
 $script:GuiStage = 'startup'
 $script:LegacyStepCount = 0
-$script:LegacyStepTotal = 40
+$script:LegacyStepTotal = 43  # +3 from v2.1: MMCSS, ProcessPriority, TrimVerify
 $script:HwInfo = $null
 
 function Write-GuiEvent {
@@ -590,7 +590,7 @@ function Invoke-ApplyUltra {
     Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย...'
     try { Test-Connection -ComputerName 1.1.1.1 -Count 4 | Format-Table -AutoSize | Out-Host } catch {}
 
-    $script:Total = 39
+    $script:Total = 42  # v2.1: 39 legacy + 3 new (MMCSS, ProcessPriority, TrimVerify)
     $n = 0
 
     Invoke-Step (++$n) $Total "Applying background, search, Game DVR, Delivery Optimization, telemetry policies..." {
@@ -669,6 +669,22 @@ function Invoke-ApplyUltra {
 
     Invoke-Step (++$n) $Total "Requesting lower kernel timer resolution..." {
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests' 1 'DWord' | Out-Null
+    }
+
+    Invoke-Step (++$n) $Total "Registering FiveM/GTAProcess to MMCSS (Multimedia Class Scheduler) with High priority..." {
+        Invoke-MmcssRegister 'FiveM.exe' | Out-Null
+    }
+
+    Invoke-Step (++$n) $Total "Setting FiveM base process priority to High (persistent)..." {
+        Invoke-ProcessPriorityHigh 'FiveM.exe' | Out-Null
+        $gtaName = Find-GtaProcessName
+        if ($gtaName) {
+            Invoke-ProcessPriorityHigh $gtaName | Out-Null
+        }
+    }
+
+    Invoke-Step (++$n) $Total "Verifying TRIM status on NVMe/SSD (write latency check)..." {
+        Invoke-TrimVerify | Out-Null
     }
 
     Invoke-Step (++$n) $Total "Disabling USB selective suspend on active power plan..." {
@@ -1065,7 +1081,7 @@ function Invoke-ApplyUltra {
     for ($i = 0; $i -lt $checks.Count; $i++) {
         try { if (& $checks[$i]) { $ok++ } else { $failed += $names[$i] } } catch { $failed += $names[$i] }
     }
-    Write-ProgressBar -Current 39 -Total 39 -Label 'Ultra profile applied'
+    Write-ProgressBar -Current $script:Total -Total $script:Total -Label 'Ultra profile applied'
     Write-Host ""
     $passColor = if ($ok -eq $checks.Count) { 'Green' } elseif ($ok -ge ($checks.Count * 0.7)) { 'Yellow' } else { 'Red' }
     Write-Host "Checks passed: $ok/$($checks.Count)" -ForegroundColor $passColor
@@ -1076,6 +1092,12 @@ function Invoke-ApplyUltra {
     Write-Log "Apply finished. Checks passed: $ok/$($checks.Count). Not applied: $($failed -join ', ')"
 
     # ---- Auto-help for Defender exclusions that Tamper Protection blocked ----
+    # v2.1: Cleanup backups and logs
+    Write-Host ""
+    Write-Host "Cleaning up old backups and rotating logs..."
+    Invoke-BackupPruning -KeepCount 5 | Out-Null
+    Invoke-LogRotation -MaxSizeMB 10 | Out-Null
+
     if ($script:PendingExclusions.Paths.Count -gt 0 -or $script:PendingExclusions.Processes.Count -gt 0) {
         Write-Host ""
         Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
@@ -1290,6 +1312,13 @@ function Invoke-ResetUltra {
     } catch {}
 
     Write-Host "Undid $count tracked changes, plus global network/power defaults."
+    
+    # v2.1: Verify reset success
+    Write-Host "Verifying reset success..."
+    $verifyOk = Invoke-ResetVerify -Changes $list
+    if (-not $verifyOk) {
+        Write-Warn2 "Some changes may not have reverted - see details above or check changes.json"
+    }
     Write-Host "Removing temporary backup folders..."
     Get-ChildItem -Path $env:TEMP -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     $desktop = [Environment]::GetFolderPath('Desktop')
@@ -1456,6 +1485,183 @@ function Invoke-RemoveDefenderPolicy {
         Write-Host "in that case this PC is genuinely managed and this should not be removed."
     }
     Read-Host "Press Enter to continue"
+}
+
+# ===========================================================================
+# v2.1 — MMCSS (Multimedia Class Scheduler) REGISTRATION FOR FiveM
+# ===========================================================================
+function Invoke-MmcssRegister {
+    param([string]$ProcessName = 'FiveM.exe')
+    try {
+        $taskPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\FiveM'
+        $keyExisted = Test-Path $taskPath
+        if ($script:DryRun) {
+            Write-Host ("  [DRYRUN] would register {0} to MMCSS with High priority" -f $ProcessName) -ForegroundColor DarkCyan
+            return $true
+        }
+        if (-not $keyExisted) { New-Item -Path $taskPath -Force | Out-Null }
+        Set-Reg "$taskPath" 'Scheduling Category' 'High' 'String' | Out-Null
+        Set-Reg "$taskPath" 'SFIO Priority' 'High' 'String' | Out-Null
+        Set-Reg "$taskPath" 'Priority' 8 'DWord' | Out-Null  # High Priority in multimedia class
+        Set-Reg "$taskPath" 'GPU Priority' 8 'DWord' | Out-Null
+        Set-Reg "$taskPath" 'Latency Sensitive' 1 'DWord' | Out-Null
+        Set-Reg "$taskPath\Process" 'FiveM.exe' '' 'String' | Out-Null
+        $gtaName = Find-GtaProcessName
+        if ($gtaName) {
+            Set-Reg "$taskPath\Process" $gtaName '' 'String' | Out-Null
+            Write-Ok "MMCSS registered: FiveM.exe + $gtaName with High Priority, Latency Sensitive=1"
+        } else {
+            Write-Ok "MMCSS registered: FiveM.exe with High Priority, Latency Sensitive=1"
+        }
+        return $true
+    } catch {
+        Write-Log ("  ! MMCSS registration failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+# ===========================================================================
+# v2.1 — PER-PROCESS PRIORITY HIGH (via Image File Execution Options)
+# ===========================================================================
+function Invoke-ProcessPriorityHigh {
+    param([string]$ProcessName = 'FiveM.exe')
+    try {
+        if ($script:DryRun) {
+            Write-Host ("  [DRYRUN] would set {0} base priority to High" -f $ProcessName) -ForegroundColor DarkCyan
+            return $true
+        }
+        $ifeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$ProcessName"
+        if (-not (Test-Path $ifeoPath)) { New-Item -Path $ifeoPath -Force | Out-Null }
+        Set-Reg "$ifeoPath" 'PriorityClass' 0x00000002 'DWord' | Out-Null  # 2 = High Priority
+        Write-Ok "Base priority set: $ProcessName = High (persists across reboots)"
+        return $true
+    } catch {
+        Write-Log ("  ! Process priority setting failed for {0}: {1}" -f $ProcessName, $_.Exception.Message)
+        return $false
+    }
+}
+
+# ===========================================================================
+# v2.1 — HARDWARE-ACCELERATED GPU SCHEDULING (HAGS) CONTROL
+# ===========================================================================
+function Invoke-HagsToggle {
+    param([ValidateSet('Enable','Disable','Skip')]$Action = 'Skip')
+    try {
+        $hags = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'
+        $current = (Get-ItemProperty $hags -Name 'HwSchMode' -ErrorAction SilentlyContinue).HwSchMode
+        $currentState = if ($current -eq 2) { 'Enabled' } else { 'Disabled' }
+        
+        if ($Action -eq 'Skip') {
+            Write-Info2 "HAGS: currently $currentState (skipped, enable/disable per your choice in NVIDIA/AMD settings or BIOS)"
+            return $true
+        } elseif ($Action -eq 'Enable') {
+            if ($script:DryRun) { Write-Host "  [DRYRUN] would enable HAGS" -ForegroundColor DarkCyan; return $true }
+            Set-Reg $hags 'HwSchMode' 2 'DWord' | Out-Null
+            Write-Info2 "HAGS: Enabled (watch performance - helps some NVIDIA/AMD chips, hurts others; revert if FPS drops)"
+            return $true
+        } else {
+            if ($script:DryRun) { Write-Host "  [DRYRUN] would disable HAGS" -ForegroundColor DarkCyan; return $true }
+            Set-Reg $hags 'HwSchMode' 1 'DWord' | Out-Null
+            Write-Info2 "HAGS: Disabled (traditional GPU scheduling)"
+            return $true
+        }
+    } catch {
+        Write-Log ("  ! HAGS toggle failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+# ===========================================================================
+# v2.1 — TRIM VERIFICATION FOR NVMe/SSD
+# ===========================================================================
+function Invoke-TrimVerify {
+    try {
+        Write-Info2 "Verifying TRIM status on all disks..."
+        $trimStatus = fsutil behavior query DisableDeleteNotify
+        if ($trimStatus -like "*0*") {
+            Write-Ok "TRIM/UNMAP: Enabled (NVMe/SSD write latency will not degrade over time)"
+        } else {
+            Write-Warn2 "TRIM/UNMAP appears disabled - NVMe/SSD write latency may increase over time. Run: fsutil behavior set DisableDeleteNotify 0 (admin)"
+        }
+    } catch {
+        Write-Log ("  ! TRIM verification skipped: {0}" -f $_.Exception.Message)
+    }
+}
+
+# ===========================================================================
+# v2.1 — BACKUP PRUNING (keep only last N backups)
+# ===========================================================================
+function Invoke-BackupPruning {
+    param([int]$KeepCount = 5)
+    try {
+        $dirs = @(Get-ChildItem -Path $env:TEMP -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+        if ($dirs.Count -gt $KeepCount) {
+            $toDelete = $dirs[$KeepCount..($dirs.Count - 1)]
+            foreach ($dir in $toDelete) {
+                try { Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+                catch { Write-Log "  ! Could not delete old backup: $($dir.FullName)" }
+            }
+            Write-Ok "Backup pruning: deleted $($toDelete.Count) old backups, keeping last $KeepCount"
+        }
+    } catch {
+        Write-Log ("  ! Backup pruning failed: {0}" -f $_.Exception.Message)
+    }
+}
+
+# ===========================================================================
+# v2.1 — LOG ROTATION (prevent write_errors.log from growing forever)
+# ===========================================================================
+function Invoke-LogRotation {
+    param([int]$MaxSizeMB = 10)
+    try {
+        $logPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
+        if (Test-Path $logPath) {
+            $file = Get-Item $logPath
+            $sizeMB = [math]::Round($file.Length / 1MB, 2)
+            if ($sizeMB -gt $MaxSizeMB) {
+                $archive = $logPath -replace '.log$', "_$(Get-Date -Format 'yyMMdd_HHmmss').log"
+                try { Move-Item -Path $logPath -Destination $archive -Force -ErrorAction SilentlyContinue }
+                catch { Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue }
+                Write-Ok "Log rotation: archived $sizeMB MB to $([System.IO.Path]::GetFileName($archive))"
+            }
+        }
+    } catch {
+        Write-Log ("  ! Log rotation failed: {0}" -f $_.Exception.Message)
+    }
+}
+
+# ===========================================================================
+# v2.1 — RESET VERIFICATION (confirm all changes were actually reverted)
+# ===========================================================================
+function Invoke-ResetVerify {
+    param([Parameter(Mandatory)][PSCustomObject[]]$Changes)
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($change in $Changes) {
+        try {
+            if ($change.Kind -eq 'RegValue' -and -not $change.KeyCreated) {
+                $path = $change.Path
+                $name = $change.Name
+                $current = (Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue).$name
+                $old = $change.OldValue
+                if ($null -ne $current -and $current -ne $old) {
+                    $failures.Add("Reg not reverted: $path\$name (now=$current, expected=$old)")
+                }
+            } elseif ($change.Kind -eq 'Service') {
+                $svc = Get-Service -Name $change.Name -ErrorAction SilentlyContinue
+                if ($svc -and $svc.StartType -ne $change.OldStart) {
+                    $failures.Add("Service not reverted: $($change.Name) (now=$($svc.StartType), expected=$($change.OldStart))")
+                }
+            }
+        } catch {}
+    }
+    if ($failures.Count -gt 0) {
+        Write-Warn2 "Reset verification found $($failures.Count) revert failures (check changes.json for details)"
+        foreach ($f in $failures) { Write-Log "  ! $f" }
+        return $false
+    } else {
+        Write-Ok "Reset verification passed: all registry/service values reverted correctly"
+        return $true
+    }
 }
 
 function Invoke-HpetToggle {
@@ -2745,8 +2951,8 @@ function Start-GuiWorkerProcess {
     }
     $workerArgs = @(
         '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-        '-File', $selfPath, '-Worker', '-WorkerAction', $Action,
-        '-GuiLogPath', $LogPath
+        '-File', "`"$selfPath`"", '-Worker', '-WorkerAction', $Action,
+        '-GuiLogPath', "`"$LogPath`""
     )
     if ($script:DryRun) { $workerArgs += '-DryRun' }
     return Start-Process -FilePath 'powershell.exe' -ArgumentList $workerArgs -WindowStyle Hidden -PassThru
@@ -3008,7 +3214,7 @@ if ($WorkerUi) {
         # Return to the original main menu after the progress window closes.
         # The worker intentionally keeps the temp script alive until this launch.
         if ($script:ScriptPath -and (Test-Path $script:ScriptPath)) {
-            $menuArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath)
+            $menuArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
             if ($script:DryRun) { $menuArgs += '-DryRun' }
             Start-Process -FilePath 'powershell.exe' -ArgumentList $menuArgs -WindowStyle Hidden | Out-Null
         }
@@ -3040,7 +3246,7 @@ try {
     if ($uiAction) {
         $selfPathForUi = $script:ScriptPath
         $uiArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-                    '-File', $selfPathForUi, '-WorkerUi', '-WorkerAction', $uiAction)
+                    '-File', "`"$selfPathForUi`"", '-WorkerUi', '-WorkerAction', $uiAction)
         if ($script:DryRun) { $uiArgs += '-DryRun' }
         Start-Process -FilePath 'powershell.exe' -ArgumentList $uiArgs -WindowStyle Hidden | Out-Null
     }
