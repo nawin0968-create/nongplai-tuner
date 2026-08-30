@@ -53,6 +53,11 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
         $runPath = Join-Path $env:TEMP "nongplai_v2_$([guid]::NewGuid().ToString('N')).ps1"
         Set-Content -Path $runPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8
     }
+    # Thread the resolved path forward explicitly so the elevated child process (and any
+    # worker processes it later spawns for GUI Apply/Reset/Scan actions) always has a real,
+    # known-good .ps1 path to relaunch itself with - this must not depend on the child
+    # re-detecting $MyInvocation.MyCommand.Path on its own.
+    $script:ScriptPath = $runPath
     $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $runPath)
     if ($HpetToggle) { $argList += '-HpetToggle' }
     if ($DryRun) { $argList += '-DryRun' }
@@ -68,6 +73,24 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
         } catch {}
     }
     exit 0
+}
+
+# Safety net for every remaining case: already elevated (started as admin, or just relaunched
+# by the block above), but $script:ScriptPath still isn't a real file on disk. This covers
+# "opened an admin PowerShell window and ran irm|iex directly" - no elevation relaunch happens
+# in that case, so the temp-file persist logic above never ran. Do it here instead so GUI
+# worker spawning (Start-GuiWorkerProcess) always has a real path to use.
+if ([string]::IsNullOrWhiteSpace($script:ScriptPath) -or -not (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
+    $fallbackPath = $MyInvocation.MyCommand.Path
+    if (-not [string]::IsNullOrWhiteSpace($fallbackPath) -and (Test-Path $fallbackPath -ErrorAction SilentlyContinue)) {
+        $script:ScriptPath = $fallbackPath
+    } else {
+        $persistPath = Join-Path $env:TEMP "nongplai_v2_$([guid]::NewGuid().ToString('N')).ps1"
+        try {
+            Set-Content -Path $persistPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8
+            $script:ScriptPath = $persistPath
+        } catch {}
+    }
 }
 
 $ErrorActionPreference = 'Stop'
@@ -2294,6 +2317,18 @@ try {
     exit 1
 }
 
+# Keep a single WPF Application/Dispatcher alive for the whole run. Without this, WPF can
+# tear down its dispatcher as soon as the first Window (e.g. the main menu) closes, which
+# makes any later Window's ShowDialog() fail with "cannot call a method on a null-valued
+# expression" - exactly the error this fixes (main menu closes -> worker progress window
+# tries to open next and fails without a persistent Application).
+if (-not [System.Windows.Application]::Current) {
+    try {
+        $script:WpfApp = New-Object System.Windows.Application
+        $script:WpfApp.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+    } catch { $script:WpfApp = $null }
+}
+
 # No console window is re-shown by the GUI entry point.
 
 $script:MenuCards = @(
@@ -2835,3 +2870,5 @@ try {
         Remove-Item -Path $selfPath -Force -ErrorAction SilentlyContinue
     }
 } catch {}
+
+try { if ($script:WpfApp) { $script:WpfApp.Shutdown() } } catch {}
