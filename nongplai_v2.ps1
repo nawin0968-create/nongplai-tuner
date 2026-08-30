@@ -34,6 +34,7 @@ param(
     [string]$GuiLogPath = ''
 )
 
+$script:InvokedFromPipe = [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path)
 $script:ScriptPath = $MyInvocation.MyCommand.Path
 
 # The companion launcher can start this script with a hidden PowerShell window.
@@ -93,6 +94,16 @@ if ([string]::IsNullOrWhiteSpace($script:ScriptPath) -or -not (Test-Path $script
             $script:ScriptPath = $persistPath
         } catch {}
     }
+}
+
+# When an already-elevated PowerShell console runs irm|iex, there is no UAC
+# relaunch to hide the original console. Relaunch the persisted copy hidden so
+# the user sees only the GUI. Worker and WorkerUi processes are excluded.
+if ($script:InvokedFromPipe -and -not $Worker -and -not $WorkerUi -and -not $HpetToggle) {
+    $pipeArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath)
+    if ($DryRun) { $pipeArgs += '-DryRun' }
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $pipeArgs -WindowStyle Hidden | Out-Null
+    exit 0
 }
 
 $ErrorActionPreference = 'Stop'
@@ -2693,7 +2704,10 @@ function Play-GuiSound {
     param([ValidateSet('Start','Progress','Done','Error')][string]$Kind = 'Progress')
     try {
         switch ($Kind) {
-            'Start'    { for ($f = 500; $f -le 1500; $f += 100) { [Console]::Beep($f, 18) } }
+            'Start'    {
+                # Single startup beep.
+                [Console]::Beep(988, 140)
+            }
             'Progress' { [Console]::Beep(660, 45) }
             'Done'     { [Console]::Beep(1046, 600) }
             'Error'    {
@@ -2714,19 +2728,11 @@ function Invoke-GuiWorkerAction {
             default { throw "ไม่พบคำสั่ง worker ที่ถูกต้อง: $WorkerAction" }
         }
         Write-GuiEvent -Type 'done' -Current 100 -Total 100 -Label 'เสร็จสมบูรณ์' -Message 'การทำงานเสร็จสมบูรณ์'
-        try {
-            if ($script:ScriptPath -and ($script:ScriptPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
-                Remove-Item -Path $script:ScriptPath -Force -ErrorAction SilentlyContinue
-            }
-        } catch {}
+        # Keep the script file until WorkerUi has closed. WorkerUi will launch
+        # the main menu again, and that new menu process performs final cleanup.
         exit 0
     } catch {
         Write-GuiEvent -Type 'error' -Current 0 -Total 100 -Label 'เกิดข้อผิดพลาด' -Message $_.Exception.Message
-        try {
-            if ($script:ScriptPath -and ($script:ScriptPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
-                Remove-Item -Path $script:ScriptPath -Force -ErrorAction SilentlyContinue
-            }
-        } catch {}
         exit 1
     }
 }
@@ -2749,69 +2755,146 @@ function Start-GuiWorkerProcess {
 function Show-WorkerProgressWpf {
     param([Parameter(Mandatory)][ValidateSet('Apply','Reset')][string]$Action)
 
+    # Use WinForms controls created directly in .NET. This avoids the WPF XAML
+    # loader path that returned a null Window on the affected Windows PowerShell
+    # installation, while preserving the same progress UI and worker behavior.
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing -ErrorAction Stop
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
     $logPath = Join-Path $env:TEMP ("NongPlaiGui_" + [guid]::NewGuid().ToString('N') + '.log')
     New-Item -ItemType File -Path $logPath -Force | Out-Null
     $worker = $null
     try { $worker = Start-GuiWorkerProcess -Action $Action -LogPath $logPath }
     catch {
         Play-GuiSound -Kind Error
-        [System.Windows.MessageBox]::Show($_.Exception.Message, 'NongPlaiShop', 'OK', 'Error') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'NongPlaiShop', 'OK', 'Error') | Out-Null
         Remove-Item $logPath -Force -ErrorAction SilentlyContinue
         return
     }
     Play-GuiSound -Kind Start
 
-    [xml]$progressXaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        Title="NongPlaiShop - Working" Height="300" Width="660"
-        WindowStartupLocation="CenterScreen" WindowStyle="None"
-        ResizeMode="NoResize" Background="#08080A" ShowInTaskbar="True">
-  <Border CornerRadius="16" Background="#15161C" BorderBrush="#34343C" BorderThickness="1" Padding="38">
-    <StackPanel VerticalAlignment="Center">
-      <TextBlock Text="NongPlaiShop กำลังทำงาน" Foreground="#F2C94C" FontSize="23" FontWeight="Bold" HorizontalAlignment="Center"/>
-      <TextBlock Name="ProgressStage" Text="กำลังเตรียมการ..." Foreground="#FFFFFF" FontSize="14" HorizontalAlignment="Center" Margin="0,14,0,0"/>
-      <ProgressBar Name="ProgressBar" Minimum="0" Maximum="100" Value="0" Height="18" Margin="0,24,0,0" Background="#2B2C33" Foreground="#F2C94C" BorderThickness="0"/>
-      <TextBlock Name="ProgressPercent" Text="0%" Foreground="#C9C9CC" FontSize="13" HorizontalAlignment="Center" Margin="0,8,0,0"/>
-      <TextBlock Name="ProgressHint" Text="กำลังทำงาน โปรดรอสักครู่..." Foreground="#7D7D82" FontSize="11" HorizontalAlignment="Center" Margin="0,7,0,0"/>
-    </StackPanel>
-  </Border>
-</Window>
-"@
-    # Use a dedicated variable name here. The main-menu window is created in a
-    # different function, but keeping the names distinct prevents accidental
-    # dynamic-scope shadowing when event handlers are attached.
-    if (-not [System.Windows.Application]::Current) {
-        $script:WpfApp = New-Object System.Windows.Application
-        $script:WpfApp.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
-    }
-    # Parse the XML document explicitly. On some Windows PowerShell/WPF setups,
-    # passing a [xml] document through New-Object XmlNodeReader can yield no root
-    # object even though the XAML is valid; Parse() returns the Window directly.
-    $progressWindow = [Windows.Markup.XamlReader]::Parse($progressXaml.OuterXml)
-    if ($null -eq $progressWindow) {
-        throw 'ไม่สามารถสร้างหน้าต่างแสดงความคืบหน้า WPF ได้ (XamlReader ส่งคืนค่า null)'
-    }
-    $stageText = $progressWindow.FindName('ProgressStage')
-    $bar = $progressWindow.FindName('ProgressBar')
-    $percentText = $progressWindow.FindName('ProgressPercent')
-    $hintText = $progressWindow.FindName('ProgressHint')
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'NongPlaiShop - Working'
+    $form.ClientSize = New-Object System.Drawing.Size(660, 330)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'None'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $true
+    $form.BackColor = [System.Drawing.Color]::FromArgb(9,10,14)
+    $form.Padding = New-Object System.Windows.Forms.Padding(2)
+
+    # Gaming-tuner visual shell: dark surface, gold/cyan accents and a compact status header.
+    $accentGold = [System.Drawing.Color]::FromArgb(242,201,76)
+    $accentCyan = [System.Drawing.Color]::FromArgb(86,204,242)
+    $muted = [System.Drawing.Color]::FromArgb(130,135,148)
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.BackColor = [System.Drawing.Color]::FromArgb(21,22,30)
+    $panel.Dock = 'Fill'
+    $form.Controls.Add($panel)
+
+    $accentLine = New-Object System.Windows.Forms.Panel
+    $accentLine.BackColor = $accentGold
+    $accentLine.Location = New-Object System.Drawing.Point(0,0)
+    $accentLine.Size = New-Object System.Drawing.Size(656,3)
+    $panel.Controls.Add($accentLine)
+
+    $brand = New-Object System.Windows.Forms.Label
+    $brand.Text = '⚡  NONGPLAISHOP'
+    $brand.ForeColor = $accentGold
+    $brand.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+    $brand.AutoSize = $true
+    $brand.Location = New-Object System.Drawing.Point(28,20)
+    $panel.Controls.Add($brand)
+
+    $mode = New-Object System.Windows.Forms.Label
+    $mode.Text = 'SMART ADAPTIVE TUNER  /  LIVE'
+    $mode.ForeColor = $accentCyan
+    $mode.Font = New-Object System.Drawing.Font('Consolas', 8, [System.Drawing.FontStyle]::Bold)
+    $mode.AutoSize = $true
+    $mode.Location = New-Object System.Drawing.Point(405,24)
+    $panel.Controls.Add($mode)
+
+    $headerRule = New-Object System.Windows.Forms.Panel
+    $headerRule.BackColor = [System.Drawing.Color]::FromArgb(48,50,62)
+    $headerRule.Location = New-Object System.Drawing.Point(28,55)
+    $headerRule.Size = New-Object System.Drawing.Size(600,1)
+    $panel.Controls.Add($headerRule)
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = 'กำลังปรับจูนระบบ'
+    $title.ForeColor = [System.Drawing.Color]::White
+    $title.Font = New-Object System.Drawing.Font('Segoe UI', 17, [System.Drawing.FontStyle]::Bold)
+    $title.AutoSize = $false
+    $title.TextAlign = 'MiddleCenter'
+    $title.Size = New-Object System.Drawing.Size(580, 32)
+    $title.Location = New-Object System.Drawing.Point(38, 76)
+    $panel.Controls.Add($title)
+
+    $stageText = New-Object System.Windows.Forms.Label
+    $stageText.Text = 'กำลังเตรียมการ...'
+    $stageText.ForeColor = [System.Drawing.Color]::White
+    $stageText.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $stageText.AutoSize = $false
+    $stageText.TextAlign = 'MiddleCenter'
+    $stageText.Size = New-Object System.Drawing.Size(580, 30)
+    $stageText.MaximumSize = New-Object System.Drawing.Size(580, 30)
+    $stageText.Location = New-Object System.Drawing.Point(38, 112)
+    $panel.Controls.Add($stageText)
+
+    $bar = New-Object System.Windows.Forms.ProgressBar
+    $bar.Minimum = 0
+    $bar.Maximum = 100
+    $bar.Value = 0
+    $bar.Style = 'Continuous'
+    $bar.Size = New-Object System.Drawing.Size(580, 20)
+    $bar.Location = New-Object System.Drawing.Point(38, 155)
+    $bar.BackColor = [System.Drawing.Color]::FromArgb(43,45,56)
+    $panel.Controls.Add($bar)
+
+    $percentText = New-Object System.Windows.Forms.Label
+    $percentText.Text = '0%'
+    $percentText.ForeColor = [System.Drawing.Color]::FromArgb(201,201,204)
+    $percentText.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $percentText.AutoSize = $false
+    $percentText.TextAlign = 'MiddleCenter'
+    $percentText.Size = New-Object System.Drawing.Size(580, 26)
+    $percentText.ForeColor = $accentGold
+    $percentText.Font = New-Object System.Drawing.Font('Consolas', 12, [System.Drawing.FontStyle]::Bold)
+    $percentText.Location = New-Object System.Drawing.Point(38, 180)
+    $panel.Controls.Add($percentText)
+
+    $hintText = New-Object System.Windows.Forms.Label
+    $hintText.Text = 'กำลังทำงาน โปรดรอสักครู่...'
+    $hintText.ForeColor = [System.Drawing.Color]::FromArgb(125,125,130)
+    $hintText.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $hintText.AutoSize = $false
+    $hintText.TextAlign = 'MiddleCenter'
+    $hintText.Size = New-Object System.Drawing.Size(580, 30)
+    $hintText.MaximumSize = New-Object System.Drawing.Size(580, 30)
+    $hintText.Location = New-Object System.Drawing.Point(38, 211)
+    $panel.Controls.Add($hintText)
+
+    $footer = New-Object System.Windows.Forms.Label
+    $footer.Text = 'PLEASE WAIT  •  APPLYING SAFE, REVERSIBLE OPTIMIZATIONS'
+    $footer.ForeColor = $muted
+    $footer.Font = New-Object System.Drawing.Font('Consolas', 8)
+    $footer.AutoSize = $true
+    $footer.Location = New-Object System.Drawing.Point(170, 278)
+    $panel.Controls.Add($footer)
+
     $done = $false
     $ticksNoEvent = 0
-
-    $timer = New-Object Windows.Threading.DispatcherTimer
-    $timer.Interval = [TimeSpan]::FromMilliseconds(350)
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 350
     $timer.Add_Tick({
         try {
             $latest = @(Get-Content -Path $logPath -Encoding UTF8 -ErrorAction SilentlyContinue |
                 Where-Object { $_ -like '__NONGPLAI_EVENT__*' } | Select-Object -Last 1)
             if ($latest.Count -eq 0) {
                 $ticksNoEvent++
-                if ($ticksNoEvent -eq 60) {
-                    $hintText.Text = 'ใช้เวลานานกว่าปกติ แต่ยังทำงานอยู่ โปรดรออีกสักครู่...'
-                }
-            } else {
-                $ticksNoEvent = 0
-            }
+                if ($ticksNoEvent -eq 60) { $hintText.Text = 'ใช้เวลานานกว่าปกติ แต่ยังทำงานอยู่ โปรดรออีกสักครู่...' }
+            } else { $ticksNoEvent = 0 }
             if ($latest.Count -gt 0) {
                 $evt = ($latest[0] -replace '^__NONGPLAI_EVENT__', '') | ConvertFrom-Json
                 $current = [int]$evt.current
@@ -2827,50 +2910,59 @@ function Show-WorkerProgressWpf {
                 if ($evt.label) { $stageText.Text = [string]$evt.label }
                 if ($evt.message) { $hintText.Text = [string]$evt.message }
                 if ([string]$evt.type -eq 'done') {
-                    $done = $true
-                    $bar.Value = 100
-                    $percentText.Text = '100%'
-                    $stageText.Text = 'เสร็จสมบูรณ์'
-                    $hintText.Text = 'ทำงานเสร็จแล้ว กำลังปิดหน้าต่าง...'
-                    Play-GuiSound -Kind Done
-                    $timer.Stop()
-                    $closeTimer = New-Object Windows.Threading.DispatcherTimer
-                    $closeTimer.Interval = [TimeSpan]::FromMilliseconds(900)
-                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $progressWindow.Close() }.GetNewClosure())
+                    $done = $true; $bar.Value = 100; $percentText.Text = '100%'
+                    $stageText.Text = 'เสร็จสมบูรณ์'; $hintText.Text = 'ทำงานเสร็จแล้ว กำลังปิดหน้าต่าง...'
+                    Play-GuiSound -Kind Done; $timer.Stop()
+                    $closeTimer = New-Object System.Windows.Forms.Timer
+                    $closeTimer.Interval = 900
+                    $closeTimer.Add_Tick({
+                        param($sender, $eventArgs)
+                        try { $sender.Stop() } catch {}
+                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
+                    }.GetNewClosure())
+                    $closeTimer.Start()
+                } elseif ([string]$evt.type -eq 'error') {
+                    $done = $true; $stageText.Text = 'เกิดข้อผิดพลาด'; $hintText.Text = [string]$evt.message
+                    Play-GuiSound -Kind Error; $timer.Stop()
+                    $closeTimer = New-Object System.Windows.Forms.Timer
+                    $closeTimer.Interval = 2500
+                    $closeTimer.Add_Tick({
+                        param($sender, $eventArgs)
+                        try { $sender.Stop() } catch {}
+                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
+                    }.GetNewClosure())
                     $closeTimer.Start()
                 }
-                elseif ([string]$evt.type -eq 'error') {
-                    $done = $true
-                    $stageText.Text = 'เกิดข้อผิดพลาด'
-                    $hintText.Text = [string]$evt.message
-                    Play-GuiSound -Kind Error
-                    $timer.Stop()
-                    $closeTimer = New-Object Windows.Threading.DispatcherTimer
-                    $closeTimer.Interval = [TimeSpan]::FromMilliseconds(2500)
-                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $progressWindow.Close() }.GetNewClosure())
-                    $closeTimer.Start()
-                }
+            }
+            if ($null -eq $worker) {
+                throw 'ไม่สามารถเริ่ม worker process ได้ (worker เป็นค่า null)'
             }
             if ($worker.HasExited -and -not $done) {
-                $done = $true
-                $stageText.Text = 'งานหยุดก่อนเสร็จสมบูรณ์'
+                $done = $true; $stageText.Text = 'งานหยุดก่อนเสร็จสมบูรณ์'
                 $hintText.Text = "โปรเซสจบการทำงาน (รหัส $($worker.ExitCode))"
-                Play-GuiSound -Kind Error
-                $timer.Stop()
-                $closeTimer = New-Object Windows.Threading.DispatcherTimer
-                $closeTimer.Interval = [TimeSpan]::FromMilliseconds(2500)
-                $closeTimer.Add_Tick({ $closeTimer.Stop(); $progressWindow.Close() }.GetNewClosure())
+                Play-GuiSound -Kind Error; $timer.Stop()
+                $closeTimer = New-Object System.Windows.Forms.Timer
+                $closeTimer.Interval = 2500
+                $closeTimer.Add_Tick({
+                        param($sender, $eventArgs)
+                        try { $sender.Stop() } catch {}
+                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
+                    }.GetNewClosure())
                 $closeTimer.Start()
             }
-        } catch {}
+        } catch {
+            try {
+                $hintText.Text = 'เกิดข้อผิดพลาดระหว่างอัปเดตสถานะ กรุณาตรวจสอบ NongPlaiGui_write_errors.log'
+                Write-CrashLog -ErrorRecord $_ -Context 'Show-WorkerProgressWpf Timer' | Out-Null
+            } catch {}
+        }
     }.GetNewClosure())
-    $progressWindow.Add_Closed({ try { $timer.Stop() } catch {}; Remove-Item $logPath -Force -ErrorAction SilentlyContinue }.GetNewClosure())
+    $form.Add_FormClosed({ try { $timer.Stop() } catch {}; Remove-Item $logPath -Force -ErrorAction SilentlyContinue }.GetNewClosure())
     $timer.Start()
-    try {
-        $progressWindow.ShowDialog() | Out-Null
-    } catch {
+    try { [void]$form.ShowDialog() }
+    catch {
         $detail = Write-CrashLog -ErrorRecord $_ -Context 'Show-WorkerProgressWpf ShowDialog'
-        try { [System.Windows.MessageBox]::Show($detail, 'NongPlaiShop - Error (detail)', 'OK', 'Error') | Out-Null } catch {}
+        try { [System.Windows.Forms.MessageBox]::Show($detail, 'NongPlaiShop - Error (detail)', 'OK', 'Error') | Out-Null } catch {}
     }
 }
 
@@ -2889,6 +2981,13 @@ if ($WorkerUi) {
     try {
         Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
         Show-WorkerProgressWpf -Action $WorkerAction
+        # Return to the original main menu after the progress window closes.
+        # The worker intentionally keeps the temp script alive until this launch.
+        if ($script:ScriptPath -and (Test-Path $script:ScriptPath)) {
+            $menuArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath)
+            if ($script:DryRun) { $menuArgs += '-DryRun' }
+            Start-Process -FilePath 'powershell.exe' -ArgumentList $menuArgs -WindowStyle Hidden | Out-Null
+        }
     } catch {
         try {
             $dbgPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
@@ -2916,10 +3015,10 @@ try {
     $uiAction = switch ($sel) { '1' { 'Apply' }; '2' { 'Reset' }; default { $null } }
     if ($uiAction) {
         $selfPathForUi = $script:ScriptPath
-        $uiArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Normal', '-ExecutionPolicy', 'Bypass',
+        $uiArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
                     '-File', $selfPathForUi, '-WorkerUi', '-WorkerAction', $uiAction)
         if ($script:DryRun) { $uiArgs += '-DryRun' }
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $uiArgs | Out-Null
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $uiArgs -WindowStyle Hidden | Out-Null
     }
 } catch {
     # Keep failures inside the GUI flow. No console is shown here.
@@ -2930,10 +3029,12 @@ try {
 }
 
 
-# Clean up the temp copy of this script if it was created for the irm|iex one-liner flow.
-    try {
-        $selfPath = $script:ScriptPath
-        if ($selfPath -and ($selfPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
+# Clean up the temp copy only when no child GUI/worker process needs it.
+# In irm|iex mode, the elevated parent launches WorkerUi with -File $selfPath;
+# deleting that file immediately can race with WorkerUi/Worker startup.
+try {
+    $selfPath = $script:ScriptPath
+    if (-not $uiAction -and $selfPath -and ($selfPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
         Remove-Item -Path $selfPath -Force -ErrorAction SilentlyContinue
     }
 } catch {}
