@@ -2912,15 +2912,10 @@ function Show-WorkerProgressWpf {
                 if ([string]$evt.type -eq 'done') {
                     $done = $true; $bar.Value = 100; $percentText.Text = '100%'
                     $stageText.Text = 'เสร็จสมบูรณ์'; $hintText.Text = 'ทำงานเสร็จแล้ว กำลังปิดหน้าต่าง...'
-                    Play-GuiSound -Kind Done; $timer.Stop()
-                    $closeTimer = New-Object System.Windows.Forms.Timer
-                    $closeTimer.Interval = 900
-                    $closeTimer.Add_Tick({
-                        param($sender, $eventArgs)
-                        try { $sender.Stop() } catch {}
-                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
-                    }.GetNewClosure())
-                    $closeTimer.Start()
+                    # Play the completion sound first; once it finishes, return immediately.
+                    Play-GuiSound -Kind Done
+                    $timer.Stop()
+                    try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
                 } elseif ([string]$evt.type -eq 'error') {
                     $done = $true; $stageText.Text = 'เกิดข้อผิดพลาด'; $hintText.Text = [string]$evt.message
                     Play-GuiSound -Kind Error; $timer.Stop()
