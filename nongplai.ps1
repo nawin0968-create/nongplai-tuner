@@ -1,4 +1,4 @@
-﻿<
+﻿<#
     NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
     Rewritten from the original .cmd to fix reliability issues caused by
     batch's fragile multi-line parsing and by spawning a fresh powershell.exe
