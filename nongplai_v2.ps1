@@ -29,6 +29,7 @@ param(
     [switch]$HpetToggle,
     [switch]$DryRun,
     [switch]$Worker,
+    [switch]$WorkerUi,
     [ValidateSet('', 'Apply','Reset','Scan','Hpet')][string]$WorkerAction = '',
     [string]$GuiLogPath = ''
 )
@@ -62,6 +63,7 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     if ($HpetToggle) { $argList += '-HpetToggle' }
     if ($DryRun) { $argList += '-DryRun' }
     if ($Worker) { $argList += '-Worker' }
+    if ($WorkerUi) { $argList += '-WorkerUi' }
     if ($WorkerAction) { $argList += @('-WorkerAction', $WorkerAction) }
     if ($GuiLogPath) { $argList += @('-GuiLogPath', $GuiLogPath) }
     try {
@@ -145,6 +147,26 @@ function Write-GuiEvent {
             [System.IO.File]::AppendAllText($dbgPath, $dbgLine + [Environment]::NewLine)
         } catch {}
     }
+}
+
+function Write-CrashLog {
+    param([Parameter(Mandatory)]$ErrorRecord, [string]$Context = '')
+    try {
+        $dbgPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine("[$(Get-Date -Format 'o')] CRASH in $Context")
+        $ex = $ErrorRecord.Exception
+        $depth = 0
+        while ($ex -ne $null) {
+            [void]$sb.AppendLine("  depth $depth : $($ex.GetType().FullName) : $($ex.Message)")
+            $ex = $ex.InnerException
+            $depth++
+        }
+        [void]$sb.AppendLine("  PositionMessage: $($ErrorRecord.InvocationInfo.PositionMessage)")
+        [void]$sb.AppendLine("  ScriptStackTrace: $($ErrorRecord.ScriptStackTrace)")
+        [System.IO.File]::AppendAllText($dbgPath, $sb.ToString() + [Environment]::NewLine)
+        return $sb.ToString()
+    } catch { return "Write-CrashLog itself failed: $($_.Exception.Message)" }
 }
 
 # In worker mode the child process has no visible console. Redirect Write-Host output
@@ -2356,7 +2378,7 @@ function Show-MainMenuWpf {
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="NongPlaiShop" Height="640" Width="960"
         WindowStartupLocation="CenterScreen" WindowStyle="None"
-        ResizeMode="NoResize" Background="Transparent" AllowsTransparency="True">
+        ResizeMode="NoResize" Background="#08080A">
   <Border CornerRadius="16" BorderBrush="#2A2A30" BorderThickness="1" ClipToBounds="True">
     <Border.Background>
       <RadialGradientBrush Center="0.5,0.15" RadiusX="0.9" RadiusY="0.9">
@@ -2654,7 +2676,13 @@ function Show-MainMenuWpf {
     })
 
     Update-CardSelection
-    $window.ShowDialog() | Out-Null
+    try {
+        $window.ShowDialog() | Out-Null
+    } catch {
+        $detail = Write-CrashLog -ErrorRecord $_ -Context 'Show-MainMenuWpf ShowDialog'
+        try { [System.Windows.MessageBox]::Show($detail, 'NongPlaiShop - Error (detail)', 'OK', 'Error') | Out-Null } catch {}
+        $script:GuiResult = $null
+    }
     return $script:GuiResult
 }
 
@@ -2737,7 +2765,7 @@ function Show-WorkerProgressWpf {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         Title="NongPlaiShop - Working" Height="300" Width="660"
         WindowStartupLocation="CenterScreen" WindowStyle="None"
-        ResizeMode="NoResize" Background="#08080A" AllowsTransparency="True" ShowInTaskbar="True">
+        ResizeMode="NoResize" Background="#08080A" ShowInTaskbar="True">
   <Border CornerRadius="16" Background="#15161C" BorderBrush="#34343C" BorderThickness="1" Padding="38">
     <StackPanel VerticalAlignment="Center">
       <TextBlock Text="NongPlaiShop กำลังทำงาน" Foreground="#F2C94C" FontSize="23" FontWeight="Bold" HorizontalAlignment="Center"/>
@@ -2749,11 +2777,24 @@ function Show-WorkerProgressWpf {
   </Border>
 </Window>
 "@
-    $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $progressXaml))
-    $stageText = $window.FindName('ProgressStage')
-    $bar = $window.FindName('ProgressBar')
-    $percentText = $window.FindName('ProgressPercent')
-    $hintText = $window.FindName('ProgressHint')
+    # Use a dedicated variable name here. The main-menu window is created in a
+    # different function, but keeping the names distinct prevents accidental
+    # dynamic-scope shadowing when event handlers are attached.
+    if (-not [System.Windows.Application]::Current) {
+        $script:WpfApp = New-Object System.Windows.Application
+        $script:WpfApp.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+    }
+    # Parse the XML document explicitly. On some Windows PowerShell/WPF setups,
+    # passing a [xml] document through New-Object XmlNodeReader can yield no root
+    # object even though the XAML is valid; Parse() returns the Window directly.
+    $progressWindow = [Windows.Markup.XamlReader]::Parse($progressXaml.OuterXml)
+    if ($null -eq $progressWindow) {
+        throw 'ไม่สามารถสร้างหน้าต่างแสดงความคืบหน้า WPF ได้ (XamlReader ส่งคืนค่า null)'
+    }
+    $stageText = $progressWindow.FindName('ProgressStage')
+    $bar = $progressWindow.FindName('ProgressBar')
+    $percentText = $progressWindow.FindName('ProgressPercent')
+    $hintText = $progressWindow.FindName('ProgressHint')
     $done = $false
     $ticksNoEvent = 0
 
@@ -2795,7 +2836,7 @@ function Show-WorkerProgressWpf {
                     $timer.Stop()
                     $closeTimer = New-Object Windows.Threading.DispatcherTimer
                     $closeTimer.Interval = [TimeSpan]::FromMilliseconds(900)
-                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $window.Close() }.GetNewClosure())
+                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $progressWindow.Close() }.GetNewClosure())
                     $closeTimer.Start()
                 }
                 elseif ([string]$evt.type -eq 'error') {
@@ -2806,7 +2847,7 @@ function Show-WorkerProgressWpf {
                     $timer.Stop()
                     $closeTimer = New-Object Windows.Threading.DispatcherTimer
                     $closeTimer.Interval = [TimeSpan]::FromMilliseconds(2500)
-                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $window.Close() }.GetNewClosure())
+                    $closeTimer.Add_Tick({ $closeTimer.Stop(); $progressWindow.Close() }.GetNewClosure())
                     $closeTimer.Start()
                 }
             }
@@ -2818,14 +2859,19 @@ function Show-WorkerProgressWpf {
                 $timer.Stop()
                 $closeTimer = New-Object Windows.Threading.DispatcherTimer
                 $closeTimer.Interval = [TimeSpan]::FromMilliseconds(2500)
-                $closeTimer.Add_Tick({ $closeTimer.Stop(); $window.Close() }.GetNewClosure())
+                $closeTimer.Add_Tick({ $closeTimer.Stop(); $progressWindow.Close() }.GetNewClosure())
                 $closeTimer.Start()
             }
         } catch {}
     }.GetNewClosure())
-    $window.Add_Closed({ try { $timer.Stop() } catch {}; Remove-Item $logPath -Force -ErrorAction SilentlyContinue }.GetNewClosure())
+    $progressWindow.Add_Closed({ try { $timer.Stop() } catch {}; Remove-Item $logPath -Force -ErrorAction SilentlyContinue }.GetNewClosure())
     $timer.Start()
-    $window.ShowDialog() | Out-Null
+    try {
+        $progressWindow.ShowDialog() | Out-Null
+    } catch {
+        $detail = Write-CrashLog -ErrorRecord $_ -Context 'Show-WorkerProgressWpf ShowDialog'
+        try { [System.Windows.MessageBox]::Show($detail, 'NongPlaiShop - Error (detail)', 'OK', 'Error') | Out-Null } catch {}
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -2833,6 +2879,24 @@ function Show-WorkerProgressWpf {
 # ---------------------------------------------------------------------------
 if ($Worker) {
     Invoke-GuiWorkerAction
+    exit 0
+}
+
+if ($WorkerUi) {
+    # Runs in its own freshly-spawned process/window/dispatcher - never shares a
+    # process with a previously-closed window, so there is no WPF dispatcher
+    # teardown race here no matter what happened in the process that launched us.
+    try {
+        Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
+        Show-WorkerProgressWpf -Action $WorkerAction
+    } catch {
+        try {
+            $dbgPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
+            $dbgLine = "[{0}] WorkerUi crashed: {1}`r`n{2}" -f (Get-Date -Format 'o'), $_.Exception.Message, $_.InvocationInfo.PositionMessage
+            [System.IO.File]::AppendAllText($dbgPath, $dbgLine + [Environment]::NewLine)
+        } catch {}
+        try { [System.Windows.MessageBox]::Show($_.Exception.Message, 'NongPlaiShop - Error', 'OK', 'Error') | Out-Null } catch {}
+    }
     exit 0
 }
 
@@ -2849,10 +2913,13 @@ if ($HpetToggle) {
 
 try {
     $sel = Show-MainMenuWpf
-    switch ($sel) {
-        '1' { Show-WorkerProgressWpf -Action 'Apply' }
-        '2' { Show-WorkerProgressWpf -Action 'Reset' }
-        default { }
+    $uiAction = switch ($sel) { '1' { 'Apply' }; '2' { 'Reset' }; default { $null } }
+    if ($uiAction) {
+        $selfPathForUi = $script:ScriptPath
+        $uiArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Normal', '-ExecutionPolicy', 'Bypass',
+                    '-File', $selfPathForUi, '-WorkerUi', '-WorkerAction', $uiAction)
+        if ($script:DryRun) { $uiArgs += '-DryRun' }
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $uiArgs | Out-Null
     }
 } catch {
     # Keep failures inside the GUI flow. No console is shown here.
