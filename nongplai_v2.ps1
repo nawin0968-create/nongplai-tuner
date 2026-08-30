@@ -3006,15 +3006,14 @@ if ($HpetToggle) {
 }
 
 try {
-    $sel = Show-MainMenuWpf
-    $uiAction = switch ($sel) { '1' { 'Apply' }; '2' { 'Reset' }; default { $null } }
-    if ($uiAction) {
-        $selfPathForUi = $script:ScriptPath
-        $uiArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-                    '-File', $selfPathForUi, '-WorkerUi', '-WorkerAction', $uiAction)
-        if ($script:DryRun) { $uiArgs += '-DryRun' }
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $uiArgs -WindowStyle Hidden | Out-Null
-    }
+    # Keep the original menu alive in this process. This guarantees that both
+    # Apply and Reset open the same loading window and then return to the same
+    # first menu, instead of spawning a second menu process.
+    do {
+        $sel = Show-MainMenuWpf
+        $uiAction = switch ($sel) { '1' { 'Apply' }; '2' { 'Reset' }; default { $null } }
+        if ($uiAction) { Show-WorkerProgressWpf -Action $uiAction }
+    } while ($sel -ne '3' -and $uiAction)
 } catch {
     # Keep failures inside the GUI flow. No console is shown here.
     Play-GuiSound -Kind Error
@@ -3029,7 +3028,7 @@ try {
 # deleting that file immediately can race with WorkerUi/Worker startup.
 try {
     $selfPath = $script:ScriptPath
-    if (-not $uiAction -and $selfPath -and ($selfPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
+    if ($sel -eq '3' -and $selfPath -and ($selfPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
         Remove-Item -Path $selfPath -Force -ErrorAction SilentlyContinue
     }
 } catch {}
