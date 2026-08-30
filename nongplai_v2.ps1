@@ -2775,7 +2775,7 @@ function Show-WorkerProgressWpf {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'NongPlaiShop - Working'
-    $form.ClientSize = New-Object System.Drawing.Size(660, 330)
+    $form.ClientSize = New-Object System.Drawing.Size(660, 345)
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'None'
     $form.MaximizeBox = $false
@@ -2875,12 +2875,27 @@ function Show-WorkerProgressWpf {
     $hintText.Location = New-Object System.Drawing.Point(38, 211)
     $panel.Controls.Add($hintText)
 
+    $openBackupBtn = New-Object System.Windows.Forms.Button
+    $openBackupBtn.Text = 'เปิดโฟลเดอร์ Backup'
+    $openBackupBtn.Size = New-Object System.Drawing.Size(180, 30)
+    $openBackupBtn.Location = New-Object System.Drawing.Point(240, 245)
+    $openBackupBtn.FlatStyle = 'Flat'
+    $openBackupBtn.FlatAppearance.BorderColor = $accentGold
+    $openBackupBtn.BackColor = [System.Drawing.Color]::FromArgb(38,39,48)
+    $openBackupBtn.ForeColor = $accentGold
+    $openBackupBtn.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $openBackupBtn.Visible = $false
+    $openBackupBtn.Add_Click({
+        try { if ($openBackupBtn.Tag) { Start-Process 'explorer.exe' -ArgumentList $openBackupBtn.Tag } } catch {}
+    }.GetNewClosure())
+    $panel.Controls.Add($openBackupBtn)
+
     $footer = New-Object System.Windows.Forms.Label
     $footer.Text = 'PLEASE WAIT  •  APPLYING SAFE, REVERSIBLE OPTIMIZATIONS'
     $footer.ForeColor = $muted
     $footer.Font = New-Object System.Drawing.Font('Consolas', 8)
     $footer.AutoSize = $true
-    $footer.Location = New-Object System.Drawing.Point(170, 278)
+    $footer.Location = New-Object System.Drawing.Point(170, 293)
     $panel.Controls.Add($footer)
 
     $done = $false
@@ -2911,11 +2926,25 @@ function Show-WorkerProgressWpf {
                 if ($evt.message) { $hintText.Text = [string]$evt.message }
                 if ([string]$evt.type -eq 'done') {
                     $done = $true; $bar.Value = 100; $percentText.Text = '100%'
-                    $stageText.Text = 'เสร็จสมบูรณ์'; $hintText.Text = 'ทำงานเสร็จแล้ว กำลังปิดหน้าต่าง...'
-                    # Play the completion sound first; once it finishes, return immediately.
+                    $stageText.Text = 'เสร็จสมบูรณ์'
+                    $summaryTxt = if ($total -gt 0) { "ปรับไปแล้ว $current จาก $total รายการ" } else { 'ทำงานเสร็จสมบูรณ์' }
+                    $hintText.Text = "$summaryTxt - กำลังปิดหน้าต่าง..."
+                    try {
+                        $bk = Find-LatestBackup
+                        if ($bk) { $openBackupBtn.Tag = $bk; $openBackupBtn.Visible = $true }
+                    } catch {}
+                    # Play the completion sound, then give the user a moment to read the
+                    # summary / click "Open Backup Folder" before auto-closing.
                     Play-GuiSound -Kind Done
                     $timer.Stop()
-                    try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
+                    $closeTimer = New-Object System.Windows.Forms.Timer
+                    $closeTimer.Interval = 1600
+                    $closeTimer.Add_Tick({
+                        param($sender, $eventArgs)
+                        try { $sender.Stop() } catch {}
+                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
+                    }.GetNewClosure())
+                    $closeTimer.Start()
                 } elseif ([string]$evt.type -eq 'error') {
                     $done = $true; $stageText.Text = 'เกิดข้อผิดพลาด'; $hintText.Text = [string]$evt.message
                     Play-GuiSound -Kind Error; $timer.Stop()
