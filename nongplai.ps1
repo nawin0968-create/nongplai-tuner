@@ -1,29 +1,38 @@
-﻿<#
-    NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
-    Rewritten from the original .cmd to fix reliability issues caused by
-    batch's fragile multi-line parsing and by spawning a fresh powershell.exe
-    process for almost every step. This version runs as a single PowerShell
-    session: fewer spawned processes, real try/catch per step, and a proper
-    JSON-based backup so Reset can undo exactly what was changed.
-
-    v2.0 additions: Hardware Scan Engine + Adaptive Deep Tweak.
-    Before applying anything, v2 scans the actual CPU/GPU/RAM/Storage/NIC in this PC and
-    only applies the tweaks that make sense for that hardware (e.g. Intel vs AMD CPU tweaks,
-    NVMe vs SATA SSD vs HDD tweaks, Realtek vs Intel NIC tweaks). Same safe change-tracking
-    and Reset as v1 - every adaptive tweak goes through the same Set-Reg/Set-SvcStart helpers
-    so it is fully undoable.
-
-    Usage:
-        Right-click > Run with PowerShell   (it will self-elevate and show a UAC prompt)
-        .\nongplai_v2.ps1                 -> shows the menu
-        .\nongplai_v2.ps1 -HpetToggle      -> opens the separate HPET on/off tool
-        .\nongplai_v2.ps1 -DryRun          -> menu runs in preview mode: shows exactly what
-                                              Smart Apply would change without changing anything
-        One-liner (no download needed):
-            irm https://<your-host>/nongplai_v2.ps1 | iex
-        Works the same as running the .ps1 file directly - it still self-elevates
-        (UAC prompt) and still shows the interactive [1]/[2]/[3] menu.
-#>
+#requires -Version 5.1
+# NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
+# Rewritten from the original .cmd to fix reliability issues caused by
+# batch's fragile multi-line parsing and by spawning a fresh powershell.exe
+# process for almost every step. This version runs as a single PowerShell
+# session: fewer spawned processes, real try/catch per step, and a proper
+# JSON-based backup so Reset can undo exactly what was changed.
+#
+# v2.0 additions: Hardware Scan Engine + Adaptive Deep Tweak.
+# Before applying anything, v2 scans the actual CPU/GPU/RAM/Storage/NIC in this PC and
+# only applies the tweaks that make sense for that hardware (e.g. Intel vs AMD CPU tweaks,
+# NVMe vs SATA SSD vs HDD tweaks, Realtek vs Intel NIC tweaks). Same safe change-tracking
+# and Reset as v1 - every adaptive tweak goes through the same Set-Reg/Set-SvcStart helpers
+# so it is fully undoable.
+#
+# Usage:
+#     Right-click > Run with PowerShell   (it will self-elevate and show a UAC prompt)
+#     .\nongplai_v2.ps1                 -> shows the menu
+#     .\nongplai_v2.ps1 -HpetToggle      -> opens the separate HPET on/off tool
+#     .\nongplai_v2.ps1 -DryRun          -> menu runs in preview mode: shows exactly what
+#                                           Smart Apply would change without changing anything
+#     One-liner (no download needed):
+#         irm https://<your-host>/nongplai_v2.ps1 | iex
+#     Works the same as running the .ps1 file directly - it still self-elevates
+#     (UAC prompt) and still shows the interactive [1]/[2]/[3] menu.
+#
+# NOTE ON THIS FILE'S HEADER: this uses single-line "#" comments instead of a "<# ... #>"
+# block comment on purpose. Windows PowerShell 5.1's `irm <url> | iex` pipeline can leave a
+# stray UTF-8 BOM character as the literal first character of the fetched string. When that
+# happens, a "<#" block-comment opener at the very start of the file is no longer recognized
+# as position 0 of the token stream, so the parser fails to treat the header as a comment at
+# all and instead tries to execute every line of the help text as a command - producing a
+# cascade of "term is not recognized" errors. Single "#" line comments do not have this
+# start-of-file matching problem, so this header is immune to that failure mode even if a BOM
+# slips through GitHub raw / Invoke-RestMethod.
 
 param(
     [switch]$HpetToggle,
