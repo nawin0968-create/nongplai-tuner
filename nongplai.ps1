@@ -29,12 +29,10 @@ param(
     [switch]$HpetToggle,
     [switch]$DryRun,
     [switch]$Worker,
-    [switch]$WorkerUi,
-    [ValidateSet('', 'Apply','Reset','Scan','Hpet')][string]$WorkerAction = '',
+    [ValidateSet('Apply','Reset','Scan','Hpet')][string]$WorkerAction = '',
     [string]$GuiLogPath = ''
 )
 
-$script:InvokedFromPipe = [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path)
 $script:ScriptPath = $MyInvocation.MyCommand.Path
 
 # The companion launcher can start this script with a hidden PowerShell window.
@@ -51,25 +49,20 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     $runPath = $MyInvocation.MyCommand.Path
     if ([string]::IsNullOrWhiteSpace($runPath)) {
         # Running via irm | iex (or similar) - persist the script text so the elevated
-        # child process has an actual file to run. Use a FIXED filename (not a random GUID)
-        # so every subsequent generation of this script (elevated copy, WorkerUi, Worker)
-        # can always find/re-create the exact same known path, even if a security tool or
-        # temp-cleanup sweep removes it between process spawns.
-        $runPath = Join-Path $env:TEMP "NongPlaiShop_v2_session.ps1"
-        Set-Content -Path $runPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8 -Force
+        # child process has an actual file to run.
+        $runPath = Join-Path $env:TEMP "nongplai_v2_$([guid]::NewGuid().ToString('N')).ps1"
+        Set-Content -Path $runPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8
     }
-    # Thread the resolved path forward explicitly so the elevated child process (and any
-    # worker processes it later spawns for GUI Apply/Reset/Scan actions) always has a real,
-    # known-good .ps1 path to relaunch itself with - this must not depend on the child
-    # re-detecting $MyInvocation.MyCommand.Path on its own.
-    $script:ScriptPath = $runPath
-    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $runPath)
+    $quotedRunPath = '"' + $runPath + '"'
+    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $quotedRunPath)
     if ($HpetToggle) { $argList += '-HpetToggle' }
     if ($DryRun) { $argList += '-DryRun' }
     if ($Worker) { $argList += '-Worker' }
-    if ($WorkerUi) { $argList += '-WorkerUi' }
     if ($WorkerAction) { $argList += @('-WorkerAction', $WorkerAction) }
-    if ($GuiLogPath) { $argList += @('-GuiLogPath', $GuiLogPath) }
+    if ($GuiLogPath) {
+        $quotedGuiLogPath = '"' + $GuiLogPath + '"'
+        $argList += @('-GuiLogPath', $quotedGuiLogPath)
+    }
     try {
         Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -WindowStyle Hidden | Out-Null
     } catch {
@@ -78,78 +71,6 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
             [System.Windows.MessageBox]::Show('ยกเลิกหรือยกระดับสิทธิ์ไม่สำเร็จ โปรแกรมนี้ต้องทำงานด้วยสิทธิ์ Administrator', 'NongPlaiShop', 'OK', 'Warning') | Out-Null
         } catch {}
     }
-    exit 0
-}
-
-# Safety net for every remaining case: already elevated (started as admin, or just relaunched
-# by the block above), but $script:ScriptPath still isn't a real file on disk. This covers
-# "opened an admin PowerShell window and ran irm|iex directly" - no elevation relaunch happens
-# in that case, so the temp-file persist logic above never ran. Do it here instead so GUI
-# worker spawning (Start-GuiWorkerProcess) always has a real path to use.
-#
-# IMPORTANT: $MyInvocation.MyCommand.Definition only contains the full script TEXT when this
-# process was started directly from piped `iex` text (gen0). Every subsequent generation
-# (elevated relaunch, WorkerUi, Worker) is started with `-File somepath.ps1`, and for a
-# file-backed command Definition just returns the file PATH again - useless once that file is
-# actually missing. The one thing that's always reliable, regardless of how THIS process was
-# launched, is the parsed AST of the script currently executing in memory - so that's the real
-# fallback source of truth used here and in Confirm-ScriptPersisted below.
-function Get-CurrentScriptSourceText {
-    try {
-        $ast = $MyInvocation.MyCommand.ScriptBlock.Ast
-        if ($ast -and $ast.Extent -and $ast.Extent.Text) { return $ast.Extent.Text }
-    } catch {}
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Definition)) { return $MyInvocation.MyCommand.Definition }
-    } catch {}
-    return $null
-}
-
-if ([string]::IsNullOrWhiteSpace($script:ScriptPath) -or -not (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
-    $fallbackPath = $MyInvocation.MyCommand.Path
-    if (-not [string]::IsNullOrWhiteSpace($fallbackPath) -and (Test-Path $fallbackPath -ErrorAction SilentlyContinue)) {
-        $script:ScriptPath = $fallbackPath
-    } else {
-        $persistPath = Join-Path $env:TEMP "NongPlaiShop_v2_session.ps1"
-        try {
-            $srcText = Get-CurrentScriptSourceText
-            if ($srcText) {
-                Set-Content -Path $persistPath -Value $srcText -Encoding UTF8 -Force
-                $script:ScriptPath = $persistPath
-            }
-        } catch {}
-    }
-}
-
-# Re-verify (and self-heal if needed) that $script:ScriptPath still points to a real file on
-# disk, right before spawning any child process that needs it. Call this immediately before
-# every Start-Process that uses $script:ScriptPath / $selfPath / $selfPathForUi, so a file
-# that got removed between process generations (temp-cleanup sweep, AV, etc.) is transparently
-# rewritten instead of the child process failing to find its own script.
-function Confirm-ScriptPersisted {
-    if (-not [string]::IsNullOrWhiteSpace($script:ScriptPath) -and (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
-        return $script:ScriptPath
-    }
-    $persistPath = Join-Path $env:TEMP "NongPlaiShop_v2_session.ps1"
-    try {
-        $srcText = Get-CurrentScriptSourceText
-        if ($srcText) {
-            Set-Content -Path $persistPath -Value $srcText -Encoding UTF8 -Force
-            $script:ScriptPath = $persistPath
-        }
-    } catch {}
-    return $script:ScriptPath
-}
-
-
-# When an already-elevated PowerShell console runs irm|iex, there is no UAC
-# relaunch to hide the original console. Relaunch the persisted copy hidden so
-# the user sees only the GUI. Worker and WorkerUi processes are excluded.
-if ($script:InvokedFromPipe -and -not $Worker -and -not $WorkerUi -and -not $HpetToggle) {
-    Confirm-ScriptPersisted | Out-Null
-    $pipeArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $($script:ScriptPath))
-    if ($DryRun) { $pipeArgs += '-DryRun' }
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $pipeArgs -WindowStyle Hidden | Out-Null
     exit 0
 }
 
@@ -165,7 +86,7 @@ $script:LogFile   = $null
 $script:OK        = 0
 $script:Total     = 0
 $script:Failed    = New-Object System.Collections.Generic.List[string]
-$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v2.1"
+$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v2.0"
 
 $script:DefenderPolicyValues = $null
 $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
@@ -173,8 +94,6 @@ $script:DryRun = [bool]$DryRun
 $script:GuiWorker = [bool]$Worker
 $script:GuiLogPath = $GuiLogPath
 $script:GuiStage = 'startup'
-$script:LegacyStepCount = 0
-$script:LegacyStepTotal = 43  # +3 from v2.1: MMCSS, ProcessPriority, TrimVerify
 $script:HwInfo = $null
 
 function Write-GuiEvent {
@@ -198,33 +117,7 @@ function Write-GuiEvent {
         }
         $line = '__NONGPLAI_EVENT__' + ($payload | ConvertTo-Json -Compress)
         [System.IO.File]::AppendAllText($script:GuiLogPath, $line + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
-    } catch {
-        try {
-            $dbgPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
-            $dbgLine = "[{0}] GuiLogPath='{1}' error={2}" -f (Get-Date -Format 'o'), $script:GuiLogPath, $_.Exception.Message
-            [System.IO.File]::AppendAllText($dbgPath, $dbgLine + [Environment]::NewLine)
-        } catch {}
-    }
-}
-
-function Write-CrashLog {
-    param([Parameter(Mandatory)]$ErrorRecord, [string]$Context = '')
-    try {
-        $dbgPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
-        $sb = New-Object System.Text.StringBuilder
-        [void]$sb.AppendLine("[$(Get-Date -Format 'o')] CRASH in $Context")
-        $ex = $ErrorRecord.Exception
-        $depth = 0
-        while ($ex -ne $null) {
-            [void]$sb.AppendLine("  depth $depth : $($ex.GetType().FullName) : $($ex.Message)")
-            $ex = $ex.InnerException
-            $depth++
-        }
-        [void]$sb.AppendLine("  PositionMessage: $($ErrorRecord.InvocationInfo.PositionMessage)")
-        [void]$sb.AppendLine("  ScriptStackTrace: $($ErrorRecord.ScriptStackTrace)")
-        [System.IO.File]::AppendAllText($dbgPath, $sb.ToString() + [Environment]::NewLine)
-        return $sb.ToString()
-    } catch { return "Write-CrashLog itself failed: $($_.Exception.Message)" }
+    } catch {}
 }
 
 # In worker mode the child process has no visible console. Redirect Write-Host output
@@ -257,14 +150,7 @@ if ($script:GuiWorker) {
 # ---------------------------------------------------------------------------
 # v2: colored status output + progress bar
 # ---------------------------------------------------------------------------
-function Write-Ok    {
-    param([string]$Message)
-    Write-Host "  [OK] $Message"   -ForegroundColor Green
-    if ($script:GuiWorker -and $script:GuiStage -eq 'legacy') {
-        $script:LegacyStepCount++
-        Write-GuiEvent -Type 'progress' -Current $script:LegacyStepCount -Total $script:LegacyStepTotal -Label $Message
-    }
-}
+function Write-Ok    { param([string]$Message) Write-Host "  [OK] $Message"   -ForegroundColor Green }
 function Write-Bad   { param([string]$Message) Write-Host "  [XX] $Message"   -ForegroundColor Red }
 function Write-Warn2 { param([string]$Message) Write-Host "  [!!] $Message"   -ForegroundColor Yellow }
 function Write-Info2 { param([string]$Message) Write-Host "  [->] $Message"   -ForegroundColor Cyan }
@@ -295,8 +181,8 @@ function Write-Log {
 }
 
 function New-BackupFolder {
-    $ts = Get-Date -Format "yyMMdd_HHmmss"
-    $dir = Join-Path $env:TEMP "NPBK_$ts"
+    $ts = Get-Date -Format "yyyyMMdd_HHmmss"
+    $dir = Join-Path $env:TEMP "FiveM_Ultra_Backup_$ts"
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
     $script:BackupDir = $dir
     $script:LogFile = Join-Path $dir "apply.log"
@@ -316,10 +202,10 @@ function Save-Changes {
 }
 
 function Find-LatestBackup {
-    $dirs = @(Get-ChildItem -Path $env:TEMP -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue)
+    $dirs = @(Get-ChildItem -Path $env:TEMP -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue)
     $desktop = [Environment]::GetFolderPath('Desktop')
     if (Test-Path $desktop) {
-        $dirs += @(Get-ChildItem -Path $desktop -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue)
+        $dirs += @(Get-ChildItem -Path $desktop -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue)
     }
     if ($dirs.Count -eq 0) { return $null }
     return ($dirs | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
@@ -597,7 +483,6 @@ function Invoke-ApplyUltra {
     $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
 
     Write-Host "Checking system..."
-    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังตรวจสอบสเปกเครื่อง...'
     try {
         $os = Get-CimInstance Win32_OperatingSystem
         $cs = Get-CimInstance Win32_ComputerSystem
@@ -612,32 +497,17 @@ function Invoke-ApplyUltra {
     if ($gtaName) { Write-Host "GTA process file: $gtaName" }
 
     Write-Host "Creating restore point..."
-    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังสร้างจุดคืนค่าระบบ (อาจใช้เวลาถึง 1 นาที)...'
     try {
-        $rpJob = Start-Job -ScriptBlock {
-            param($desc)
-            Checkpoint-Computer -Description $desc -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
-        } -ArgumentList 'FiveM Ultra Before Apply'
-        if (Wait-Job $rpJob -Timeout 45) {
-            if ($rpJob.State -eq 'Completed' -and -not (Receive-Job $rpJob -ErrorAction SilentlyContinue -Keep | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })) {
-                Write-Host "Restore point: created"
-            } else {
-                Write-Host "Restore point: skipped (see job errors)"
-            }
-        } else {
-            Write-Host "Restore point: skipped - timed out after 45s (Windows System Restore is slow/stuck on this PC)"
-            Stop-Job $rpJob -ErrorAction SilentlyContinue
-        }
-        Remove-Job $rpJob -Force -ErrorAction SilentlyContinue
+        Checkpoint-Computer -Description 'FiveM Ultra Before Apply' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+        Write-Host "Restore point: created"
     } catch {
         Write-Host ("Restore point: skipped - " + $_.Exception.Message)
     }
 
     Write-Host "Testing network baseline..."
-    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย...'
-    try { Test-Connection -ComputerName 8.8.8.8 -Count 4 | Format-Table -AutoSize | Out-Host } catch {}
+    try { Test-Connection -ComputerName 1.1.1.1 -Count 4 | Format-Table -AutoSize | Out-Host } catch {}
 
-    $script:Total = 42  # v2.1: 39 legacy + 3 new (MMCSS, ProcessPriority, TrimVerify)
+    $script:Total = 39
     $n = 0
 
     Invoke-Step (++$n) $Total "Applying background, search, Game DVR, Delivery Optimization, telemetry policies..." {
@@ -716,22 +586,6 @@ function Invoke-ApplyUltra {
 
     Invoke-Step (++$n) $Total "Requesting lower kernel timer resolution..." {
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests' 1 'DWord' | Out-Null
-    }
-
-    Invoke-Step (++$n) $Total "Registering FiveM/GTAProcess to MMCSS (Multimedia Class Scheduler) with High priority..." {
-        Invoke-MmcssRegister 'FiveM.exe' | Out-Null
-    }
-
-    Invoke-Step (++$n) $Total "Setting FiveM base process priority to High (persistent)..." {
-        Invoke-ProcessPriorityHigh 'FiveM.exe' | Out-Null
-        $gtaName = Find-GtaProcessName
-        if ($gtaName) {
-            Invoke-ProcessPriorityHigh $gtaName | Out-Null
-        }
-    }
-
-    Invoke-Step (++$n) $Total "Verifying TRIM status on NVMe/SSD (write latency check)..." {
-        Invoke-TrimVerify | Out-Null
     }
 
     Invoke-Step (++$n) $Total "Disabling USB selective suspend on active power plan..." {
@@ -836,7 +690,7 @@ function Invoke-ApplyUltra {
             try {
                 $old = (Get-DnsClientServerAddress -InterfaceIndex $a.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
                 $script:Changes.Add([PSCustomObject]@{ Kind='Dns'; IfIndex=$a.IfIndex; OldServers=$old })
-                Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ServerAddresses ('8.8.8.8','8.8.4.4') -ErrorAction Stop
+                Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ServerAddresses ('1.1.1.1','1.0.0.1') -ErrorAction Stop
             } catch { Write-Log "  ! DNS set failed: $($_.Exception.Message)" }
         }
     }
@@ -1128,7 +982,7 @@ function Invoke-ApplyUltra {
     for ($i = 0; $i -lt $checks.Count; $i++) {
         try { if (& $checks[$i]) { $ok++ } else { $failed += $names[$i] } } catch { $failed += $names[$i] }
     }
-    Write-ProgressBar -Current $script:Total -Total $script:Total -Label 'Ultra profile applied'
+    Write-ProgressBar -Current 39 -Total 39 -Label 'Ultra profile applied'
     Write-Host ""
     $passColor = if ($ok -eq $checks.Count) { 'Green' } elseif ($ok -ge ($checks.Count * 0.7)) { 'Yellow' } else { 'Red' }
     Write-Host "Checks passed: $ok/$($checks.Count)" -ForegroundColor $passColor
@@ -1139,12 +993,6 @@ function Invoke-ApplyUltra {
     Write-Log "Apply finished. Checks passed: $ok/$($checks.Count). Not applied: $($failed -join ', ')"
 
     # ---- Auto-help for Defender exclusions that Tamper Protection blocked ----
-    # v2.1: Cleanup backups and logs
-    Write-Host ""
-    Write-Host "Cleaning up old backups and rotating logs..."
-    Invoke-BackupPruning -KeepCount 5 | Out-Null
-    Invoke-LogRotation -MaxSizeMB 10 | Out-Null
-
     if ($script:PendingExclusions.Paths.Count -gt 0 -or $script:PendingExclusions.Processes.Count -gt 0) {
         Write-Host ""
         Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
@@ -1359,18 +1207,11 @@ function Invoke-ResetUltra {
     } catch {}
 
     Write-Host "Undid $count tracked changes, plus global network/power defaults."
-    
-    # v2.1: Verify reset success
-    Write-Host "Verifying reset success..."
-    $verifyOk = Invoke-ResetVerify -Changes $list
-    if (-not $verifyOk) {
-        Write-Warn2 "Some changes may not have reverted - see details above or check changes.json"
-    }
     Write-Host "Removing temporary backup folders..."
-    Get-ChildItem -Path $env:TEMP -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $env:TEMP -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     $desktop = [Environment]::GetFolderPath('Desktop')
     if (Test-Path $desktop) {
-        Get-ChildItem -Path $desktop -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $desktop -Directory -Filter "FiveM_Ultra_Backup_*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
     Write-Host ""
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
@@ -1507,7 +1348,7 @@ function Invoke-RemoveDefenderPolicy {
         return
     }
 
-    $backupDir = Join-Path $env:TEMP ("NPBK_" + (Get-Date -Format "yyMMdd_HHmmss"))
+    $backupDir = Join-Path $env:TEMP ("FiveM_Ultra_Backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
     New-Item -Path $backupDir -ItemType Directory -Force | Out-Null
     $regBackup = Join-Path $backupDir "WindowsDefenderPolicy_backup.reg"
     try {
@@ -1532,183 +1373,6 @@ function Invoke-RemoveDefenderPolicy {
         Write-Host "in that case this PC is genuinely managed and this should not be removed."
     }
     Read-Host "Press Enter to continue"
-}
-
-# ===========================================================================
-# v2.1 — MMCSS (Multimedia Class Scheduler) REGISTRATION FOR FiveM
-# ===========================================================================
-function Invoke-MmcssRegister {
-    param([string]$ProcessName = 'FiveM.exe')
-    try {
-        $taskPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\FiveM'
-        $keyExisted = Test-Path $taskPath
-        if ($script:DryRun) {
-            Write-Host ("  [DRYRUN] would register {0} to MMCSS with High priority" -f $ProcessName) -ForegroundColor DarkCyan
-            return $true
-        }
-        if (-not $keyExisted) { New-Item -Path $taskPath -Force | Out-Null }
-        Set-Reg "$taskPath" 'Scheduling Category' 'High' 'String' | Out-Null
-        Set-Reg "$taskPath" 'SFIO Priority' 'High' 'String' | Out-Null
-        Set-Reg "$taskPath" 'Priority' 8 'DWord' | Out-Null  # High Priority in multimedia class
-        Set-Reg "$taskPath" 'GPU Priority' 8 'DWord' | Out-Null
-        Set-Reg "$taskPath" 'Latency Sensitive' 1 'DWord' | Out-Null
-        Set-Reg "$taskPath\Process" 'FiveM.exe' '' 'String' | Out-Null
-        $gtaName = Find-GtaProcessName
-        if ($gtaName) {
-            Set-Reg "$taskPath\Process" $gtaName '' 'String' | Out-Null
-            Write-Ok "MMCSS registered: FiveM.exe + $gtaName with High Priority, Latency Sensitive=1"
-        } else {
-            Write-Ok "MMCSS registered: FiveM.exe with High Priority, Latency Sensitive=1"
-        }
-        return $true
-    } catch {
-        Write-Log ("  ! MMCSS registration failed: {0}" -f $_.Exception.Message)
-        return $false
-    }
-}
-
-# ===========================================================================
-# v2.1 — PER-PROCESS PRIORITY HIGH (via Image File Execution Options)
-# ===========================================================================
-function Invoke-ProcessPriorityHigh {
-    param([string]$ProcessName = 'FiveM.exe')
-    try {
-        if ($script:DryRun) {
-            Write-Host ("  [DRYRUN] would set {0} base priority to High" -f $ProcessName) -ForegroundColor DarkCyan
-            return $true
-        }
-        $ifeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$ProcessName"
-        if (-not (Test-Path $ifeoPath)) { New-Item -Path $ifeoPath -Force | Out-Null }
-        Set-Reg "$ifeoPath" 'PriorityClass' 0x00000002 'DWord' | Out-Null  # 2 = High Priority
-        Write-Ok "Base priority set: $ProcessName = High (persists across reboots)"
-        return $true
-    } catch {
-        Write-Log ("  ! Process priority setting failed for {0}: {1}" -f $ProcessName, $_.Exception.Message)
-        return $false
-    }
-}
-
-# ===========================================================================
-# v2.1 — HARDWARE-ACCELERATED GPU SCHEDULING (HAGS) CONTROL
-# ===========================================================================
-function Invoke-HagsToggle {
-    param([ValidateSet('Enable','Disable','Skip')]$Action = 'Skip')
-    try {
-        $hags = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'
-        $current = (Get-ItemProperty $hags -Name 'HwSchMode' -ErrorAction SilentlyContinue).HwSchMode
-        $currentState = if ($current -eq 2) { 'Enabled' } else { 'Disabled' }
-        
-        if ($Action -eq 'Skip') {
-            Write-Info2 "HAGS: currently $currentState (skipped, enable/disable per your choice in NVIDIA/AMD settings or BIOS)"
-            return $true
-        } elseif ($Action -eq 'Enable') {
-            if ($script:DryRun) { Write-Host "  [DRYRUN] would enable HAGS" -ForegroundColor DarkCyan; return $true }
-            Set-Reg $hags 'HwSchMode' 2 'DWord' | Out-Null
-            Write-Info2 "HAGS: Enabled (watch performance - helps some NVIDIA/AMD chips, hurts others; revert if FPS drops)"
-            return $true
-        } else {
-            if ($script:DryRun) { Write-Host "  [DRYRUN] would disable HAGS" -ForegroundColor DarkCyan; return $true }
-            Set-Reg $hags 'HwSchMode' 1 'DWord' | Out-Null
-            Write-Info2 "HAGS: Disabled (traditional GPU scheduling)"
-            return $true
-        }
-    } catch {
-        Write-Log ("  ! HAGS toggle failed: {0}" -f $_.Exception.Message)
-        return $false
-    }
-}
-
-# ===========================================================================
-# v2.1 — TRIM VERIFICATION FOR NVMe/SSD
-# ===========================================================================
-function Invoke-TrimVerify {
-    try {
-        Write-Info2 "Verifying TRIM status on all disks..."
-        $trimStatus = fsutil behavior query DisableDeleteNotify
-        if ($trimStatus -like "*0*") {
-            Write-Ok "TRIM/UNMAP: Enabled (NVMe/SSD write latency will not degrade over time)"
-        } else {
-            Write-Warn2 "TRIM/UNMAP appears disabled - NVMe/SSD write latency may increase over time. Run: fsutil behavior set DisableDeleteNotify 0 (admin)"
-        }
-    } catch {
-        Write-Log ("  ! TRIM verification skipped: {0}" -f $_.Exception.Message)
-    }
-}
-
-# ===========================================================================
-# v2.1 — BACKUP PRUNING (keep only last N backups)
-# ===========================================================================
-function Invoke-BackupPruning {
-    param([int]$KeepCount = 5)
-    try {
-        $dirs = @(Get-ChildItem -Path $env:TEMP -Directory -Filter "NPBK_*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
-        if ($dirs.Count -gt $KeepCount) {
-            $toDelete = $dirs[$KeepCount..($dirs.Count - 1)]
-            foreach ($dir in $toDelete) {
-                try { Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-                catch { Write-Log "  ! Could not delete old backup: $($dir.FullName)" }
-            }
-            Write-Ok "Backup pruning: deleted $($toDelete.Count) old backups, keeping last $KeepCount"
-        }
-    } catch {
-        Write-Log ("  ! Backup pruning failed: {0}" -f $_.Exception.Message)
-    }
-}
-
-# ===========================================================================
-# v2.1 — LOG ROTATION (prevent write_errors.log from growing forever)
-# ===========================================================================
-function Invoke-LogRotation {
-    param([int]$MaxSizeMB = 10)
-    try {
-        $logPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
-        if (Test-Path $logPath) {
-            $file = Get-Item $logPath
-            $sizeMB = [math]::Round($file.Length / 1MB, 2)
-            if ($sizeMB -gt $MaxSizeMB) {
-                $archive = $logPath -replace '.log$', "_$(Get-Date -Format 'yyMMdd_HHmmss').log"
-                try { Move-Item -Path $logPath -Destination $archive -Force -ErrorAction SilentlyContinue }
-                catch { Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue }
-                Write-Ok "Log rotation: archived $sizeMB MB to $([System.IO.Path]::GetFileName($archive))"
-            }
-        }
-    } catch {
-        Write-Log ("  ! Log rotation failed: {0}" -f $_.Exception.Message)
-    }
-}
-
-# ===========================================================================
-# v2.1 — RESET VERIFICATION (confirm all changes were actually reverted)
-# ===========================================================================
-function Invoke-ResetVerify {
-    param([Parameter(Mandatory)][PSCustomObject[]]$Changes)
-    $failures = New-Object System.Collections.Generic.List[string]
-    foreach ($change in $Changes) {
-        try {
-            if ($change.Kind -eq 'RegValue' -and -not $change.KeyCreated) {
-                $path = $change.Path
-                $name = $change.Name
-                $current = (Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue).$name
-                $old = $change.OldValue
-                if ($null -ne $current -and $current -ne $old) {
-                    $failures.Add("Reg not reverted: $path\$name (now=$current, expected=$old)")
-                }
-            } elseif ($change.Kind -eq 'Service') {
-                $svc = Get-Service -Name $change.Name -ErrorAction SilentlyContinue
-                if ($svc -and $svc.StartType -ne $change.OldStart) {
-                    $failures.Add("Service not reverted: $($change.Name) (now=$($svc.StartType), expected=$($change.OldStart))")
-                }
-            }
-        } catch {}
-    }
-    if ($failures.Count -gt 0) {
-        Write-Warn2 "Reset verification found $($failures.Count) revert failures (check changes.json for details)"
-        foreach ($f in $failures) { Write-Log "  ! $f" }
-        return $false
-    } else {
-        Write-Ok "Reset verification passed: all registry/service values reverted correctly"
-        return $true
-    }
 }
 
 function Invoke-HpetToggle {
@@ -2398,7 +2062,7 @@ function Invoke-NetworkAdaptive {
 function Invoke-SmartApply {
     Clear-Host
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    Write-Host "  SMART ADAPTIVE TUNER v1.0 - HARDWARE SCAN -> DEEP TWEAK" -ForegroundColor Cyan
+    Write-Host "  SMART ADAPTIVE TUNER v2.0 - HARDWARE SCAN -> DEEP TWEAK" -ForegroundColor Cyan
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     if ($script:DryRun) {
         Write-Warn2 "DRY RUN MODE - nothing will actually be changed, this is a preview only"
@@ -2495,7 +2159,6 @@ function Invoke-DoEverything {
 
     # --- Part 1: full legacy 39-step Apply Ultra (creates backup folder + restore point) ---
     $script:GuiStage = 'legacy'
-    $script:LegacyStepCount = 0
     Invoke-ApplyUltra
 
     # --- Part 2: scan this PC's hardware and layer on adaptive CPU/GPU/RAM/Storage/Network tweaks ---
@@ -2603,18 +2266,6 @@ try {
     exit 1
 }
 
-# Keep a single WPF Application/Dispatcher alive for the whole run. Without this, WPF can
-# tear down its dispatcher as soon as the first Window (e.g. the main menu) closes, which
-# makes any later Window's ShowDialog() fail with "cannot call a method on a null-valued
-# expression" - exactly the error this fixes (main menu closes -> worker progress window
-# tries to open next and fails without a persistent Application).
-if (-not [System.Windows.Application]::Current) {
-    try {
-        $script:WpfApp = New-Object System.Windows.Application
-        $script:WpfApp.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
-    } catch { $script:WpfApp = $null }
-}
-
 # No console window is re-shown by the GUI entry point.
 
 $script:MenuCards = @(
@@ -2642,7 +2293,7 @@ function Show-MainMenuWpf {
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="NongPlaiShop" Height="640" Width="960"
         WindowStartupLocation="CenterScreen" WindowStyle="None"
-        ResizeMode="NoResize" Background="#08080A">
+        ResizeMode="NoResize" Background="Transparent" AllowsTransparency="True">
   <Border CornerRadius="16" BorderBrush="#2A2A30" BorderThickness="1" ClipToBounds="True">
     <Border.Background>
       <RadialGradientBrush Center="0.5,0.15" RadiusX="0.9" RadiusY="0.9">
@@ -2693,7 +2344,7 @@ function Show-MainMenuWpf {
       </Grid>
 
       <!-- Fanned card stage -->
-      <Grid Grid.Row="1" Name="Stage" Background="Transparent">
+      <Grid Grid.Row="1">
         <Border Name="Card0" Width="240" Height="290" CornerRadius="14" BorderThickness="2" BorderBrush="Transparent" Cursor="Hand"
                 HorizontalAlignment="Center" VerticalAlignment="Center">
           <Border.Effect><DropShadowEffect Color="Black" BlurRadius="30" ShadowDepth="6" Opacity="0.6"/></Border.Effect>
@@ -2775,7 +2426,7 @@ function Show-MainMenuWpf {
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
-        <StackPanel Grid.Column="0" Name="ButtonsPanel" Orientation="Horizontal">
+        <StackPanel Grid.Column="0" Orientation="Horizontal">
           <Button Name="CycleLeftBtn" Content="◂" Width="42" Height="42" Background="#1c1c20" Foreground="White"
                   FontSize="16" BorderThickness="0" Cursor="Hand" Margin="0,0,8,0"/>
           <Button Name="RunBtn" Content="RUN ▸" Width="170" Height="42"
@@ -2783,8 +2434,23 @@ function Show-MainMenuWpf {
           <Button Name="CycleRightBtn" Content="▸" Width="42" Height="42" Background="#1c1c20" Foreground="White"
                   FontSize="16" BorderThickness="0" Cursor="Hand" Margin="8,0,0,0"/>
         </StackPanel>
-        <TextBlock Grid.Column="1" Text="NongPlaiShop · Smart Adaptive Tuner v1.0"
+        <TextBlock Grid.Column="1" Text="NongPlaiShop · Smart Adaptive Tuner v2.0"
                    Foreground="#4a4a4e" FontSize="11" VerticalAlignment="Center" HorizontalAlignment="Right"/>
+      </Grid>
+
+      <!-- Work overlay: the worker runs hidden while this remains the only visible window. -->
+      <Grid Name="WorkOverlay" Grid.RowSpan="4" Visibility="Collapsed" Background="#E608080A" Panel.ZIndex="100">
+        <Border Width="610" Height="230" CornerRadius="16" Background="#191A20" BorderBrush="#3A3A42" BorderThickness="1"
+                HorizontalAlignment="Center" VerticalAlignment="Center" Padding="34">
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Text="NongPlaiShop กำลังทำงาน" Foreground="#F2C94C" FontSize="22" FontWeight="Bold" HorizontalAlignment="Center"/>
+            <TextBlock Name="WorkStage" Text="กำลังเตรียมการ..." Foreground="#FFFFFF" FontSize="14" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+            <ProgressBar Name="WorkProgress" Minimum="0" Maximum="100" Value="0" Height="18" Margin="0,22,0,0"
+                         Background="#2B2C33" Foreground="#F2C94C" BorderThickness="0"/>
+            <TextBlock Name="WorkPercent" Text="0%" Foreground="#C9C9CC" FontSize="13" HorizontalAlignment="Center" Margin="0,8,0,0"/>
+            <TextBlock Name="WorkHint" Text="โปรดรอสักครู่ ห้ามปิดหน้าต่างระหว่างทำงาน" Foreground="#7D7D82" FontSize="11" HorizontalAlignment="Center" Margin="0,8,0,0"/>
+          </StackPanel>
+        </Border>
       </Grid>
     </Grid>
   </Border>
@@ -2800,7 +2466,6 @@ function Show-MainMenuWpf {
     $runBtn    = $window.FindName('RunBtn')
     $closeBtn  = $window.FindName('CloseBtn')
     $topBar    = $window.FindName('TopBar')
-    $buttonsPanel   = $window.FindName('ButtonsPanel')
     $leftBtn   = $window.FindName('CycleLeftBtn')
     $rightBtn  = $window.FindName('CycleRightBtn')
 
@@ -2883,70 +2548,16 @@ function Show-MainMenuWpf {
 
     for ($i = 0; $i -lt $cards.Count; $i++) {
         $idx = $i
-        $cards[$i].Add_MouseLeftButtonUp({ if (-not $script:GuiIsDragging) { $script:GuiSelectedIndex = $idx; Update-CardSelection } }.GetNewClosure())
+        $cards[$i].Add_MouseLeftButtonUp({ $script:GuiSelectedIndex = $idx; Update-CardSelection }.GetNewClosure())
     }
     $leftBtn.Add_Click({ $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection })
     $rightBtn.Add_Click({ $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection })
-    $runBtn.Add_Click({
-        $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key
-        $window.Close()
-    })
+    $runBtn.Add_Click({ $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key; $window.Close() })
     $closeBtn.Add_Click({ $script:GuiResult = '3'; $window.Close() })
     $topBar.Add_MouseLeftButtonDown({ try { $window.DragMove() } catch {} })
 
-    # Mouse drag (click-and-drag left/right) to swipe between cards, like a carousel
-    $stage = $window.FindName('Stage')
-    $script:GuiDragStartX = $null
-    $script:GuiIsDragging = $false
-    $stage.Add_MouseLeftButtonDown({
-        param($s, $e)
-        $script:GuiDragStartX = $e.GetPosition($stage).X
-        $script:GuiIsDragging = $false
-        $stage.CaptureMouse() | Out-Null
-    })
-    $stage.Add_MouseMove({
-        param($s, $e)
-        if ($script:GuiDragStartX -ne $null -and $e.LeftButton -eq 'Pressed') {
-            $dx = $e.GetPosition($stage).X - $script:GuiDragStartX
-            if ([math]::Abs($dx) -gt 8) { $script:GuiIsDragging = $true }
-        }
-    })
-    $stage.Add_MouseLeftButtonUp({
-        param($s, $e)
-        if ($script:GuiDragStartX -ne $null) {
-            $dx = $e.GetPosition($stage).X - $script:GuiDragStartX
-            if ($script:GuiIsDragging) {
-                if ($dx -le -40) { $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection }
-                elseif ($dx -ge 40) { $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection }
-            }
-        }
-        $stage.ReleaseMouseCapture() | Out-Null
-        $script:GuiDragStartX = $null
-        $script:GuiIsDragging = $false
-    })
-
-    # Keyboard shortcuts: 1/2/3 jump straight to a card, arrows cycle, Enter runs, Esc exits
-    $window.Add_KeyDown({
-        param($s, $e)
-        switch ($e.Key) {
-            'D1'      { $script:GuiSelectedIndex = 0; Update-CardSelection }
-            'D2'      { $script:GuiSelectedIndex = 1; Update-CardSelection }
-            'D3'      { $script:GuiSelectedIndex = 2; Update-CardSelection }
-            'Left'    { $script:GuiSelectedIndex = ($script:GuiSelectedIndex - 1 + $cards.Count) % $cards.Count; Update-CardSelection }
-            'Right'   { $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection }
-            'Enter'   { $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key; $window.Close() }
-            'Escape'  { $script:GuiResult = '3'; $window.Close() }
-        }
-    })
-
     Update-CardSelection
-    try {
-        $window.ShowDialog() | Out-Null
-    } catch {
-        $detail = Write-CrashLog -ErrorRecord $_ -Context 'Show-MainMenuWpf ShowDialog'
-        try { [System.Windows.MessageBox]::Show($detail, 'NongPlaiShop - Error (detail)', 'OK', 'Error') | Out-Null } catch {}
-        $script:GuiResult = $null
-    }
+    $window.ShowDialog() | Out-Null
     return $script:GuiResult
 }
 
@@ -2957,16 +2568,10 @@ function Play-GuiSound {
     param([ValidateSet('Start','Progress','Done','Error')][string]$Kind = 'Progress')
     try {
         switch ($Kind) {
-            'Start'    {
-                # Single startup beep.
-                [Console]::Beep(988, 140)
-            }
-            'Progress' { [Console]::Beep(660, 45) }
-            'Done'     { [Console]::Beep(1046, 600) }
-            'Error'    {
-                [Console]::Beep(311, 220)
-                [Console]::Beep(233, 260)
-            }
+            'Start'    { [System.Media.SystemSounds]::Asterisk.Play() }
+            'Progress' { [System.Media.SystemSounds]::Beep.Play() }
+            'Done'     { [System.Media.SystemSounds]::Exclamation.Play() }
+            'Error'    { [System.Media.SystemSounds]::Hand.Play() }
         }
     } catch {}
 }
@@ -2981,38 +2586,42 @@ function Invoke-GuiWorkerAction {
             default { throw "ไม่พบคำสั่ง worker ที่ถูกต้อง: $WorkerAction" }
         }
         Write-GuiEvent -Type 'done' -Current 100 -Total 100 -Label 'เสร็จสมบูรณ์' -Message 'การทำงานเสร็จสมบูรณ์'
-        # Keep the script file until WorkerUi has closed. WorkerUi will launch
-        # the main menu again, and that new menu process performs final cleanup.
+        try {
+            if ($script:ScriptPath -and ($script:ScriptPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
+                Remove-Item -Path $script:ScriptPath -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
         exit 0
     } catch {
         Write-GuiEvent -Type 'error' -Current 0 -Total 100 -Label 'เกิดข้อผิดพลาด' -Message $_.Exception.Message
+        try {
+            if ($script:ScriptPath -and ($script:ScriptPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
+                Remove-Item -Path $script:ScriptPath -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
         exit 1
     }
 }
 
 function Start-GuiWorkerProcess {
     param([Parameter(Mandatory)][string]$Action, [Parameter(Mandatory)][string]$LogPath)
-    $selfPath = Confirm-ScriptPersisted
+    $selfPath = $script:ScriptPath
     if ([string]::IsNullOrWhiteSpace($selfPath) -or -not (Test-Path $selfPath)) {
         throw 'ไม่พบไฟล์ .ps1 สำหรับเริ่มงานเบื้องหลัง กรุณาเปิดจากไฟล์สคริปต์ที่บันทึกไว้ในเครื่อง'
     }
+    $quotedSelfPath = '"' + $selfPath + '"'
+    $quotedLogPath = '"' + $LogPath + '"'
     $workerArgs = @(
         '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-        '-File', $selfPath, '-Worker', '-WorkerAction', $Action,
-        '-GuiLogPath', $LogPath
+        '-File', $quotedSelfPath, '-Worker', '-WorkerAction', $Action,
+        '-GuiLogPath', $quotedLogPath
     )
     if ($script:DryRun) { $workerArgs += '-DryRun' }
     return Start-Process -FilePath 'powershell.exe' -ArgumentList $workerArgs -WindowStyle Hidden -PassThru
 }
 
 function Show-WorkerProgressWpf {
-    param([Parameter(Mandatory)][ValidateSet('Apply','Reset')][string]$Action)
-
-    # Use WinForms controls created directly in .NET. This avoids the WPF XAML
-    # loader path that returned a null Window on the affected Windows PowerShell
-    # installation, while preserving the same progress UI and worker behavior.
-    Add-Type -AssemblyName System.Windows.Forms, System.Drawing -ErrorAction Stop
-    [System.Windows.Forms.Application]::EnableVisualStyles()
+    param([Parameter(Mandatory)][ValidateSet('Apply','Reset','Scan','Hpet')][string]$Action)
 
     $logPath = Join-Path $env:TEMP ("NongPlaiGui_" + [guid]::NewGuid().ToString('N') + '.log')
     New-Item -ItemType File -Path $logPath -Force | Out-Null
@@ -3020,149 +2629,45 @@ function Show-WorkerProgressWpf {
     try { $worker = Start-GuiWorkerProcess -Action $Action -LogPath $logPath }
     catch {
         Play-GuiSound -Kind Error
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'NongPlaiShop', 'OK', 'Error') | Out-Null
+        [System.Windows.MessageBox]::Show($_.Exception.Message, 'NongPlaiShop', 'OK', 'Error') | Out-Null
         Remove-Item $logPath -Force -ErrorAction SilentlyContinue
         return
     }
     Play-GuiSound -Kind Start
 
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'NongPlaiShop - Working'
-    $form.ClientSize = New-Object System.Drawing.Size(660, 345)
-    $form.StartPosition = 'CenterScreen'
-    $form.FormBorderStyle = 'None'
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $false
-    $form.ShowInTaskbar = $true
-    $form.BackColor = [System.Drawing.Color]::FromArgb(9,10,14)
-    $form.Padding = New-Object System.Windows.Forms.Padding(2)
-
-    # Gaming-tuner visual shell: dark surface, gold/cyan accents and a compact status header.
-    $accentGold = [System.Drawing.Color]::FromArgb(242,201,76)
-    $accentCyan = [System.Drawing.Color]::FromArgb(86,204,242)
-    $muted = [System.Drawing.Color]::FromArgb(130,135,148)
-    $panel = New-Object System.Windows.Forms.Panel
-    $panel.BackColor = [System.Drawing.Color]::FromArgb(21,22,30)
-    $panel.Dock = 'Fill'
-    $form.Controls.Add($panel)
-
-    $accentLine = New-Object System.Windows.Forms.Panel
-    $accentLine.BackColor = $accentGold
-    $accentLine.Location = New-Object System.Drawing.Point(0,0)
-    $accentLine.Size = New-Object System.Drawing.Size(656,3)
-    $panel.Controls.Add($accentLine)
-
-    $brand = New-Object System.Windows.Forms.Label
-    $brand.Text = '⚡  NONGPLAISHOP'
-    $brand.ForeColor = $accentGold
-    $brand.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
-    $brand.AutoSize = $true
-    $brand.Location = New-Object System.Drawing.Point(28,20)
-    $panel.Controls.Add($brand)
-
-    $mode = New-Object System.Windows.Forms.Label
-    $mode.Text = 'SMART ADAPTIVE TUNER  /  LIVE'
-    $mode.ForeColor = $accentCyan
-    $mode.Font = New-Object System.Drawing.Font('Consolas', 8, [System.Drawing.FontStyle]::Bold)
-    $mode.AutoSize = $true
-    $mode.Location = New-Object System.Drawing.Point(405,24)
-    $panel.Controls.Add($mode)
-
-    $headerRule = New-Object System.Windows.Forms.Panel
-    $headerRule.BackColor = [System.Drawing.Color]::FromArgb(48,50,62)
-    $headerRule.Location = New-Object System.Drawing.Point(28,55)
-    $headerRule.Size = New-Object System.Drawing.Size(600,1)
-    $panel.Controls.Add($headerRule)
-
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = 'กำลังปรับจูนระบบ'
-    $title.ForeColor = [System.Drawing.Color]::White
-    $title.Font = New-Object System.Drawing.Font('Segoe UI', 17, [System.Drawing.FontStyle]::Bold)
-    $title.AutoSize = $false
-    $title.TextAlign = 'MiddleCenter'
-    $title.Size = New-Object System.Drawing.Size(580, 32)
-    $title.Location = New-Object System.Drawing.Point(38, 76)
-    $panel.Controls.Add($title)
-
-    $stageText = New-Object System.Windows.Forms.Label
-    $stageText.Text = 'กำลังเตรียมการ...'
-    $stageText.ForeColor = [System.Drawing.Color]::White
-    $stageText.Font = New-Object System.Drawing.Font('Segoe UI', 10)
-    $stageText.AutoSize = $false
-    $stageText.TextAlign = 'MiddleCenter'
-    $stageText.Size = New-Object System.Drawing.Size(580, 30)
-    $stageText.MaximumSize = New-Object System.Drawing.Size(580, 30)
-    $stageText.Location = New-Object System.Drawing.Point(38, 112)
-    $panel.Controls.Add($stageText)
-
-    $bar = New-Object System.Windows.Forms.ProgressBar
-    $bar.Minimum = 0
-    $bar.Maximum = 100
-    $bar.Value = 0
-    $bar.Style = 'Continuous'
-    $bar.Size = New-Object System.Drawing.Size(580, 20)
-    $bar.Location = New-Object System.Drawing.Point(38, 155)
-    $bar.BackColor = [System.Drawing.Color]::FromArgb(43,45,56)
-    $panel.Controls.Add($bar)
-
-    $percentText = New-Object System.Windows.Forms.Label
-    $percentText.Text = '0%'
-    $percentText.ForeColor = [System.Drawing.Color]::FromArgb(201,201,204)
-    $percentText.Font = New-Object System.Drawing.Font('Segoe UI', 10)
-    $percentText.AutoSize = $false
-    $percentText.TextAlign = 'MiddleCenter'
-    $percentText.Size = New-Object System.Drawing.Size(580, 26)
-    $percentText.ForeColor = $accentGold
-    $percentText.Font = New-Object System.Drawing.Font('Consolas', 12, [System.Drawing.FontStyle]::Bold)
-    $percentText.Location = New-Object System.Drawing.Point(38, 180)
-    $panel.Controls.Add($percentText)
-
-    $hintText = New-Object System.Windows.Forms.Label
-    $hintText.Text = 'กำลังทำงาน โปรดรอสักครู่...'
-    $hintText.ForeColor = [System.Drawing.Color]::FromArgb(125,125,130)
-    $hintText.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-    $hintText.AutoSize = $false
-    $hintText.TextAlign = 'MiddleCenter'
-    $hintText.Size = New-Object System.Drawing.Size(580, 30)
-    $hintText.MaximumSize = New-Object System.Drawing.Size(580, 30)
-    $hintText.Location = New-Object System.Drawing.Point(38, 211)
-    $panel.Controls.Add($hintText)
-
-    $openBackupBtn = New-Object System.Windows.Forms.Button
-    $openBackupBtn.Text = 'เปิดโฟลเดอร์ Backup'
-    $openBackupBtn.Size = New-Object System.Drawing.Size(180, 30)
-    $openBackupBtn.Location = New-Object System.Drawing.Point(240, 245)
-    $openBackupBtn.FlatStyle = 'Flat'
-    $openBackupBtn.FlatAppearance.BorderColor = $accentGold
-    $openBackupBtn.BackColor = [System.Drawing.Color]::FromArgb(38,39,48)
-    $openBackupBtn.ForeColor = $accentGold
-    $openBackupBtn.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-    $openBackupBtn.Visible = $false
-    $openBackupBtn.Add_Click({
-        try { if ($openBackupBtn.Tag) { Start-Process 'explorer.exe' -ArgumentList $openBackupBtn.Tag } } catch {}
-    }.GetNewClosure())
-    $panel.Controls.Add($openBackupBtn)
-
-    $footer = New-Object System.Windows.Forms.Label
-    $footer.Text = 'PLEASE WAIT  •  APPLYING SAFE, REVERSIBLE OPTIMIZATIONS'
-    $footer.ForeColor = $muted
-    $footer.Font = New-Object System.Drawing.Font('Consolas', 8)
-    $footer.AutoSize = $true
-    $footer.Location = New-Object System.Drawing.Point(170, 293)
-    $panel.Controls.Add($footer)
-
+    [xml]$progressXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        Title="NongPlaiShop - Working" Height="300" Width="660"
+        WindowStartupLocation="CenterScreen" WindowStyle="None"
+        ResizeMode="NoResize" Background="#08080A" AllowsTransparency="True" ShowInTaskbar="True">
+  <Border CornerRadius="16" Background="#15161C" BorderBrush="#34343C" BorderThickness="1" Padding="38">
+    <StackPanel VerticalAlignment="Center">
+      <TextBlock Text="NongPlaiShop กำลังทำงาน" Foreground="#F2C94C" FontSize="23" FontWeight="Bold" HorizontalAlignment="Center"/>
+      <TextBlock Name="ProgressStage" Text="กำลังเตรียมการ..." Foreground="#FFFFFF" FontSize="14" HorizontalAlignment="Center" Margin="0,14,0,0"/>
+      <ProgressBar Name="ProgressBar" Minimum="0" Maximum="100" Value="0" Height="18" Margin="0,24,0,0" Background="#2B2C33" Foreground="#F2C94C" BorderThickness="0"/>
+      <TextBlock Name="ProgressPercent" Text="0%" Foreground="#C9C9CC" FontSize="13" HorizontalAlignment="Center" Margin="0,8,0,0"/>
+      <TextBlock Name="ProgressHint" Text="กำลังทำงาน โปรดรอสักครู่..." Foreground="#7D7D82" FontSize="11" HorizontalAlignment="Center" Margin="0,7,0,0"/>
+      <Button Name="ProgressClose" Content="ปิด" Width="120" Height="34" IsEnabled="False" Visibility="Collapsed"
+              HorizontalAlignment="Center" Margin="0,17,0,0" Background="#F2C94C" Foreground="#111114" FontWeight="Bold" BorderThickness="0"/>
+    </StackPanel>
+  </Border>
+</Window>
+"@
+    $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $progressXaml))
+    $stageText = $window.FindName('ProgressStage')
+    $bar = $window.FindName('ProgressBar')
+    $percentText = $window.FindName('ProgressPercent')
+    $hintText = $window.FindName('ProgressHint')
+    $close = $window.FindName('ProgressClose')
     $done = $false
-    $ticksNoEvent = 0
-    $timer = New-Object System.Windows.Forms.Timer
-    $timer.Interval = 350
+    $lastSoundBucket = 0
+
+    $timer = New-Object Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(350)
     $timer.Add_Tick({
         try {
             $latest = @(Get-Content -Path $logPath -Encoding UTF8 -ErrorAction SilentlyContinue |
                 Where-Object { $_ -like '__NONGPLAI_EVENT__*' } | Select-Object -Last 1)
-            if ($latest.Count -eq 0) {
-                $ticksNoEvent++
-                if ($ticksNoEvent -eq 60) { $hintText.Text = 'ใช้เวลานานกว่าปกติ แต่ยังทำงานอยู่ โปรดรออีกสักครู่...' }
-            } else { $ticksNoEvent = 0 }
             if ($latest.Count -gt 0) {
                 $evt = ($latest[0] -replace '^__NONGPLAI_EVENT__', '') | ConvertFrom-Json
                 $current = [int]$evt.current
@@ -3177,70 +2682,45 @@ function Show-WorkerProgressWpf {
                 $percentText.Text = "$pct%"
                 if ($evt.label) { $stageText.Text = [string]$evt.label }
                 if ($evt.message) { $hintText.Text = [string]$evt.message }
+                $bucket = [int]([math]::Floor($pct / 10) * 10)
+                if ($bucket -gt $lastSoundBucket -and $pct -lt 100) {
+                    Play-GuiSound -Kind Progress
+                    $lastSoundBucket = $bucket
+                }
                 if ([string]$evt.type -eq 'done') {
-                    $done = $true; $bar.Value = 100; $percentText.Text = '100%'
+                    $done = $true
+                    $bar.Value = 100
+                    $percentText.Text = '100%'
                     $stageText.Text = 'เสร็จสมบูรณ์'
-                    $summaryTxt = if ($total -gt 0) { "ปรับไปแล้ว $current จาก $total รายการ" } else { 'ทำงานเสร็จสมบูรณ์' }
-                    $hintText.Text = "$summaryTxt - กำลังปิดหน้าต่าง..."
-                    try {
-                        $bk = Find-LatestBackup
-                        if ($bk) { $openBackupBtn.Tag = $bk; $openBackupBtn.Visible = $true }
-                    } catch {}
-                    # Play the completion sound, then give the user a moment to read the
-                    # summary / click "Open Backup Folder" before auto-closing.
+                    $hintText.Text = 'ทำงานเสร็จแล้ว กดปิดเพื่อกลับไปหน้าหลัก'
+                    $close.Visibility = 'Visible'
+                    $close.IsEnabled = $true
                     Play-GuiSound -Kind Done
-                    $timer.Stop()
-                    $closeTimer = New-Object System.Windows.Forms.Timer
-                    $closeTimer.Interval = 1600
-                    $closeTimer.Add_Tick({
-                        param($sender, $eventArgs)
-                        try { $sender.Stop() } catch {}
-                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
-                    }.GetNewClosure())
-                    $closeTimer.Start()
-                } elseif ([string]$evt.type -eq 'error') {
-                    $done = $true; $stageText.Text = 'เกิดข้อผิดพลาด'; $hintText.Text = [string]$evt.message
-                    Play-GuiSound -Kind Error; $timer.Stop()
-                    $closeTimer = New-Object System.Windows.Forms.Timer
-                    $closeTimer.Interval = 2500
-                    $closeTimer.Add_Tick({
-                        param($sender, $eventArgs)
-                        try { $sender.Stop() } catch {}
-                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
-                    }.GetNewClosure())
-                    $closeTimer.Start()
+                }
+                elseif ([string]$evt.type -eq 'error') {
+                    $done = $true
+                    $stageText.Text = 'เกิดข้อผิดพลาด'
+                    $hintText.Text = [string]$evt.message
+                    $close.Visibility = 'Visible'
+                    $close.IsEnabled = $true
+                    Play-GuiSound -Kind Error
                 }
             }
-            if ($null -eq $worker) {
-                throw 'ไม่สามารถเริ่ม worker process ได้ (worker เป็นค่า null)'
-            }
             if ($worker.HasExited -and -not $done) {
-                $done = $true; $stageText.Text = 'งานหยุดก่อนเสร็จสมบูรณ์'
+                $done = $true
+                $stageText.Text = 'งานหยุดก่อนเสร็จสมบูรณ์'
                 $hintText.Text = "โปรเซสจบการทำงาน (รหัส $($worker.ExitCode))"
-                Play-GuiSound -Kind Error; $timer.Stop()
-                $closeTimer = New-Object System.Windows.Forms.Timer
-                $closeTimer.Interval = 2500
-                $closeTimer.Add_Tick({
-                        param($sender, $eventArgs)
-                        try { $sender.Stop() } catch {}
-                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
-                    }.GetNewClosure())
-                $closeTimer.Start()
+                $close.Visibility = 'Visible'
+                $close.IsEnabled = $true
+                Play-GuiSound -Kind Error
             }
-        } catch {
-            try {
-                $hintText.Text = 'เกิดข้อผิดพลาดระหว่างอัปเดตสถานะ กรุณาตรวจสอบ NongPlaiGui_write_errors.log'
-                Write-CrashLog -ErrorRecord $_ -Context 'Show-WorkerProgressWpf Timer' | Out-Null
-            } catch {}
-        }
+        } catch {}
     }.GetNewClosure())
-    $form.Add_FormClosed({ try { $timer.Stop() } catch {}; Remove-Item $logPath -Force -ErrorAction SilentlyContinue }.GetNewClosure())
+    $close.Add_Click({ $window.Close() })
+    $window.Add_Closed({ $timer.Stop() })
     $timer.Start()
-    try { [void]$form.ShowDialog() }
-    catch {
-        $detail = Write-CrashLog -ErrorRecord $_ -Context 'Show-WorkerProgressWpf ShowDialog'
-        try { [System.Windows.Forms.MessageBox]::Show($detail, 'NongPlaiShop - Error (detail)', 'OK', 'Error') | Out-Null } catch {}
-    }
+    $window.ShowDialog() | Out-Null
+    Remove-Item $logPath -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------
@@ -3248,32 +2728,6 @@ function Show-WorkerProgressWpf {
 # ---------------------------------------------------------------------------
 if ($Worker) {
     Invoke-GuiWorkerAction
-    exit 0
-}
-
-if ($WorkerUi) {
-    # Runs in its own freshly-spawned process/window/dispatcher - never shares a
-    # process with a previously-closed window, so there is no WPF dispatcher
-    # teardown race here no matter what happened in the process that launched us.
-    try {
-        Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
-        Show-WorkerProgressWpf -Action $WorkerAction
-        # Return to the original main menu after the progress window closes.
-        # The worker intentionally keeps the temp script alive until this launch.
-        if ($script:ScriptPath -and (Test-Path $script:ScriptPath)) {
-            Confirm-ScriptPersisted | Out-Null
-            $menuArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $($script:ScriptPath))
-            if ($script:DryRun) { $menuArgs += '-DryRun' }
-            Start-Process -FilePath 'powershell.exe' -ArgumentList $menuArgs -WindowStyle Hidden | Out-Null
-        }
-    } catch {
-        try {
-            $dbgPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
-            $dbgLine = "[{0}] WorkerUi crashed: {1}`r`n{2}" -f (Get-Date -Format 'o'), $_.Exception.Message, $_.InvocationInfo.PositionMessage
-            [System.IO.File]::AppendAllText($dbgPath, $dbgLine + [Environment]::NewLine)
-        } catch {}
-        try { [System.Windows.MessageBox]::Show($_.Exception.Message, 'NongPlaiShop - Error', 'OK', 'Error') | Out-Null } catch {}
-    }
     exit 0
 }
 
@@ -3289,14 +2743,14 @@ if ($HpetToggle) {
 }
 
 try {
-    $sel = Show-MainMenuWpf
-    $uiAction = switch ($sel) { '1' { 'Apply' }; '2' { 'Reset' }; default { $null } }
-    if ($uiAction) {
-        $selfPathForUi = Confirm-ScriptPersisted
-        $uiArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-                    '-File', $selfPathForUi, '-WorkerUi', '-WorkerAction', $uiAction)
-        if ($script:DryRun) { $uiArgs += '-DryRun' }
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $uiArgs -WindowStyle Hidden | Out-Null
+    :menu while ($true) {
+        $sel = Show-MainMenuWpf
+        switch ($sel) {
+            '1' { Show-WorkerProgressWpf -Action 'Apply' }
+            '2' { Show-WorkerProgressWpf -Action 'Reset' }
+            '3' { break menu }
+            default { break menu }
+        }
     }
 } catch {
     # Keep failures inside the GUI flow. No console is shown here.
@@ -3307,14 +2761,10 @@ try {
 }
 
 
-# Clean up the temp copy only when no child GUI/worker process needs it.
-# In irm|iex mode, the elevated parent launches WorkerUi with -File $selfPath;
-# deleting that file immediately can race with WorkerUi/Worker startup.
-try {
-    $selfPath = $script:ScriptPath
-    if (-not $uiAction -and $selfPath -and ($selfPath -eq (Join-Path $env:TEMP 'NongPlaiShop_v2_session.ps1'))) {
+# Clean up the temp copy of this script if it was created for the irm|iex one-liner flow.
+    try {
+        $selfPath = $script:ScriptPath
+        if ($selfPath -and ($selfPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
         Remove-Item -Path $selfPath -Force -ErrorAction SilentlyContinue
     }
 } catch {}
-
-try { if ($script:WpfApp) { $script:WpfApp.Shutdown() } } catch {}
