@@ -51,9 +51,12 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     $runPath = $MyInvocation.MyCommand.Path
     if ([string]::IsNullOrWhiteSpace($runPath)) {
         # Running via irm | iex (or similar) - persist the script text so the elevated
-        # child process has an actual file to run.
-        $runPath = Join-Path $env:TEMP "nongplai_v2_$([guid]::NewGuid().ToString('N')).ps1"
-        Set-Content -Path $runPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8
+        # child process has an actual file to run. Use a FIXED filename (not a random GUID)
+        # so every subsequent generation of this script (elevated copy, WorkerUi, Worker)
+        # can always find/re-create the exact same known path, even if a security tool or
+        # temp-cleanup sweep removes it between process spawns.
+        $runPath = Join-Path $env:TEMP "NongPlaiShop_v2_session.ps1"
+        Set-Content -Path $runPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8 -Force
     }
     # Thread the resolved path forward explicitly so the elevated child process (and any
     # worker processes it later spawns for GUI Apply/Reset/Scan actions) always has a real,
@@ -83,23 +86,67 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 # "opened an admin PowerShell window and ran irm|iex directly" - no elevation relaunch happens
 # in that case, so the temp-file persist logic above never ran. Do it here instead so GUI
 # worker spawning (Start-GuiWorkerProcess) always has a real path to use.
+#
+# IMPORTANT: $MyInvocation.MyCommand.Definition only contains the full script TEXT when this
+# process was started directly from piped `iex` text (gen0). Every subsequent generation
+# (elevated relaunch, WorkerUi, Worker) is started with `-File somepath.ps1`, and for a
+# file-backed command Definition just returns the file PATH again - useless once that file is
+# actually missing. The one thing that's always reliable, regardless of how THIS process was
+# launched, is the parsed AST of the script currently executing in memory - so that's the real
+# fallback source of truth used here and in Confirm-ScriptPersisted below.
+function Get-CurrentScriptSourceText {
+    try {
+        $ast = $MyInvocation.MyCommand.ScriptBlock.Ast
+        if ($ast -and $ast.Extent -and $ast.Extent.Text) { return $ast.Extent.Text }
+    } catch {}
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Definition)) { return $MyInvocation.MyCommand.Definition }
+    } catch {}
+    return $null
+}
+
 if ([string]::IsNullOrWhiteSpace($script:ScriptPath) -or -not (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
     $fallbackPath = $MyInvocation.MyCommand.Path
     if (-not [string]::IsNullOrWhiteSpace($fallbackPath) -and (Test-Path $fallbackPath -ErrorAction SilentlyContinue)) {
         $script:ScriptPath = $fallbackPath
     } else {
-        $persistPath = Join-Path $env:TEMP "nongplai_v2_$([guid]::NewGuid().ToString('N')).ps1"
+        $persistPath = Join-Path $env:TEMP "NongPlaiShop_v2_session.ps1"
         try {
-            Set-Content -Path $persistPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8
-            $script:ScriptPath = $persistPath
+            $srcText = Get-CurrentScriptSourceText
+            if ($srcText) {
+                Set-Content -Path $persistPath -Value $srcText -Encoding UTF8 -Force
+                $script:ScriptPath = $persistPath
+            }
         } catch {}
     }
 }
+
+# Re-verify (and self-heal if needed) that $script:ScriptPath still points to a real file on
+# disk, right before spawning any child process that needs it. Call this immediately before
+# every Start-Process that uses $script:ScriptPath / $selfPath / $selfPathForUi, so a file
+# that got removed between process generations (temp-cleanup sweep, AV, etc.) is transparently
+# rewritten instead of the child process failing to find its own script.
+function Confirm-ScriptPersisted {
+    if (-not [string]::IsNullOrWhiteSpace($script:ScriptPath) -and (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
+        return $script:ScriptPath
+    }
+    $persistPath = Join-Path $env:TEMP "NongPlaiShop_v2_session.ps1"
+    try {
+        $srcText = Get-CurrentScriptSourceText
+        if ($srcText) {
+            Set-Content -Path $persistPath -Value $srcText -Encoding UTF8 -Force
+            $script:ScriptPath = $persistPath
+        }
+    } catch {}
+    return $script:ScriptPath
+}
+
 
 # When an already-elevated PowerShell console runs irm|iex, there is no UAC
 # relaunch to hide the original console. Relaunch the persisted copy hidden so
 # the user sees only the GUI. Worker and WorkerUi processes are excluded.
 if ($script:InvokedFromPipe -and -not $Worker -and -not $WorkerUi -and -not $HpetToggle) {
+    Confirm-ScriptPersisted | Out-Null
     $pipeArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
     if ($DryRun) { $pipeArgs += '-DryRun' }
     Start-Process -FilePath 'powershell.exe' -ArgumentList $pipeArgs -WindowStyle Hidden | Out-Null
@@ -2945,7 +2992,7 @@ function Invoke-GuiWorkerAction {
 
 function Start-GuiWorkerProcess {
     param([Parameter(Mandatory)][string]$Action, [Parameter(Mandatory)][string]$LogPath)
-    $selfPath = $script:ScriptPath
+    $selfPath = Confirm-ScriptPersisted
     if ([string]::IsNullOrWhiteSpace($selfPath) -or -not (Test-Path $selfPath)) {
         throw 'ไม่พบไฟล์ .ps1 สำหรับเริ่มงานเบื้องหลัง กรุณาเปิดจากไฟล์สคริปต์ที่บันทึกไว้ในเครื่อง'
     }
@@ -3214,6 +3261,7 @@ if ($WorkerUi) {
         # Return to the original main menu after the progress window closes.
         # The worker intentionally keeps the temp script alive until this launch.
         if ($script:ScriptPath -and (Test-Path $script:ScriptPath)) {
+            Confirm-ScriptPersisted | Out-Null
             $menuArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
             if ($script:DryRun) { $menuArgs += '-DryRun' }
             Start-Process -FilePath 'powershell.exe' -ArgumentList $menuArgs -WindowStyle Hidden | Out-Null
@@ -3244,7 +3292,7 @@ try {
     $sel = Show-MainMenuWpf
     $uiAction = switch ($sel) { '1' { 'Apply' }; '2' { 'Reset' }; default { $null } }
     if ($uiAction) {
-        $selfPathForUi = $script:ScriptPath
+        $selfPathForUi = Confirm-ScriptPersisted
         $uiArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
                     '-File', "`"$selfPathForUi`"", '-WorkerUi', '-WorkerAction', $uiAction)
         if ($script:DryRun) { $uiArgs += '-DryRun' }
@@ -3264,7 +3312,7 @@ try {
 # deleting that file immediately can race with WorkerUi/Worker startup.
 try {
     $selfPath = $script:ScriptPath
-    if (-not $uiAction -and $selfPath -and ($selfPath -like (Join-Path $env:TEMP 'nongplai_v2_*.ps1'))) {
+    if (-not $uiAction -and $selfPath -and ($selfPath -eq (Join-Path $env:TEMP 'NongPlaiShop_v2_session.ps1'))) {
         Remove-Item -Path $selfPath -Force -ErrorAction SilentlyContinue
     }
 } catch {}
