@@ -635,7 +635,7 @@ function Invoke-ApplyUltra {
 
     Write-Host "Testing network baseline..."
     Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย...'
-    try { Test-Connection -ComputerName 1.1.1.1 -Count 4 | Format-Table -AutoSize | Out-Host } catch {}
+    try { Test-Connection -ComputerName 8.8.8.8 -Count 4 | Format-Table -AutoSize | Out-Host } catch {}
 
     $script:Total = 42  # v2.1: 39 legacy + 3 new (MMCSS, ProcessPriority, TrimVerify)
     $n = 0
@@ -836,7 +836,7 @@ function Invoke-ApplyUltra {
             try {
                 $old = (Get-DnsClientServerAddress -InterfaceIndex $a.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
                 $script:Changes.Add([PSCustomObject]@{ Kind='Dns'; IfIndex=$a.IfIndex; OldServers=$old })
-                Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ServerAddresses ('1.1.1.1','1.0.0.1') -ErrorAction Stop
+                Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ServerAddresses ('8.8.8.8','8.8.4.4') -ErrorAction Stop
             } catch { Write-Log "  ! DNS set failed: $($_.Exception.Message)" }
         }
     }
