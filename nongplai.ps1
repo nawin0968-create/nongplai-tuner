@@ -1,4 +1,4 @@
-<#
+﻿<#
     NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
     Rewritten from the original .cmd to fix reliability issues caused by
     batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -63,7 +63,7 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     # known-good .ps1 path to relaunch itself with - this must not depend on the child
     # re-detecting $MyInvocation.MyCommand.Path on its own.
     $script:ScriptPath = $runPath
-    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $runPath)
+    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$runPath`"")
     if ($HpetToggle) { $argList += '-HpetToggle' }
     if ($DryRun) { $argList += '-DryRun' }
     if ($Worker) { $argList += '-Worker' }
@@ -147,7 +147,7 @@ function Confirm-ScriptPersisted {
 # the user sees only the GUI. Worker and WorkerUi processes are excluded.
 if ($script:InvokedFromPipe -and -not $Worker -and -not $WorkerUi -and -not $HpetToggle) {
     Confirm-ScriptPersisted | Out-Null
-    $pipeArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $($script:ScriptPath))
+    $pipeArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
     if ($DryRun) { $pipeArgs += '-DryRun' }
     Start-Process -FilePath 'powershell.exe' -ArgumentList $pipeArgs -WindowStyle Hidden | Out-Null
     exit 0
@@ -2998,8 +2998,8 @@ function Start-GuiWorkerProcess {
     }
     $workerArgs = @(
         '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-        '-File', $selfPath, '-Worker', '-WorkerAction', $Action,
-        '-GuiLogPath', $LogPath
+        '-File', "`"$selfPath`"", '-Worker', '-WorkerAction', $Action,
+        '-GuiLogPath', "`"$LogPath`""
     )
     if ($script:DryRun) { $workerArgs += '-DryRun' }
     return Start-Process -FilePath 'powershell.exe' -ArgumentList $workerArgs -WindowStyle Hidden -PassThru
@@ -3262,7 +3262,7 @@ if ($WorkerUi) {
         # The worker intentionally keeps the temp script alive until this launch.
         if ($script:ScriptPath -and (Test-Path $script:ScriptPath)) {
             Confirm-ScriptPersisted | Out-Null
-            $menuArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $($script:ScriptPath))
+            $menuArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
             if ($script:DryRun) { $menuArgs += '-DryRun' }
             Start-Process -FilePath 'powershell.exe' -ArgumentList $menuArgs -WindowStyle Hidden | Out-Null
         }
@@ -3294,7 +3294,7 @@ try {
     if ($uiAction) {
         $selfPathForUi = Confirm-ScriptPersisted
         $uiArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-                    '-File', $selfPathForUi, '-WorkerUi', '-WorkerAction', $uiAction)
+                    '-File', "`"$selfPathForUi`"", '-WorkerUi', '-WorkerAction', $uiAction)
         if ($script:DryRun) { $uiArgs += '-DryRun' }
         Start-Process -FilePath 'powershell.exe' -ArgumentList $uiArgs -WindowStyle Hidden | Out-Null
     }
