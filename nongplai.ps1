@@ -3716,6 +3716,9 @@ try {
     $sel = Show-MainMenuWpf
     $uiAction = switch ($sel) { '1' { 'Apply' }; '2' { 'Reset' }; default { $null } }
     if ($uiAction) {
+        foreach ($openWindow in @([System.Windows.Application]::Current.Windows)) {
+            try { $openWindow.Hide() } catch {}
+        }
         Show-WorkerProgressWpf -Action $uiAction
     }
 } catch {
