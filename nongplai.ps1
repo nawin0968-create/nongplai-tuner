@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
 # Rewritten from the original .cmd to fix reliability issues caused by
 # batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -37,7 +37,7 @@ param(
     [switch]$DryRun,
     [switch]$Worker,
     [switch]$WorkerUi,
-    [ValidateSet('Apply','Reset','Scan','Hpet')][string]$WorkerAction,
+    [string]$WorkerAction,
     [string]$GuiLogPath
 )
 
