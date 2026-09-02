@@ -3517,7 +3517,7 @@ function Show-WorkerProgressWpf {
     $panel.Controls.Add($title)
 
     $stageText = New-Object System.Windows.Forms.Label
-    $stageText.Text = 'กำลังเตรียมการ...'
+    $stageText.Text = 'กำลังเริ่ม worker...'
     $stageText.ForeColor = [System.Drawing.Color]::White
     $stageText.Font = New-Object System.Drawing.Font('Segoe UI', 10)
     $stageText.AutoSize = $false
@@ -3538,7 +3538,7 @@ function Show-WorkerProgressWpf {
     $panel.Controls.Add($bar)
 
     $percentText = New-Object System.Windows.Forms.Label
-    $percentText.Text = '0%'
+    $percentText.Text = '1%'
     $percentText.ForeColor = [System.Drawing.Color]::FromArgb(201,201,204)
     $percentText.Font = New-Object System.Drawing.Font('Segoe UI', 10)
     $percentText.AutoSize = $false
