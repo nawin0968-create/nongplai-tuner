@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
 # Rewritten from the original .cmd to fix reliability issues caused by
 # batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -3389,7 +3389,7 @@ function Start-GuiWorkerProcess {
     $workerArgs = @(
         '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
         '-File', "`"$selfPath`"", '-Worker', '-WorkerAction', $Action,
-        '-GuiLogPath', "`"$LogPath`""
+        '-GuiLogPath', $LogPath
     )
     if ($script:DryRun) { $workerArgs += '-DryRun' }
     return Start-Process -FilePath 'powershell.exe' -ArgumentList $workerArgs -WindowStyle Hidden -PassThru
