@@ -3319,9 +3319,10 @@ function Show-MainMenuWpf {
     $rightBtn.Add_Click({ $script:GuiSelectedIndex = ($script:GuiSelectedIndex + 1) % $cards.Count; Update-CardSelection })
     $runBtn.Add_Click({
         $script:GuiResult = $script:MenuCards[$script:GuiSelectedIndex].Key
+        $window.Hide()
         $window.Close()
     })
-    $closeBtn.Add_Click({ $script:GuiResult = '3'; $window.Close() })
+    $closeBtn.Add_Click({ $script:GuiResult = '3'; $window.Hide(); $window.Close() })
     $topBar.Add_MouseLeftButtonDown({ try { $window.DragMove() } catch {} })
 
     # Mouse drag (click-and-drag left/right) to swipe between cards, like a carousel
@@ -3689,13 +3690,6 @@ if ($WorkerUi) {
     try {
         Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
         Show-WorkerProgressWpf -Action $WorkerAction
-        # Return to the original main menu after the progress window closes.
-        if ($script:ScriptPath -and (Test-Path $script:ScriptPath)) {
-            Confirm-ScriptPersisted | Out-Null
-            $menuArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
-            if ($script:DryRun) { $menuArgs += '-DryRun' }
-            Start-Process -FilePath 'powershell.exe' -ArgumentList $menuArgs -WindowStyle Hidden | Out-Null
-        }
     } catch {
         try {
             $dbgPath = Join-Path $env:TEMP 'NongPlaiGui_write_errors.log'
