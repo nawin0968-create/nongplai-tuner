@@ -14,27 +14,25 @@
 # so it is fully undoable.
 #
 # Usage:
-#     Right-click > Run with PowerShell   (it will self-elevate and show a UAC prompt)
-#     .\nongplai_v2.ps1                 -> shows the menu
-#     .\nongplai_v2.ps1 -HpetToggle      -> opens the separate HPET on/off tool
-#     .\nongplai_v2.ps1 -DryRun          -> menu runs in preview mode: shows exactly what
-#                                           Smart Apply would change without changing anything
-#     One-liner (no download needed):
-#         irm https://<your-host>/nongplai_v2.ps1 | iex
-#     Works the same as running the .ps1 file directly - it still self-elevates
-#     (UAC prompt) and still shows the interactive [1]/[2]/[3] menu.
+#     Right-click > Run with PowerShell
+#     .\nongplai.ps1                 -> เปิดเมนูหลัก (GUI ถ้ามี / console fallback ถ้าไม่มี GUI)
+#     .\nongplai.ps1 -Apply          -> Apply Everything ผ่าน command line
+#     .\nongplai.ps1 -Reset          -> Reset คืนค่าล่าสุดผ่าน command line
+#     .\nongplai.ps1 -Scan           -> สแกนฮาร์ดแวร์อย่างเดียว
+#     .\nongplai.ps1 -Report         -> สร้างรายงาน HTML บน Desktop
+#     .\nongplai.ps1 -HpetToggle     -> เปิดเครื่องมือ HPET
+#     .\nongplai.ps1 -NoGui          -> บังคับใช้เมนูแบบ console
+#     .\nongplai.ps1 -DryRun         -> แสดงรายการที่จะเปลี่ยนโดยไม่แก้ไขระบบ
 #
-# NOTE ON THIS FILE'S HEADER: this uses single-line "#" comments instead of a "<# ... #>"
-# block comment on purpose. Windows PowerShell 5.1's `irm <url> | iex` pipeline can leave a
-# stray UTF-8 BOM character as the literal first character of the fetched string. When that
-# happens, a "<#" block-comment opener at the very start of the file is no longer recognized
-# as position 0 of the token stream, so the parser fails to treat the header as a comment at
-# all and instead tries to execute every line of the help text as a command - producing a
-# cascade of "term is not recognized" errors. Single "#" line comments do not have this
-# start-of-file matching problem, so this header is immune to that failure mode even if a BOM
-# slips through GitHub raw / Invoke-RestMethod.
+# หมายเหตุ: สคริปต์นี้ออกแบบให้เปิดจากไฟล์ nongplai.ps1 ที่บันทึกอยู่ในเครื่องเท่านั้น
 
 param(
+    [switch]$Apply,
+    [switch]$Reset,
+    [switch]$Scan,
+    [switch]$Report,
+    [switch]$NoGui,
+    [switch]$Help,
     [switch]$HpetToggle,
     [switch]$DryRun,
     [switch]$Worker,
@@ -43,36 +41,42 @@ param(
     [string]$GuiLogPath = ''
 )
 
-$script:InvokedFromPipe = [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path)
 $script:ScriptPath = $MyInvocation.MyCommand.Path
 
-# The companion launcher can start this script with a hidden PowerShell window.
+# When loaded with irm | iex, persist the in-memory script so elevated and GUI
+# worker processes can relaunch the same code.
+if ([string]::IsNullOrWhiteSpace($script:ScriptPath)) {
+    $inlineScript = $MyInvocation.MyCommand.Definition
+    if ([string]::IsNullOrWhiteSpace($inlineScript)) {
+        throw 'ไม่พบเนื้อหาสคริปต์สำหรับเริ่มการทำงาน'
+    }
+    $script:ScriptPath = Join-Path $env:TEMP ('NongPlai_{0}.ps1' -f ([guid]::NewGuid().ToString('N')))
+    try {
+        Set-Content -Path $script:ScriptPath -Value $inlineScript -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        throw "ไม่สามารถเตรียมไฟล์ชั่วคราวสำหรับการทำงานแบบ irm | iex: $($_.Exception.Message)"
+    }
+}
 
-# Self-elevate: relaunch as Administrator if not already, then stop this non-elevated instance.
-# NOTE: when run via `irm <url> | iex`, there is no on-disk script file, so
-# $MyInvocation.MyCommand.Path is empty. $MyInvocation.MyCommand.Definition still holds the
-# full script text in both cases (local file OR piped from iex), so we always write that text
-# out to a temp .ps1 and elevate against the temp file. This makes the one-liner work exactly
-# like running the .ps1 directly, including self-elevation and the interactive menu.
+if (-not (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
+    throw 'ไม่พบไฟล์ nongplai.ps1 สำหรับเริ่มการทำงาน'
+}
+
+# ยกระดับสิทธิ์เป็น Administrator เมื่อจำเป็น
 $currentId = [Security.Principal.WindowsIdentity]::GetCurrent()
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal($currentId)
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $runPath = $MyInvocation.MyCommand.Path
-    if ([string]::IsNullOrWhiteSpace($runPath)) {
-        # Running via irm | iex (or similar) - persist the script text so the elevated
-        # child process has an actual file to run. Use a FIXED filename (not a random GUID)
-        # so every subsequent generation of this script (elevated copy, WorkerUi, Worker)
-        # can always find/re-create the exact same known path, even if a security tool or
-        # temp-cleanup sweep removes it between process spawns.
-        $runPath = Join-Path $env:TEMP "NongPlaiShop_v2_session.ps1"
-        Set-Content -Path $runPath -Value $MyInvocation.MyCommand.Definition -Encoding UTF8 -Force
-    }
-    # Thread the resolved path forward explicitly so the elevated child process (and any
-    # worker processes it later spawns for GUI Apply/Reset/Scan actions) always has a real,
-    # known-good .ps1 path to relaunch itself with - this must not depend on the child
-    # re-detecting $MyInvocation.MyCommand.Path on its own.
-    $script:ScriptPath = $runPath
-    $argList = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$runPath`"")
+    $launchConsole = [bool]($Apply -or $Reset -or $Scan -or $Report -or $HpetToggle -or $Help -or $NoGui)
+    $launcherPowerShell = Join-Path $PSHOME 'powershell.exe'
+    if (-not (Test-Path $launcherPowerShell)) { $launcherPowerShell = 'powershell.exe' }
+    $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
+    if (-not $launchConsole -or $Worker -or $WorkerUi) { $argList += @('-WindowStyle', 'Hidden') }
+    if ($Apply) { $argList += '-Apply' }
+    if ($Reset) { $argList += '-Reset' }
+    if ($Scan) { $argList += '-Scan' }
+    if ($Report) { $argList += '-Report' }
+    if ($NoGui) { $argList += '-NoGui' }
+    if ($Help) { $argList += '-Help' }
     if ($HpetToggle) { $argList += '-HpetToggle' }
     if ($DryRun) { $argList += '-DryRun' }
     if ($Worker) { $argList += '-Worker' }
@@ -80,7 +84,11 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     if ($WorkerAction) { $argList += @('-WorkerAction', $WorkerAction) }
     if ($GuiLogPath) { $argList += @('-GuiLogPath', $GuiLogPath) }
     try {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -WindowStyle Hidden | Out-Null
+        if (-not $launchConsole -or $Worker -or $WorkerUi) {
+            Start-Process -FilePath $launcherPowerShell -ArgumentList $argList -Verb RunAs -WindowStyle Hidden | Out-Null
+        } else {
+            Start-Process -FilePath $launcherPowerShell -ArgumentList $argList -Verb RunAs | Out-Null
+        }
     } catch {
         try {
             Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
@@ -90,76 +98,20 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     exit 0
 }
 
-# Safety net for every remaining case: already elevated (started as admin, or just relaunched
-# by the block above), but $script:ScriptPath still isn't a real file on disk. This covers
-# "opened an admin PowerShell window and ran irm|iex directly" - no elevation relaunch happens
-# in that case, so the temp-file persist logic above never ran. Do it here instead so GUI
-# worker spawning (Start-GuiWorkerProcess) always has a real path to use.
-#
-# IMPORTANT: $MyInvocation.MyCommand.Definition only contains the full script TEXT when this
-# process was started directly from piped `iex` text (gen0). Every subsequent generation
-# (elevated relaunch, WorkerUi, Worker) is started with `-File somepath.ps1`, and for a
-# file-backed command Definition just returns the file PATH again - useless once that file is
-# actually missing. The one thing that's always reliable, regardless of how THIS process was
-# launched, is the parsed AST of the script currently executing in memory - so that's the real
-# fallback source of truth used here and in Confirm-ScriptPersisted below.
-function Get-CurrentScriptSourceText {
-    try {
-        $ast = $MyInvocation.MyCommand.ScriptBlock.Ast
-        if ($ast -and $ast.Extent -and $ast.Extent.Text) { return $ast.Extent.Text }
-    } catch {}
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Definition)) { return $MyInvocation.MyCommand.Definition }
-    } catch {}
-    return $null
-}
-
-if ([string]::IsNullOrWhiteSpace($script:ScriptPath) -or -not (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
-    $fallbackPath = $MyInvocation.MyCommand.Path
-    if (-not [string]::IsNullOrWhiteSpace($fallbackPath) -and (Test-Path $fallbackPath -ErrorAction SilentlyContinue)) {
-        $script:ScriptPath = $fallbackPath
-    } else {
-        $persistPath = Join-Path $env:TEMP "NongPlaiShop_v2_session.ps1"
-        try {
-            $srcText = Get-CurrentScriptSourceText
-            if ($srcText) {
-                Set-Content -Path $persistPath -Value $srcText -Encoding UTF8 -Force
-                $script:ScriptPath = $persistPath
-            }
-        } catch {}
-    }
-}
-
-# Re-verify (and self-heal if needed) that $script:ScriptPath still points to a real file on
-# disk, right before spawning any child process that needs it. Call this immediately before
-# every Start-Process that uses $script:ScriptPath / $selfPath / $selfPathForUi, so a file
-# that got removed between process generations (temp-cleanup sweep, AV, etc.) is transparently
-# rewritten instead of the child process failing to find its own script.
+# คืนค่าพาธของไฟล์สคริปต์จริงสำหรับโปรเซสลูกของ GUI
 function Confirm-ScriptPersisted {
-    if (-not [string]::IsNullOrWhiteSpace($script:ScriptPath) -and (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
-        return $script:ScriptPath
+    if (-not (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
+        throw 'ไม่พบไฟล์ nongplai.ps1 สำหรับเริ่มงานเบื้องหลัง'
     }
-    $persistPath = Join-Path $env:TEMP "NongPlaiShop_v2_session.ps1"
-    try {
-        $srcText = Get-CurrentScriptSourceText
-        if ($srcText) {
-            Set-Content -Path $persistPath -Value $srcText -Encoding UTF8 -Force
-            $script:ScriptPath = $persistPath
-        }
-    } catch {}
     return $script:ScriptPath
 }
 
-
-# When an already-elevated PowerShell console runs irm|iex, there is no UAC
-# relaunch to hide the original console. Relaunch the persisted copy hidden so
-# the user sees only the GUI. Worker and WorkerUi processes are excluded.
-if ($script:InvokedFromPipe -and -not $Worker -and -not $WorkerUi -and -not $HpetToggle) {
-    Confirm-ScriptPersisted | Out-Null
-    $pipeArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
-    if ($DryRun) { $pipeArgs += '-DryRun' }
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $pipeArgs -WindowStyle Hidden | Out-Null
-    exit 0
+function Get-PowerShellExePath {
+    $preferred = Join-Path $PSHOME 'powershell.exe'
+    if (Test-Path $preferred) { return $preferred }
+    $cmd = Get-Command 'powershell.exe' -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    throw 'ไม่พบ powershell.exe บนเครื่องนี้'
 }
 
 $ErrorActionPreference = 'Stop'
@@ -185,6 +137,119 @@ $script:GuiStage = 'startup'
 $script:LegacyStepCount = 0
 $script:LegacyStepTotal = 43  # +3 from v2.1: MMCSS, ProcessPriority, TrimVerify
 $script:HwInfo = $null
+$script:GuiReady = $false
+$script:PowerShellExe = Get-PowerShellExePath
+
+function Get-RequestedAction {
+    $selected = New-Object System.Collections.Generic.List[string]
+    if ($Apply)      { $selected.Add('Apply') }
+    if ($Reset)      { $selected.Add('Reset') }
+    if ($Scan)       { $selected.Add('Scan') }
+    if ($Report)     { $selected.Add('Report') }
+    if ($HpetToggle) { $selected.Add('Hpet') }
+    if ($Help)       { $selected.Add('Help') }
+    if ($selected.Count -gt 1) {
+        throw ('ระบุคำสั่งมากกว่าหนึ่งแบบพร้อมกันไม่ได้: ' + ($selected -join ', '))
+    }
+    if ($selected.Count -eq 1) { return $selected[0] }
+    return $null
+}
+
+function Show-Usage {
+    Write-Host ""
+    Write-Host "  NONGPLAISHOP - COMMAND USAGE" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\nongplai.ps1"
+    Write-Host "      เปิดเมนูหลัก (GUI ถ้ามี / console fallback ถ้าไม่มี GUI)"
+    Write-Host ""
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\nongplai.ps1 -Apply"
+    Write-Host "      Apply Everything ทันที"
+    Write-Host ""
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\nongplai.ps1 -Reset"
+    Write-Host "      Reset คืนค่าจาก backup ล่าสุด"
+    Write-Host ""
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\nongplai.ps1 -Scan"
+    Write-Host "      สแกนฮาร์ดแวร์อย่างเดียว"
+    Write-Host ""
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\nongplai.ps1 -Report"
+    Write-Host "      สร้างรายงาน HTML บน Desktop"
+    Write-Host ""
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\nongplai.ps1 -HpetToggle"
+    Write-Host "      เปิดเมนู HPET"
+    Write-Host ""
+    Write-Host "  ตัวเลือกเสริม: -DryRun, -NoGui, -Help" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+function Initialize-GuiRuntime {
+    param([switch]$Silent)
+    if ($script:GuiReady) { return $true }
+    try {
+        Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
+    } catch {
+        if (-not $Silent) {
+            try {
+                $popup = New-Object -ComObject WScript.Shell
+                $popup.Popup('ไม่สามารถโหลดส่วน GUI ได้ จะสลับไปใช้ console mode แทน', 0, 'NongPlaiShop', 48) | Out-Null
+            } catch {}
+        }
+        return $false
+    }
+    if (-not [System.Windows.Application]::Current) {
+        try {
+            $script:WpfApp = New-Object System.Windows.Application
+            $script:WpfApp.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+        } catch { $script:WpfApp = $null }
+    }
+    $script:GuiReady = $true
+    return $true
+}
+
+$script:RequestedAction = Get-RequestedAction
+$script:ExplicitConsoleMode = [bool]($Apply -or $Reset -or $Scan -or $Report -or $HpetToggle -or $Help -or $NoGui)
+
+function Show-MainMenuConsole {
+    while ($true) {
+        Clear-Host
+        Write-BoxTop
+        Write-BoxCenter 'NONGPLAISHOP - CONSOLE MODE' 'Cyan'
+        Write-BoxDivider
+        Write-MenuItem -Key '1' -Label 'APPLY EVERYTHING' -Desc 'ปรับจูนทั้งหมดทันที'
+        Write-MenuItem -Key '2' -Label 'RESET ALL' -Desc 'คืนค่าจาก backup ล่าสุด' -KeyColor 'Yellow'
+        Write-MenuItem -Key '3' -Label 'SCAN HARDWARE' -Desc 'ดูสเปกและ profile ที่ตรวจเจอ' -KeyColor 'Cyan'
+        Write-MenuItem -Key '4' -Label 'EXPORT REPORT' -Desc 'สร้างรายงาน HTML บน Desktop' -KeyColor 'Cyan'
+        Write-MenuItem -Key '5' -Label 'HPET TOOL' -Desc 'เปิดเมนู HPET แยกต่างหาก' -KeyColor 'Magenta'
+        Write-MenuItem -Key '6' -Label 'HELP' -Desc 'ดูตัวอย่างคำสั่ง command line' -KeyColor 'Gray'
+        Write-MenuItem -Key '0' -Label 'EXIT' -Desc 'ปิดโปรแกรม' -KeyColor 'Red'
+        Write-BoxBottom
+        Write-Host ""
+        switch (Read-Host 'Select') {
+            '1' { Invoke-DoEverything; return }
+            '2' { Invoke-ResetUltra; return }
+            '3' { Invoke-HardwareScanOnly; return }
+            '4' { Invoke-ExportReport; return }
+            '5' { Invoke-HpetToggle; return }
+            '6' { Show-Usage; Read-Host 'Press Enter to continue' | Out-Null }
+            '0' { return }
+            default {
+                Write-Warn2 'กรุณาเลือกหมายเลขที่ถูกต้อง'
+                Read-Host 'Press Enter to continue' | Out-Null
+            }
+        }
+    }
+}
+
+function Invoke-RequestedAction {
+    param([Parameter(Mandatory)][ValidateSet('Apply','Reset','Scan','Report','Hpet','Help')][string]$Action)
+    switch ($Action) {
+        'Apply'  { Invoke-DoEverything }
+        'Reset'  { Invoke-ResetUltra }
+        'Scan'   { Invoke-HardwareScanOnly }
+        'Report' { Invoke-ExportReport }
+        'Hpet'   { Invoke-HpetToggle }
+        'Help'   { Show-Usage }
+    }
+}
 
 function Write-GuiEvent {
     param(
@@ -584,6 +649,126 @@ function Find-GtaProcessName {
 
 function Get-ActiveAdapter {
     return Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+}
+
+function Set-ScheduledTaskDisabled {
+    param([Parameter(Mandatory)][string]$TaskPath)
+    try {
+        if ($TaskPath -notmatch '^(.*\\)([^\\]+)$') { return }
+        $taskFolder = $Matches[1]
+        $taskName = $Matches[2]
+        $task = Get-ScheduledTask -TaskPath $taskFolder -TaskName $taskName -ErrorAction Stop
+        if ($script:DryRun) {
+            Write-Host "  [DRYRUN] would disable scheduled task: $TaskPath" -ForegroundColor DarkCyan
+            return
+        }
+        $wasEnabled = ($task.State -ne 'Disabled')
+        $script:Changes.Add([PSCustomObject]@{ Kind='ScheduledTask'; TaskPath=$taskFolder; TaskName=$taskName; WasEnabled=$wasEnabled })
+        if ($wasEnabled) { Disable-ScheduledTask -TaskPath $taskFolder -TaskName $taskName -ErrorAction Stop | Out-Null }
+    } catch { Write-Log "Scheduled task skipped: $TaskPath" }
+}
+
+function Invoke-FullGamingExtras {
+    Write-Host "Applying additional full-system gaming extras..." -ForegroundColor Cyan
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' 'GlobalUserDisabled' 1 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings' 'NOC_GLOBAL_SETTING_TOASTS_ENABLED' 0 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AudioCaptureEnabled' 0 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsConsumerFeatures' 1 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 0 'DWord' | Out-Null
+    foreach ($task in @(
+        '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser',
+        '\Microsoft\Windows\Application Experience\ProgramDataUpdater',
+        '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator',
+        '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip',
+        '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector',
+        '\Microsoft\Windows\Feedback\Siuf\DmClient',
+        '\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload',
+        '\Microsoft\Windows\Maps\MapsToastTask',
+        '\Microsoft\Windows\Maps\MapsUpdateTask'
+    )) { Set-ScheduledTaskDisabled -TaskPath $task }
+    foreach ($svc in 'DoSvc','MapsBroker','WerSvc','RetailDemo','lfsvc','PhoneSvc') {
+        Set-SvcStart $svc 'Manual' | Out-Null
+    }
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarAnimations' 0 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ListviewAlphaSelect' 0 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'IconsOnly' 1 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\DWM' 'EnableAeroPeek' 0 'DWord' | Out-Null
+    Save-Changes
+    Write-Ok "Full-system gaming extras applied"
+}
+
+function Invoke-DeepAggressiveTuning {
+    Write-Host "Applying deep aggressive system tuning..." -ForegroundColor Magenta
+
+    # Foreground multimedia scheduler and startup latency.
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'AlwaysOn' 1 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'NoLazyMode' 1 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'StartupDelayInMSec' 0 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'DisablePreviewDesktop' 1 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'DisableThumbnails' 1 'DWord' | Out-Null
+
+    # Remove extra background scheduling and power-saving on the active plan.
+    try {
+        powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100 | Out-Null
+        powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100 | Out-Null
+        powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100 | Out-Null
+        powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100 | Out-Null
+        powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PERFBOOSTMODE 2 | Out-Null
+        powercfg.exe /setactive SCHEME_CURRENT | Out-Null
+    } catch {}
+
+    # Additional nonessential services: preserve original startup modes through Set-SvcStart.
+    foreach ($svc in 'TimeBrokerSvc','PcaSvc','DusmSvc','DoSvc','WpnService','WSearch','MapsBroker') {
+        Set-SvcStart $svc 'Manual' | Out-Null
+    }
+
+    # Disable more Windows capture and consumer hooks for a gaming session.
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'HistoricalCaptureEnabled' 0 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'CursorCaptureEnabled' 0 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Microsoft.WindowsStore_8wekyb3d8bbwe!App' 'Enabled' 0 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoRebootWithLoggedOnUsers' 1 'DWord' | Out-Null
+
+    Save-Changes
+    Write-Ok "Deep aggressive tuning applied"
+}
+
+function Invoke-NetworkAggressiveTuning {
+    Write-Host "Applying aggressive FiveM network tuning..." -ForegroundColor Magenta
+
+    # DNS client cache: reduce stale/negative cache retention for frequently changing servers.
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters' 'MaxCacheTtl' 30 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters' 'MaxNegativeCacheTtl' 0 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters' 'NetFailureCacheTime' 0 'DWord' | Out-Null
+
+    # TCP connection/retransmission behavior for small real-time game packets.
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'TcpMaxConnectRetransmissions' 2 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'TcpMaxDataRetransmissions' 3 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'TcpMaxDupAcks' 2 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'Tcp1323Opts' 0 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'EnablePMTUBHDetect' 0 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'EnablePMTUDiscovery' 1 'DWord' | Out-Null
+
+    # Remove background delivery/update traffic while gaming.
+    foreach ($svc in 'BITS','DoSvc','wuauserv') { Set-SvcStart $svc 'Manual' | Out-Null }
+
+    # Apply low-latency global stack profile. Existing Reset restores the global defaults.
+    try { netsh.exe int tcp set global autotuninglevel=disabled | Out-Null } catch {}
+    try { netsh.exe int tcp set global rss=enabled | Out-Null } catch {}
+    try { netsh.exe int tcp set global rsc=disabled | Out-Null } catch {}
+    try { netsh.exe int tcp set global ecncapability=disabled | Out-Null } catch {}
+    try { netsh.exe int tcp set global timestamps=disabled | Out-Null } catch {}
+    try { netsh.exe int tcp set global fastopen=enabled | Out-Null } catch {}
+    try { netsh.exe int tcp set heuristics disabled | Out-Null } catch {}
+
+    # Disable unused tunnel transition technologies that can add routes/overhead.
+    try { netsh.exe interface teredo set state disable | Out-Null } catch {}
+    try { netsh.exe interface 6to4 set state state=disabled | Out-Null } catch {}
+    try { netsh.exe interface isatap set state state=disabled | Out-Null } catch {}
+
+    try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
+    Save-Changes
+    Write-Ok "Aggressive FiveM network tuning applied"
 }
 
 # ---------------------------------------------------------------------------
@@ -1305,6 +1490,15 @@ function Invoke-ResetUltra {
                 }
                 'Rsc' {
                     if ($c.WasOn) { Enable-NetAdapterRsc -Name $c.Name -ErrorAction SilentlyContinue }
+                }
+                'ScheduledTask' {
+                    if ($c.WasEnabled) { Enable-ScheduledTask -TaskPath $c.TaskPath -TaskName $c.TaskName -ErrorAction SilentlyContinue | Out-Null }
+                }
+                'Mtu' {
+                    if ($c.OldMtu) { Set-NetIPInterface -InterfaceIndex $c.IfIndex -AddressFamily $c.AddressFamily -NlMtuBytes ([int]$c.OldMtu) -ErrorAction SilentlyContinue }
+                }
+                'NetworkProfile' {
+                    if ($c.OldCategory) { Set-NetConnectionProfile -InterfaceIndex $c.IfIndex -NetworkCategory $c.OldCategory -ErrorAction SilentlyContinue }
                 }
                 'HidPower' {
                     try {
@@ -2401,6 +2595,148 @@ function Invoke-NetworkAdaptive {
     Write-Ok "Global: RSS=ON, ECN/Timestamps/RSC=Off, AutoTuning=Experimental, TCP Fast Open=On, ICW=10, UDP receive offload off, fast small-datagram send path"
 }
 
+function Invoke-NetworkEnvironmentAdaptive {
+    param([Parameter(Mandatory)]$NicList)
+    Write-Info2 "Applying per-adapter LAN/Wi-Fi environment profile..."
+
+    foreach ($nic in $NicList) {
+        $adapter = Get-NetAdapter -Name $nic.Name -ErrorAction SilentlyContinue
+        if (-not $adapter) { continue }
+
+        # Wi-Fi gets radio power/roaming latency settings; wired gets link-only settings.
+        if ($nic.IsWireless) {
+            foreach ($prop in @(
+                @{ Name='Transmit Power'; Value='Highest' },
+                @{ Name='Roaming Aggressiveness'; Value='Highest' },
+                @{ Name='MIMO Power Save Mode'; Value='No SMPS' },
+                @{ Name='U-APSD support'; Value='Disabled' },
+                @{ Name='Preferred Band'; Value='Prefer 5GHz band' },
+                @{ Name='ARP offload for WoWLAN'; Value='Disabled' },
+                @{ Name='NS offload for WoWLAN'; Value='Disabled' }
+            )) {
+                try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
+            }
+            Write-Ok "Wi-Fi profile applied: power-save off, roaming/tx power optimized"
+        }
+        else {
+            foreach ($prop in @(
+                @{ Name='Jumbo Packet'; Value='Disabled' },
+                @{ Name='Flow Control'; Value='Disabled' },
+                @{ Name='Interrupt Moderation'; Value='Disabled' },
+                @{ Name='Energy Efficient Ethernet'; Value='Disabled' },
+                @{ Name='Green Ethernet'; Value='Disabled' },
+                @{ Name='Wake on Magic Packet'; Value='Disabled' }
+            )) {
+                try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
+            }
+            Write-Ok "LAN profile applied: low-latency link settings"
+        }
+
+        # Keep the adapter MTU at a standard value only when it is not a VPN/virtual interface.
+        try {
+            $ipIf = Get-NetIPInterface -InterfaceIndex $nic.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+            if ($ipIf -and $ipIf.NlMtuBytes -gt 1500 -and $nic.Model -notmatch 'VPN|Virtual|TAP|Hyper-V|VMware|VirtualBox') {
+                $script:Changes.Add([PSCustomObject]@{ Kind='Mtu'; IfIndex=$nic.IfIndex; AddressFamily='IPv4'; OldMtu=[int]$ipIf.NlMtuBytes })
+                Set-NetIPInterface -InterfaceIndex $nic.IfIndex -AddressFamily IPv4 -NlMtuBytes 1500 -ErrorAction SilentlyContinue
+                Write-Ok "MTU normalized to 1500 on $($nic.Name)"
+            }
+        } catch {}
+
+        # Prefer Private profile for a usable home gaming network; do not touch domain networks.
+        try {
+            $profile = Get-NetConnectionProfile -InterfaceIndex $nic.IfIndex -ErrorAction SilentlyContinue
+            if ($profile -and $profile.NetworkCategory -eq 'Public' -and $profile.NetworkName -notmatch 'Domain') {
+                $script:Changes.Add([PSCustomObject]@{ Kind='NetworkProfile'; IfIndex=$nic.IfIndex; OldCategory=[string]$profile.NetworkCategory })
+                Set-NetConnectionProfile -InterfaceIndex $nic.IfIndex -NetworkCategory Private -ErrorAction SilentlyContinue
+            }
+        } catch {}
+    }
+
+    # Apply the same QoS priority to all common FiveM/GTA process names.
+    foreach ($exe in 'FiveM.exe','CitizenFX.exe','GTA5.exe','PlayGTAV.exe') {
+        $policy = "NongPlai_$($exe -replace '\.exe$','')"
+        try {
+            Remove-NetQosPolicy -Name $policy -Confirm:$false -ErrorAction SilentlyContinue
+            New-NetQosPolicy -Name $policy -AppPathNameMatchCondition $exe -DSCPAction 46 -NetworkProfile All -ErrorAction Stop | Out-Null
+            $script:Changes.Add([PSCustomObject]@{ Kind='QosPolicy'; Name=$policy })
+        } catch { Write-Log "QoS policy skipped for $exe" }
+    }
+    try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
+    Save-Changes
+    Write-Ok "Adaptive LAN/Wi-Fi environment profile applied"
+}
+
+function Invoke-SystemAdaptiveProfile {
+    param([Parameter(Mandatory)]$Hw)
+    Write-Info2 "Selecting system profile from detected hardware..."
+
+    $cpuThreads = [int]$Hw.Cpu.Threads
+    $ramGB = [double]$Hw.Ram.TotalGB
+    $isLaptop = [bool]$Hw.IsLaptop
+    $hasFastStorage = @($Hw.Storage | Where-Object { $_.Kind -in @('NVMe','SATA SSD') }).Count -gt 0
+    $hasHdd = @($Hw.Storage | Where-Object { $_.Kind -eq 'HDD' }).Count -gt 0
+    $hasRealGpu = @($Hw.Gpu | Where-Object { -not $_.IsVirtual }).Count -gt 0
+
+    # CPU tier: tune scheduler values to avoid wasting queueing/threads on small CPUs.
+    $responsiveness = if ($cpuThreads -ge 16) { 0 } elseif ($cpuThreads -ge 8) { 5 } else { 10 }
+    $prioritySep = if ($cpuThreads -ge 8) { 38 } else { 26 }
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'SystemResponsiveness' $responsiveness 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' 'Win32PrioritySeparation' $prioritySep 'DWord' | Out-Null
+
+    # RAM tier: only disable compression on machines with enough physical memory.
+    if ($ramGB -ge 24) {
+        try { Disable-MMAgent -mc -ErrorAction Stop; $script:Changes.Add([PSCustomObject]@{ Kind='MemoryCompression' }) } catch {}
+        Write-Ok "RAM profile: high-memory / compression disabled"
+    } elseif ($ramGB -ge 16) {
+        Write-Ok "RAM profile: 16-24GB / performance mode"
+    } else {
+        try { Enable-MMAgent -mc -ErrorAction SilentlyContinue } catch {}
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'DisablePagingExecutive' 0 'DWord' | Out-Null
+        Write-Ok "RAM profile: limited-memory / compression kept on"
+    }
+
+    # Laptop and desktop power profiles are deliberately different.
+    try {
+        if ($isLaptop) {
+            powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100 | Out-Null
+            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 50 | Out-Null
+            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_USB USBSELECTIVE 1 | Out-Null
+        } else {
+            powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100 | Out-Null
+            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100 | Out-Null
+            powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_USB USBSELECTIVE 0 | Out-Null
+        }
+        powercfg.exe /setactive SCHEME_CURRENT | Out-Null
+    } catch {}
+
+    # Storage tier: keep HDD-friendly caching while using aggressive SSD/NVMe paths.
+    if ($hasFastStorage) {
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' 'NtfsMemoryUsage' 2 'DWord' | Out-Null
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' 'DisableDeleteNotification' 0 'DWord' | Out-Null
+        Write-Ok "Storage profile: SSD/NVMe performance path"
+    }
+    if ($hasHdd) {
+        Set-SvcStart 'SysMain' 'Manual' | Out-Null
+        Write-Ok "Storage profile: HDD detected / background prefetch kept compatible"
+    }
+
+    # GPU tier: only force HAGS on real display hardware; integrated-only machines keep Windows default.
+    if ($hasRealGpu -and @($Hw.Gpu | Where-Object { $_.Brand -in @('NVIDIA','AMD') }).Count -gt 0) {
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2 'DWord' | Out-Null
+        Write-Ok "GPU profile: hardware scheduling enabled"
+    } else {
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 1 'DWord' | Out-Null
+        Write-Ok "GPU profile: conservative scheduling for integrated/unknown GPU"
+    }
+
+    $profileName = if ($isLaptop) { 'Laptop' } else { 'Desktop' }
+    $profileName += if ($cpuThreads -ge 16) { '-HighThread' } elseif ($cpuThreads -ge 8) { '-MidThread' } else { '-LowThread' }
+    $profileName += if ($ramGB -ge 16) { '-HighRAM' } else { '-LowRAM' }
+    $script:Changes.Add([PSCustomObject]@{ Kind='AdaptiveProfile'; Name=$profileName; CpuThreads=$cpuThreads; RamGB=$ramGB; IsLaptop=$isLaptop; FastStorage=$hasFastStorage; Hdd=$hasHdd })
+    Save-Changes
+    Write-Ok "Adaptive system profile selected: $profileName"
+}
+
 # ===========================================================================
 # v2.0 — SMART APPLY (scan -> adaptive apply, with progress bar + DryRun)
 # ===========================================================================
@@ -2437,7 +2773,7 @@ function Invoke-SmartApply {
         @{ Name = 'GPU adaptive tweaks';     Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
         @{ Name = 'RAM adaptive tweaks';     Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
         @{ Name = 'Storage adaptive tweaks'; Action = { Invoke-StorageAdaptive -StorageList $hw.Storage } },
-        @{ Name = 'Network adaptive tweaks'; Action = { Invoke-NetworkAdaptive -NicList $hw.Nic -Cpu $hw.Cpu } }
+        @{ Name = 'Network adaptive tweaks'; Action = { Invoke-NetworkAdaptive -NicList $hw.Nic -Cpu $hw.Cpu; Invoke-NetworkEnvironmentAdaptive -NicList $hw.Nic } }
     )
     $total = $modules.Count
     $i = 0
@@ -2471,7 +2807,8 @@ function Invoke-HardwareScanOnly {
 }
 
 function Invoke-ExportReport {
-    Clear-Host
+    param([switch]$FromGui)
+    if (-not $FromGui) { Clear-Host }
     Write-Host "  EXPORT HARDWARE + TWEAK REPORT (HTML)" -ForegroundColor Cyan
     $outPath = Join-Path ([Environment]::GetFolderPath('Desktop')) ("NongPlai_Tuner_Report_{0}.html" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
     $html = @(
@@ -2488,7 +2825,7 @@ function Invoke-ExportReport {
     catch {
         Write-Bad "Could not save report: $($_.Exception.Message)"
     }
-    if (-not $script:GuiWorker) { Read-Host "Press Enter to continue" }
+    if (-not $FromGui -and -not $script:GuiWorker) { Read-Host "Press Enter to continue" }
 }
 
 # ===========================================================================
@@ -2507,13 +2844,22 @@ function Invoke-DoEverything {
     $script:LegacyStepCount = 0
     Invoke-ApplyUltra
 
-    # --- Part 2: scan this PC's hardware and layer on adaptive CPU/GPU/RAM/Storage/Network tweaks ---
+    # Full Gaming extras are included in Apply Everything.
+    Invoke-FullGamingExtras
+    Invoke-DeepAggressiveTuning
+    Invoke-NetworkAggressiveTuning
+
+    # Scan first, then select every system profile from this machine's actual hardware.
+    # The adaptive profile is applied before CPU/GPU/RAM/Storage/Network modules.
     $script:GuiStage = 'adaptive'
+    $hw = Invoke-HardwareScan
+    Invoke-SystemAdaptiveProfile -Hw $hw
+
+    # --- Part 2: apply hardware-specific adaptive modules and layer on adaptive CPU/GPU/RAM/Storage/Network tweaks ---
     Write-Host ""
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    Write-Host "  HARDWARE SCAN -> ADAPTIVE DEEP TWEAK" -ForegroundColor Cyan
+    Write-Host "  HARDWARE PROFILE -> ADAPTIVE DEEP TWEAK" -ForegroundColor Cyan
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    $hw = Invoke-HardwareScan
     Show-HardwareSummary -Hw $hw
 
     if (-not $script:BackupDir) { New-BackupFolder | Out-Null }
@@ -2629,15 +2975,15 @@ if (-not [System.Windows.Application]::Current) {
 $script:MenuCards = @(
     [PSCustomObject]@{
         Key='1'; Glyph='⚡'; Title='APPLY EVERYTHING'; Accent='#F2C94C'
-        Desc='สแกนฮาร์ดแวร์เครื่องนี้ (CPU/GPU/RAM/SSD/เน็ต) แล้วปรับจูนทุกอย่างให้เหมาะกับสเปกที่ตรวจเจอโดยอัตโนมัติ ปลอดภัย ย้อนกลับได้เสมอ'
+        Desc='Full system gaming tune'
     },
     [PSCustomObject]@{
         Key='2'; Glyph='↺'; Title='RESET ALL'; Accent='#56CCF2'
-        Desc='คืนค่าทุกอย่างที่เครื่องมือนี้เคยปรับกลับไปเป็นค่าเดิมทั้งหมด โดยอ่านจาก backup ล่าสุดที่บันทึกไว้อัตโนมัติทุกครั้งที่กด Apply'
+        Desc='Restore latest backup'
     },
     [PSCustomObject]@{
         Key='3'; Glyph='✕'; Title='EXIT'; Accent='#EB5757'
-        Desc='ปิดโปรแกรม NongPlaiShop Smart Adaptive Tuner โดยไม่ทำการเปลี่ยนแปลงใด ๆ เพิ่มเติม'
+        Desc='Close NongPlaiShop'
     }
 )
 
@@ -2663,7 +3009,7 @@ function Show-MainMenuWpf {
       <Grid.RowDefinitions>
         <RowDefinition Height="52"/>
         <RowDefinition Height="*"/>
-        <RowDefinition Height="150"/>
+        <RowDefinition Height="178"/>
         <RowDefinition Height="72"/>
       </Grid.RowDefinitions>
 
@@ -2775,7 +3121,12 @@ function Show-MainMenuWpf {
       <!-- Description panel -->
       <StackPanel Grid.Row="2" Margin="34,10,34,0">
         <TextBlock Name="DescTitle" Text="APPLY EVERYTHING" Foreground="#F2C94C" FontSize="19" FontWeight="Bold"/>
-        <TextBlock Name="DescBody" TextWrapping="Wrap" Foreground="#c9c9cc" FontSize="13" Margin="0,8,0,0"/>
+        <TextBlock Name="DescBody" TextWrapping="NoWrap" Foreground="#c9c9cc" FontSize="12" Margin="0,6,0,0"/>
+        <TextBlock Name="QuickStatus" Text="กำลังอ่านสถานะเครื่อง..." Foreground="#7d7d82" FontSize="10" Margin="0,6,0,0" TextTrimming="CharacterEllipsis"/>
+        <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+          <Button Name="OpenBackupBtn" Content="BACKUP" Width="92" Height="25" Background="#20242C" Foreground="#D6A84F" BorderThickness="0" FontSize="10" Cursor="Hand" Margin="0,0,8,0"/>
+          <Button Name="OpenReportBtn" Content="REPORT" Width="92" Height="25" Background="#20242C" Foreground="#56CCF2" BorderThickness="0" FontSize="10" Cursor="Hand"/>
+        </StackPanel>
       </StackPanel>
 
       <!-- Bottom bar -->
@@ -2805,6 +3156,9 @@ function Show-MainMenuWpf {
     $cards = @($window.FindName('Card0'), $window.FindName('Card1'), $window.FindName('Card2'))
     $descTitle = $window.FindName('DescTitle')
     $descBody  = $window.FindName('DescBody')
+    $quickStatus = $window.FindName('QuickStatus')
+    $openBackupBtn = $window.FindName('OpenBackupBtn')
+    $openReportBtn = $window.FindName('OpenReportBtn')
     $bigTitle  = $window.FindName('BigTitle')
     $runBtn    = $window.FindName('RunBtn')
     $closeBtn  = $window.FindName('CloseBtn')
@@ -2816,6 +3170,33 @@ function Show-MainMenuWpf {
     $script:GuiSelectedIndex = 0
     $script:GuiResult = $null
     $bc = New-Object Windows.Media.BrushConverter
+
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $processor = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+        $gpu = (Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Basic|Virtual|Remote' } | Select-Object -First 1).Name
+        $ram = if ($cs) { [math]::Round($cs.TotalPhysicalMemory / 1GB, 0) } else { '?' }
+        $cpuRaw = if ($processor -and $processor.Name) { [string]$processor.Name } else { '' }
+        $cpu = if ($cpuRaw -match '(?i)(i[3579]-[0-9]{4,5}[A-Z]*|Ryzen\s+[3579]\s+[0-9]{4,5}[A-Z]*|Threadripper\s+[0-9]{4,5}[A-Z]*|Xeon\s+[A-Z0-9-]+)') { $Matches[1] } else { 'Unknown' }
+        $gpuRaw = if ($gpu) { [string]$gpu } else { '' }
+        $gpuShort = if ($gpuRaw -match '(?i)((?:NVIDIA\s+)?(?:GeForce\s+)?(?:RTX|GTX)\s*[0-9]{3,4}(?:\s*Ti|\s*SUPER)?|(?:AMD\s+)?Radeon\s+(?:RX\s*)?[0-9]{3,4}(?:\s*XT)?|Intel\s+Arc\s+[A-Za-z0-9]+)') { $Matches[1] } else { 'Unknown' }
+        $gpuShort = $gpuShort -replace '(?i)NVIDIA\s+|GeForce\s+|AMD\s+|Radeon\s+', ''
+        $adapter = Get-ActiveAdapter
+        $net = if (-not $adapter) { 'Offline' } elseif ([string]$adapter.Name -match '(?i)wi-?fi|wireless|802\.11') { 'Wi-Fi' } elseif ([string]$adapter.Name -match '(?i)ethernet|gigabit|realtek|intel.*(i21|ethernet)') { 'Ethernet' } else { 'Online' }
+        $quickStatus.Text = "CPU: $cpu  GPU: $gpuShort  RAM: ${ram} GB  NET: $net"
+    } catch { $quickStatus.Text = 'Hardware status unavailable' }
+
+    $openBackupBtn.Add_Click({
+        try { $bk = Find-LatestBackup; if ($bk) { Start-Process 'explorer.exe' -ArgumentList $bk } else { [System.Windows.MessageBox]::Show('ยังไม่มี Backup', 'NongPlaiShop') | Out-Null } } catch {}
+    })
+    $openReportBtn.Add_Click({
+        try {
+            Invoke-ExportReport -FromGui
+            [System.Windows.MessageBox]::Show('สร้าง Report บน Desktop แล้ว', 'NongPlaiShop', 'OK', 'Information') | Out-Null
+        } catch {
+            [System.Windows.MessageBox]::Show(('สร้าง Report ไม่สำเร็จ: ' + $_.Exception.Message), 'NongPlaiShop', 'OK', 'Error') | Out-Null
+        }
+    })
 
     function Animate-CardSlot {
         param($Card, [double]$X, [double]$Rotate, [double]$Scale, [double]$Opacity, [int]$Z, [string]$Accent, [bool]$Selected)
@@ -2884,7 +3265,7 @@ function Show-MainMenuWpf {
         $m = $script:MenuCards[$sel]
         $descTitle.Text = $m.Title
         $descTitle.Foreground = $bc.ConvertFromString($m.Accent)
-        $descBody.Text = $m.Desc
+        $descBody.Text = if ($m.Key -eq '1') { 'Full system gaming tune' } elseif ($m.Key -eq '2') { 'Restore latest backup' } else { 'Close app' }
         $bigTitle.Text = $m.Title.Split(' ')[0]
         $bigTitle.Foreground = $bc.ConvertFromString($m.Accent)
         $bigTitle.Opacity = 1.0
@@ -3153,7 +3534,7 @@ function Show-WorkerProgressWpf {
     $panel.Controls.Add($openBackupBtn)
 
     $footer = New-Object System.Windows.Forms.Label
-    $footer.Text = 'PLEASE WAIT  •  APPLYING SAFE, REVERSIBLE OPTIMIZATIONS'
+    $footer.Text = 'FULL GAMING TUNER  •  DARK DASHBOARD  •  REVERSIBLE BACKUP'
     $footer.ForeColor = $muted
     $footer.Font = New-Object System.Drawing.Font('Consolas', 8)
     $footer.AutoSize = $true
@@ -3268,7 +3649,6 @@ if ($WorkerUi) {
         Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
         Show-WorkerProgressWpf -Action $WorkerAction
         # Return to the original main menu after the progress window closes.
-        # The worker intentionally keeps the temp script alive until this launch.
         if ($script:ScriptPath -and (Test-Path $script:ScriptPath)) {
             Confirm-ScriptPersisted | Out-Null
             $menuArgs = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
@@ -3315,15 +3695,5 @@ try {
     try { [System.Windows.MessageBox]::Show($_.Exception.Message, 'NongPlaiShop - Error', 'OK', 'Error') | Out-Null } catch {}
 }
 
-
-# Clean up the temp copy only when no child GUI/worker process needs it.
-# In irm|iex mode, the elevated parent launches WorkerUi with -File $selfPath;
-# deleting that file immediately can race with WorkerUi/Worker startup.
-try {
-    $selfPath = $script:ScriptPath
-    if (-not $uiAction -and $selfPath -and ($selfPath -eq (Join-Path $env:TEMP 'NongPlaiShop_v2_session.ps1'))) {
-        Remove-Item -Path $selfPath -Force -ErrorAction SilentlyContinue
-    }
-} catch {}
 
 try { if ($script:WpfApp) { $script:WpfApp.Shutdown() } } catch {}
