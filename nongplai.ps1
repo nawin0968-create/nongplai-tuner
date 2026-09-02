@@ -2252,10 +2252,11 @@ function Invoke-CpuAdaptive {
             powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 2>$null | Out-Null
             powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 2>$null | Out-Null
             powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
-            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
+            $dcMin = if ($IsLaptop) { 50 } else { 100 }
+            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c $dcMin 2>$null | Out-Null
             powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
-            Write-Ok "Boost=Aggressive, min processor state=100% on AC AND battery - no OS-level power limit held back on this CPU"
-            if ($IsLaptop) { Write-Warn2 "This is a laptop - battery drains faster and fans run louder with power limits removed on battery too. That's intentional per your request." }
+            Write-Ok "Boost=Aggressive, min processor state=100% on AC and ${dcMin}% on battery - tuned for this chassis"
+            if ($IsLaptop) { Write-Info2 "Laptop battery profile: AC stays at maximum responsiveness; battery uses ${dcMin}% minimum to reduce heat and power drain." }
         } catch { Write-Warn2 "Some Intel powercfg tweaks failed: $($_.Exception.Message)" }
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\be337238-0d82-4146-a960-4f3749d470c7' 'Attributes' 2 'DWord' | Out-Null
         if (-not $Cpu.Unlocked) { Write-Info2 "Locked SKU note: Windows-side limits are now fully open, but Intel's hardware PL1/PL2 power cap on a locked chip can only be raised further from BIOS/motherboard UEFI (Enable MCE / raise Power Limits), not from Windows." }
@@ -2281,9 +2282,10 @@ function Invoke-CpuAdaptive {
             }
             # Min processor state = 100% on AC AND battery, on every SKU including X3D, per your request.
             powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
-            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
+            $dcMin = if ($IsLaptop) { 50 } else { 100 }
+            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c $dcMin 2>$null | Out-Null
             powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
-            Write-Ok "Min processor state = 100% on AC AND battery - no OS-level power limit held back on this CPU"
+            Write-Ok "Min processor state = 100% on AC and ${dcMin}% on battery - tuned for this chassis"
             if ($Cpu.IsX3D) { Write-Warn2 "3D V-Cache part - this will run hotter at idle than X3D's default power profile. Watch temps; PBO/curve-optimizer tuning in BIOS is the next step if you want to push further." }
             if ($IsLaptop) { Write-Warn2 "This is a laptop - battery drains faster and fans run louder with power limits removed on battery too. That's intentional per your request." }
         } catch { Write-Warn2 "Some AMD powercfg tweaks failed: $($_.Exception.Message)" }
@@ -2741,12 +2743,13 @@ function Invoke-SystemAdaptiveProfile {
     }
 
     # GPU tier: only force HAGS on real display hardware; integrated-only machines keep Windows default.
-    if ($hasRealGpu -and @($Hw.Gpu | Where-Object { $_.Brand -in @('NVIDIA','AMD') }).Count -gt 0) {
+    $hasHighTierGpu = @($Hw.Gpu | Where-Object { -not $_.IsVirtual -and $_.Brand -in @('NVIDIA','AMD') -and $_.Tier -eq 'High' }).Count -gt 0
+    if ($hasHighTierGpu) {
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2 'DWord' | Out-Null
-        Write-Ok "GPU profile: hardware scheduling enabled"
+        Write-Ok "GPU profile: HAGS enabled for high-tier discrete GPU"
     } else {
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 1 'DWord' | Out-Null
-        Write-Ok "GPU profile: conservative scheduling for integrated/unknown GPU"
+        Write-Ok "GPU profile: conservative scheduling for integrated, entry/mid-tier, or unknown GPU"
     }
 
     $profileName = if ($isLaptop) { 'Laptop' } else { 'Desktop' }
