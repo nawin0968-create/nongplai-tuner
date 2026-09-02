@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
 # Rewritten from the original .cmd to fix reliability issues caused by
 # batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -155,7 +155,8 @@ $script:GuiWorker = [bool]$Worker
 $script:GuiLogPath = $GuiLogPath
 $script:GuiStage = 'startup'
 $script:LegacyStepCount = 0
-$script:LegacyStepTotal = 43  # +3 from v2.1: MMCSS, ProcessPriority, TrimVerify
+$script:LegacyStepTotal = 42  # 39 legacy steps + MMCSS, process priority, and TRIM verification
+$script:InputQueueSize = 20
 $script:HwInfo = $null
 $script:GuiReady = $false
 $script:PowerShellExe = Get-PowerShellExePath
@@ -1265,8 +1266,15 @@ function Invoke-ApplyUltra {
         # small amount of input lag. Lowering it (a well-known low-latency gaming tweak) makes
         # Windows process each move/click sooner. mouclass/kbdclass are core Windows HID class
         # drivers present on every install, so this works regardless of mouse/keyboard brand.
-        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\mouclass\Parameters' 'MouseDataQueueSize' 20 'DWord' | Out-Null
-        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\kbdclass\Parameters' 'KeyboardDataQueueSize' 20 'DWord' | Out-Null
+        $inputCpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+        $inputRam = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $inputLaptop = Get-HwIsLaptop
+        $inputThreads = if ($inputCpu) { [int]$inputCpu.NumberOfLogicalProcessors } else { 4 }
+        $inputRamGB = if ($inputRam) { [double]($inputRam.TotalPhysicalMemory / 1GB) } else { 8 }
+        $script:InputQueueSize = if ($inputLaptop -or $inputThreads -lt 8 -or $inputRamGB -lt 8) { 32 } elseif ($inputThreads -ge 16 -and $inputRamGB -ge 16) { 20 } else { 24 }
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\mouclass\Parameters' 'MouseDataQueueSize' $script:InputQueueSize 'DWord' | Out-Null
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\kbdclass\Parameters' 'KeyboardDataQueueSize' $script:InputQueueSize 'DWord' | Out-Null
+        Write-Ok "HID input queues set to $($script:InputQueueSize) for this CPU/RAM/chassis profile"
     }
 
     Invoke-Step (++$n) $Total "Disabling per-device power management on all HID (mouse/keyboard) devices..." {
@@ -1300,7 +1308,9 @@ function Invoke-ApplyUltra {
         # might be worth checking manually if routing/ping looks wrong.
         try {
             $suspectPattern = 'Parsec|Virtual|VPN|TAP|Hyper-V|VMware|VirtualBox|Npcap|Loopback'
-            $suspects = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and $_.Name -match $suspectPattern -or $_.InterfaceDescription -match $suspectPattern }
+            $suspects = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+                $_.Status -eq 'Up' -and ($_.Name -match $suspectPattern -or $_.InterfaceDescription -match $suspectPattern)
+            }
             if ($suspects) {
                 Write-Host "Active virtual/remote adapters found (not changed, just flagged):"
                 foreach ($s in $suspects) { Write-Host "  - $($s.Name) ($($s.InterfaceDescription))" }
@@ -1334,7 +1344,7 @@ function Invoke-ApplyUltra {
         { (Get-ItemProperty 'HKCU:\Software\Microsoft\GameBar' -Name AutoGameModeEnabled -EA SilentlyContinue).AutoGameModeEnabled -eq 0 }
         { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name MaxUserPort -EA SilentlyContinue) -ne $null }
         { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name DisablePagingExecutive -EA SilentlyContinue).DisablePagingExecutive -eq 1 }
-        { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\mouclass\Parameters' -Name MouseDataQueueSize -EA SilentlyContinue).MouseDataQueueSize -eq 20 }
+        { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\mouclass\Parameters' -Name MouseDataQueueSize -EA SilentlyContinue).MouseDataQueueSize -eq $script:InputQueueSize }
         { $a = Get-ActiveAdapter; if ($a) { -not (Get-NetAdapterRsc -Name $a.Name -EA SilentlyContinue).IPv4Enabled } else { $true } }
     )
     $names = 'PowerThrottling','FiveM-CPU-priority','FiveM-GPU-preference','Timer-resolution','Keyboard-response','SysMain-service','QoS-reservation','Visual-effects','Windows-Update-pause','Defender-exclusion','Hibernation-off','Games-task-priority','GameBar-disabled','TCP-port-range','RAM-paging-tweak','HID-queue-size','RSC-off'
@@ -2484,6 +2494,8 @@ function Invoke-NetworkAdaptive {
         elseif ($Cpu.Threads -ge 4) { $rssQueues = 2 }
         else { $rssQueues = 1 }
     }
+    $canSetIrqAffinity = [bool]($Cpu -and $Cpu.Threads -ge 2)
+    $irqMask = [byte[]](2,0,0,0,0,0,0,0)
 
     foreach ($nic in $NicList) {
         $mediaTxt = if ($nic.IsWireless) { 'Wi-Fi' } else { 'wired' }
@@ -2579,12 +2591,14 @@ function Invoke-NetworkAdaptive {
             $sub = Get-ChildItem $devPath -ErrorAction SilentlyContinue | Where-Object {
                 (Get-ItemProperty $_.PSPath -Name 'DriverDesc' -ErrorAction SilentlyContinue).DriverDesc -eq $nic.Model
             } | Select-Object -First 1
-            if ($sub) {
+            if ($sub -and $canSetIrqAffinity) {
                 Set-Reg $sub.PSPath 'MessageSignaledInterruptProperties\MSISupported' 1 'DWord' | Out-Null
                 $affPath = Join-Path $sub.PSPath 'Interrupt Management\Affinity Policy'
                 Set-Reg $affPath 'DevicePolicy' 4 'DWord' | Out-Null      # 4 = IrqPolicySpecifiedProcessors
-                Set-Reg $affPath 'AssignmentSetOverride' ([byte[]](2,0,0,0,0,0,0,0)) 'Binary' | Out-Null  # core index 1 (skip core 0)
-                Write-Ok "IRQ affinity for $($nic.Name) steered away from Core 0"
+                Set-Reg $affPath 'AssignmentSetOverride' $irqMask 'Binary' | Out-Null  # core index 1 (skip core 0)
+                Write-Ok "IRQ affinity for $($nic.Name) steered away from Core 0 (CPU has $($Cpu.Threads) threads)"
+            } elseif ($sub) {
+                Write-Info2 "IRQ affinity skipped for $($nic.Name): CPU exposes fewer than 2 logical threads"
             }
         } catch { Write-Warn2 "IRQ affinity step skipped for $($nic.Name)" }
         # Per-adapter TCP registry tuning (Tcpip\Parameters\Interfaces\<GUID>) - disables Nagle's
@@ -2666,9 +2680,9 @@ function Invoke-NetworkEnvironmentAdaptive {
 
         # Prefer Private profile for a usable home gaming network; do not touch domain networks.
         try {
-            $profile = Get-NetConnectionProfile -InterfaceIndex $nic.IfIndex -ErrorAction SilentlyContinue
-            if ($profile -and $profile.NetworkCategory -eq 'Public' -and $profile.NetworkName -notmatch 'Domain') {
-                $script:Changes.Add([PSCustomObject]@{ Kind='NetworkProfile'; IfIndex=$nic.IfIndex; OldCategory=[string]$profile.NetworkCategory })
+            $connectionProfile = Get-NetConnectionProfile -InterfaceIndex $nic.IfIndex -ErrorAction SilentlyContinue
+            if ($connectionProfile -and $connectionProfile.NetworkCategory -eq 'Public' -and $connectionProfile.NetworkName -notmatch 'Domain') {
+                $script:Changes.Add([PSCustomObject]@{ Kind='NetworkProfile'; IfIndex=$nic.IfIndex; OldCategory=[string]$connectionProfile.NetworkCategory })
                 Set-NetConnectionProfile -InterfaceIndex $nic.IfIndex -NetworkCategory Private -ErrorAction SilentlyContinue
             }
         } catch {}
