@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
 # Rewritten from the original .cmd to fix reliability issues caused by
 # batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -46,13 +46,25 @@ $script:ScriptPath = $MyInvocation.MyCommand.Path
 # When loaded with irm | iex, persist the in-memory script so elevated and GUI
 # worker processes can relaunch the same code.
 if ([string]::IsNullOrWhiteSpace($script:ScriptPath)) {
-    $inlineScript = $MyInvocation.MyCommand.Definition
+    $inlineScript = $null
+    $sourceVariable = $null
+    try { $sourceVariable = $ExecutionContext.SessionState.PSVariable.Get('s').Value } catch {}
+    if ($sourceVariable -is [string] -and $sourceVariable -match '(?s)#requires.*param\(') {
+        $inlineScript = $sourceVariable
+    }
+    if ([string]::IsNullOrWhiteSpace($inlineScript)) {
+        $inlineScript = $MyInvocation.MyCommand.Definition
+    }
     if ([string]::IsNullOrWhiteSpace($inlineScript)) {
         throw 'ไม่พบเนื้อหาสคริปต์สำหรับเริ่มการทำงาน'
     }
     $script:ScriptPath = Join-Path $env:TEMP ('NongPlai_{0}.ps1' -f ([guid]::NewGuid().ToString('N')))
     try {
         Set-Content -Path $script:ScriptPath -Value $inlineScript -Encoding UTF8 -ErrorAction Stop
+        if ((Get-Item -LiteralPath $script:ScriptPath -ErrorAction Stop).Length -lt 1000) {
+            Remove-Item -LiteralPath $script:ScriptPath -Force -ErrorAction SilentlyContinue
+            throw 'source ของ irm | iex ไม่ครบ จึงไม่สามารถเริ่ม worker ได้ กรุณาใช้รูปแบบ $s = irm "URL"; iex ($s.TrimStart([char]0xFEFF))'
+        }
     } catch {
         throw "ไม่สามารถเตรียมไฟล์ชั่วคราวสำหรับการทำงานแบบ irm | iex: $($_.Exception.Message)"
     }
