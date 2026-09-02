@@ -3389,7 +3389,7 @@ function Start-GuiWorkerProcess {
     $workerArgs = @(
         '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
         '-File', "`"$selfPath`"", '-Worker', '-WorkerAction', $Action,
-        '-GuiLogPath', $LogPath
+        '-GuiLogPath', "`"$LogPath`""
     )
     if ($script:DryRun) { $workerArgs += '-DryRun' }
     return Start-Process -FilePath 'powershell.exe' -ArgumentList $workerArgs -WindowStyle Hidden -PassThru
