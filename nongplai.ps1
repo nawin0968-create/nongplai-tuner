@@ -53,6 +53,14 @@ if ([string]::IsNullOrWhiteSpace($script:ScriptPath)) {
         $inlineScript = $sourceVariable
     }
     if ([string]::IsNullOrWhiteSpace($inlineScript)) {
+        $urlMatch = [regex]::Match([string]$MyInvocation.Line, '(https?://[^\s"'']+\.ps1(?:\?[^\s"'']*)?)')
+        if ($urlMatch.Success) {
+            try {
+                $inlineScript = (New-Object System.Net.WebClient).DownloadString($urlMatch.Groups[1].Value).TrimStart([char]0xFEFF)
+            } catch {}
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($inlineScript)) {
         $inlineScript = $MyInvocation.MyCommand.Definition
     }
     if ([string]::IsNullOrWhiteSpace($inlineScript)) {
