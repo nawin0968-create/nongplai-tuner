@@ -811,6 +811,7 @@ function Invoke-ApplyUltra {
     New-BackupFolder | Out-Null
     $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
 
+    Write-GuiEvent -Type 'progress' -Current 2 -Total $script:LegacyStepTotal -Label 'กำลังตรวจสอบเครื่อง' -Message 'กำลังอ่าน CPU, RAM, GPU และอุปกรณ์เครือข่าย...'
     Write-Host "Checking system..."
     Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังตรวจสอบสเปกเครื่อง...'
     try {
@@ -826,6 +827,7 @@ function Invoke-ApplyUltra {
     $gtaName = Find-GtaProcessName
     if ($gtaName) { Write-Host "GTA process file: $gtaName" }
 
+    Write-GuiEvent -Type 'progress' -Current 3 -Total $script:LegacyStepTotal -Label 'กำลังสร้าง restore point' -Message 'ขั้นตอนนี้อาจใช้เวลาสูงสุดประมาณ 45 วินาที...'
     Write-Host "Creating restore point..."
     Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังสร้างจุดคืนค่าระบบ (อาจใช้เวลาถึง 1 นาที)...'
     try {
@@ -848,6 +850,7 @@ function Invoke-ApplyUltra {
         Write-Host ("Restore point: skipped - " + $_.Exception.Message)
     }
 
+    Write-GuiEvent -Type 'progress' -Current 4 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย' -Message 'กำลังทดสอบการเชื่อมต่อก่อนปรับค่า...'
     Write-Host "Testing network baseline..."
     Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย...'
     try { Test-Connection -ComputerName 1.1.1.1 -Count 4 | Format-Table -AutoSize | Out-Host } catch {}
@@ -3400,6 +3403,7 @@ function Play-GuiSound {
 
 function Invoke-GuiWorkerAction {
     try {
+        Write-GuiEvent -Type 'progress' -Current 1 -Total 100 -Label 'กำลังเริ่ม worker' -Message 'กำลังตรวจสิทธิ์และเตรียมการ...'
         switch ($WorkerAction) {
             'Apply' { Invoke-DoEverything }
             'Reset' { Invoke-ResetUltra }
