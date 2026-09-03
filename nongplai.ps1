@@ -2895,6 +2895,33 @@ function Invoke-SystemAdaptiveProfile {
     Write-Ok "Adaptive system profile selected: $profileName"
 }
 
+function Invoke-AdaptiveFiveMRuntime {
+    param([Parameter(Mandatory)]$Hw)
+    $targets = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessName -in @('FiveM','GTAProcess','GTA5','PlayGTAV','CitizenFX')
+    })
+    if ($targets.Count -eq 0) {
+        Write-Info2 "FiveM runtime not running - persistent game profile will apply when the game starts"
+        return
+    }
+
+    $threads = [int]$Hw.Cpu.Threads
+    foreach ($proc in $targets) {
+        try { $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High } catch {}
+        # Only use affinity on conventional, non-hybrid CPUs with enough logical processors.
+        # Hybrid CPUs are left to Windows Thread Director.
+        if ($threads -ge 8 -and -not $Hw.Cpu.Hybrid) {
+            try {
+                $mask = ([int64]1 -shl $threads) - 1
+                $mask = $mask -band (-bnot [int64]1)   # leave logical processor 0 for OS/interrupts
+                if ($mask -gt 0) { $proc.ProcessorAffinity = [intptr]$mask }
+            } catch {}
+        }
+        Write-Ok "Runtime profile: $($proc.ProcessName) = High priority"
+    }
+    Save-Changes
+}
+
 # ===========================================================================
 # v2.0 — SMART APPLY (scan -> adaptive apply, with progress bar + DryRun)
 # ===========================================================================
@@ -3092,6 +3119,7 @@ function Invoke-DoEverything {
     $script:GuiStage = 'adaptive'
     $hw = Invoke-HardwareScan
     Invoke-SystemAdaptiveProfile -Hw $hw
+    Invoke-AdaptiveFiveMRuntime -Hw $hw
 
     # --- Part 2: apply hardware-specific adaptive modules and layer on adaptive CPU/GPU/RAM/Storage/Network tweaks ---
     Write-Host ""
