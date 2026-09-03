@@ -3733,6 +3733,23 @@ function Show-WorkerProgressWpf {
             if ($latest.Count -eq 0) {
                 $ticksNoEvent++
                 if ($ticksNoEvent -eq 60) { $hintText.Text = 'ใช้เวลานานกว่าปกติ แต่ยังทำงานอยู่ โปรดรออีกสักครู่...' }
+                # Hard timeout: if the worker process is still "alive" (HasExited=false) but has
+                # never written a single event for this long, it is almost certainly suspended by
+                # an antivirus/EDR product (common with a freshly-spawned, unsigned, hidden-window
+                # powershell.exe child) rather than genuinely stuck on a slow step. Waiting forever
+                # in that case just looks like a frozen app, so bail out with a clear diagnosis.
+                if ($ticksNoEvent -eq 260 -and -not $done) {
+                    $done = $true
+                    $stageText.Text = 'ไม่มีการตอบสนองจาก worker'
+                    $hintText.Text = 'worker process ไม่ตอบสนองนานเกินไป (ยังไม่ถูกปิด แต่ไม่ทำงานต่อ) - มักเกิดจากโปรแกรมป้องกันไวรัส/EDR แช่แข็งโปรเซสไว้เพื่อสแกน ลองเพิ่ม exclusion ให้โฟลเดอร์ %TEMP% หรือไฟล์สคริปต์นี้ แล้วลองใหม่'
+                    try {
+                        if ($worker -and -not $worker.HasExited) { $worker.Kill() }
+                    } catch {}
+                    Play-GuiSound -Kind Error
+                    $timer.Stop()
+                    $closeBtn.Visible = $true
+                    return
+                }
             } else { $ticksNoEvent = 0 }
             if ($latest.Count -gt 0) {
                 $evt = ($latest[0] -replace '^__NONGPLAI_EVENT__', '') | ConvertFrom-Json
