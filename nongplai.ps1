@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 # NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
 # Rewritten from the original .cmd to fix reliability issues caused by
 # batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -813,7 +813,7 @@ function Invoke-ApplyUltra {
 
     Write-GuiEvent -Type 'progress' -Current 2 -Total $script:LegacyStepTotal -Label 'กำลังตรวจสอบเครื่อง' -Message 'กำลังอ่าน CPU, RAM, GPU และอุปกรณ์เครือข่าย...'
     Write-Host "Checking system..."
-    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังตรวจสอบสเปกเครื่อง...'
+    Write-GuiEvent -Type 'progress' -Current 2 -Total $script:LegacyStepTotal -Label 'กำลังตรวจสอบสเปกเครื่อง...'
     try {
         $os = Get-CimInstance Win32_OperatingSystem
         $cs = Get-CimInstance Win32_ComputerSystem
@@ -829,7 +829,7 @@ function Invoke-ApplyUltra {
 
     Write-GuiEvent -Type 'progress' -Current 3 -Total $script:LegacyStepTotal -Label 'กำลังสร้าง restore point' -Message 'ขั้นตอนนี้อาจใช้เวลาสูงสุดประมาณ 45 วินาที...'
     Write-Host "Creating restore point..."
-    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังสร้างจุดคืนค่าระบบ (อาจใช้เวลาถึง 1 นาที)...'
+    Write-GuiEvent -Type 'progress' -Current 3 -Total $script:LegacyStepTotal -Label 'กำลังสร้างจุดคืนค่าระบบ (อาจใช้เวลาถึง 1 นาที)...'
     try {
         $rpJob = Start-Job -ScriptBlock {
             param($desc)
@@ -852,8 +852,10 @@ function Invoke-ApplyUltra {
 
     Write-GuiEvent -Type 'progress' -Current 4 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย' -Message 'กำลังทดสอบการเชื่อมต่อก่อนปรับค่า...'
     Write-Host "Testing network baseline..."
-    Write-GuiEvent -Type 'progress' -Current 0 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย...'
-    try { Test-Connection -ComputerName 1.1.1.1 -Count 4 | Format-Table -AutoSize | Out-Host } catch {}
+    Write-GuiEvent -Type 'progress' -Current 4 -Total $script:LegacyStepTotal -Label 'กำลังทดสอบเครือข่าย...'
+    # -TimeoutSeconds bounds each ping so this can't hang for minutes if ICMP is filtered
+    # on this network (previously used the default timeout, which can appear as a "stuck" GUI).
+    try { Test-Connection -ComputerName 1.1.1.1 -Count 2 -TimeoutSeconds 2 -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-Host } catch {}
 
     $script:Total = 42  # v2.1: 39 legacy + 3 new (MMCSS, ProcessPriority, TrimVerify)
     $n = 0
@@ -3434,7 +3436,15 @@ function Start-GuiWorkerProcess {
         '-GuiLogPath', $LogPath
     )
     if ($script:DryRun) { $workerArgs += '-DryRun' }
-    return Start-Process -FilePath 'powershell.exe' -ArgumentList $workerArgs -WindowStyle Hidden -PassThru
+    $stdOutPath = Join-Path $env:TEMP ('NongPlaiWorker_out_' + [guid]::NewGuid().ToString('N') + '.log')
+    $stdErrPath = Join-Path $env:TEMP ('NongPlaiWorker_err_' + [guid]::NewGuid().ToString('N') + '.log')
+    $proc = Start-Process -FilePath $script:PowerShellExe -ArgumentList $workerArgs -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $stdOutPath -RedirectStandardError $stdErrPath
+    # Stash the redirect paths on the process object's Tag-like property via a script-scope map
+    # so Show-WorkerProgressWpf can show the real reason if the worker exits before it's done.
+    $script:LastWorkerStdOut = $stdOutPath
+    $script:LastWorkerStdErr = $stdErrPath
+    return $proc
 }
 
 function Show-WorkerProgressWpf {
@@ -3648,7 +3658,20 @@ function Show-WorkerProgressWpf {
             }
             if ($worker.HasExited -and -not $done) {
                 $done = $true; $stageText.Text = 'งานหยุดก่อนเสร็จสมบูรณ์'
-                $hintText.Text = "โปรเซสจบการทำงาน (รหัส $($worker.ExitCode))"
+                $errDetail = ''
+                try {
+                    if ($script:LastWorkerStdErr -and (Test-Path $script:LastWorkerStdErr)) {
+                        $errDetail = (Get-Content -Path $script:LastWorkerStdErr -Raw -ErrorAction SilentlyContinue).Trim()
+                    }
+                } catch {}
+                if ($errDetail) {
+                    $hintText.Text = "โปรเซสจบการทำงาน (รหัส $($worker.ExitCode)): $errDetail"
+                    Write-CrashLog -ErrorRecord ([System.Management.Automation.ErrorRecord]::new(
+                        (New-Object System.Exception($errDetail)), 'WorkerExitedEarly',
+                        [System.Management.Automation.ErrorCategory]::NotSpecified, $null)) -Context 'Worker process stderr' | Out-Null
+                } else {
+                    $hintText.Text = "โปรเซสจบการทำงาน (รหัส $($worker.ExitCode)) - ไม่พบรายละเอียดเพิ่มเติม อาจถูกโปรแกรมป้องกันไวรัสบล็อก"
+                }
                 Play-GuiSound -Kind Error; $timer.Stop()
                 $closeTimer = New-Object System.Windows.Forms.Timer
                 $closeTimer.Interval = 2500
