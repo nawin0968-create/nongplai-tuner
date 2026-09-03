@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
 # Rewritten from the original .cmd to fix reliability issues caused by
 # batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -38,10 +38,12 @@ param(
     [switch]$Worker,
     [switch]$WorkerUi,
     [string]$WorkerAction,
-    [string]$GuiLogPath
+    [string]$GuiLogPath,
+    [ValidateSet('Safe','Balanced','Aggressive')][string]$OptimizationLevel = 'Balanced'
 )
 
 $script:ScriptPath = $MyInvocation.MyCommand.Path
+$script:OptimizationLevel = $OptimizationLevel
 
 # When loaded with irm | iex, persist the in-memory script so elevated and GUI
 # worker processes can relaunch the same code.
@@ -2987,12 +2989,92 @@ function Invoke-ExportReport {
 # ===========================================================================
 # v2.0 — DO EVERYTHING (Legacy Apply Ultra + Hardware Scan + Adaptive Deep Tweaks, one shot)
 # ===========================================================================
+# ===========================================================================
+# AGGRESSIVE OPTIMIZATION MODULE
+# ===========================================================================
+function Invoke-AggressiveOptimization {
+    Write-Host ""
+    Write-Host "════ AGGRESSIVE OPTIMIZATIONS ════" -ForegroundColor Red
+    
+    try {
+        # 1. Disable Visual Effects completely
+        Write-Host "🎨 Disabling visual effects..." -ForegroundColor Cyan
+        Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 2 'DWord'
+        
+        # 2. Disable Aero (max performance)
+        Write-Host "⚡ Disabling Aero transparency..." -ForegroundColor Cyan
+        Set-Reg 'HKCU:\Software\Microsoft\Windows\DWM' 'EnableAeroPeek' 0 'DWord'
+        
+        # 3. Aggressive memory management
+        Write-Host "🧠 Aggressive memory management..." -ForegroundColor Cyan
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'ClearPageFileAtShutdown' 1 'DWord'
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'LargeSystemCache' 1 'DWord'
+        
+        # 4. Disable unnecessary services (aggressive)
+        Write-Host "🔌 Disabling unnecessary services..." -ForegroundColor Cyan
+        $aggressiveServices = @(
+            'DiagTrack'           # Diagnostic Tracking
+            'dmwappushservice'    # DMW App Push
+            'MapsBrokerService'   # Maps
+            'lfsvc'               # Geolocation
+            'SharedAccess'        # ICS (Internet Connection Sharing)
+            'WSearch'             # Windows Search (can be re-enabled manually)
+            'bthserv'             # Bluetooth (if not using)
+        )
+        foreach ($svc in $aggressiveServices) {
+            try {
+                $s = Get-Service $svc -EA SilentlyContinue
+                if ($s) {
+                    Stop-Service $svc -Force -EA SilentlyContinue
+                    Set-Service $svc -StartupType Disabled -EA SilentlyContinue
+                    Write-Host "  ✓ $svc disabled" -ForegroundColor Green
+                }
+            } catch {}
+        }
+        
+        # 5. Aggressive network tweaks
+        Write-Host "🌐 Aggressive network optimization..." -ForegroundColor Cyan
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'TcpAckFrequency' 1 'DWord'
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'TCPNoDelay' 1 'DWord'
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'MaxUserPort' 65534 'DWord'
+        
+        # 6. Disable cortana indexing
+        Write-Host "🔍 Disabling Cortana indexing..." -ForegroundColor Cyan
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'AllowCortana' 0 'DWord'
+        
+        # 7. Game Mode tweaks
+        Write-Host "🎮 Enforcing Game Mode..." -ForegroundColor Cyan
+        Set-Reg 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled' 1 'DWord'
+        Set-Reg 'HKCU:\Software\Microsoft\GameBar' 'GamePanelStartupToken' 1 'DWord'
+        
+        # 8. Disable notifications
+        Write-Host "📢 Disabling notifications..." -ForegroundColor Cyan
+        Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings' 'NOC_GLOBAL_SETTING_TOASTS_ENABLED' 0 'DWord'
+        
+        Write-Host "✅ Aggressive optimizations applied" -ForegroundColor Green
+    } catch {
+        Write-Warn2 "Some aggressive tweaks failed: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-DoEverything {
     Clear-Host
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  NONGPLAISHOP - APPLY EVERYTHING (Ultra + Adaptive Deep Tweak)" -ForegroundColor Cyan
+    Write-Host "  📊 Optimization Level: $script:OptimizationLevel" -ForegroundColor Yellow
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     if ($script:DryRun) { Write-Warn2 "DRY RUN MODE - preview only, nothing will actually be changed" }
+    Write-Host ""
+    
+    # Apply level-specific tweaks
+    if ($script:OptimizationLevel -eq 'Aggressive') {
+        Write-Host "🔥 Applying AGGRESSIVE optimization tweaks..." -ForegroundColor Red
+        Invoke-AggressiveOptimization
+    } elseif ($script:OptimizationLevel -eq 'Balanced') {
+        Write-Host "⚙️ Applying BALANCED optimization tweaks..." -ForegroundColor Yellow
+    } else {
+        Write-Host "🛡️ Applying SAFE optimization tweaks (conservative)..." -ForegroundColor Green
+    }
     Write-Host ""
 
     # --- Part 1: full legacy 39-step Apply Ultra (creates backup folder + restore point) ---
