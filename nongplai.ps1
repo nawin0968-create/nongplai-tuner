@@ -3573,7 +3573,7 @@ function Show-WorkerProgressWpf {
     $openBackupBtn = New-Object System.Windows.Forms.Button
     $openBackupBtn.Text = 'เปิดโฟลเดอร์ Backup'
     $openBackupBtn.Size = New-Object System.Drawing.Size(180, 30)
-    $openBackupBtn.Location = New-Object System.Drawing.Point(240, 245)
+    $openBackupBtn.Location = New-Object System.Drawing.Point(178, 245)
     $openBackupBtn.FlatStyle = 'Flat'
     $openBackupBtn.FlatAppearance.BorderColor = $accentGold
     $openBackupBtn.BackColor = [System.Drawing.Color]::FromArgb(38,39,48)
@@ -3584,6 +3584,21 @@ function Show-WorkerProgressWpf {
         try { if ($openBackupBtn.Tag) { Start-Process 'explorer.exe' -ArgumentList $openBackupBtn.Tag } } catch {}
     }.GetNewClosure())
     $panel.Controls.Add($openBackupBtn)
+
+    $closeBtn = New-Object System.Windows.Forms.Button
+    $closeBtn.Text = 'ปิดหน้าต่าง'
+    $closeBtn.Size = New-Object System.Drawing.Size(110, 30)
+    $closeBtn.Location = New-Object System.Drawing.Point(368, 245)
+    $closeBtn.FlatStyle = 'Flat'
+    $closeBtn.FlatAppearance.BorderColor = $accentCyan
+    $closeBtn.BackColor = [System.Drawing.Color]::FromArgb(38,39,48)
+    $closeBtn.ForeColor = $accentCyan
+    $closeBtn.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $closeBtn.Visible = $false
+    $closeBtn.Add_Click({
+        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
+    }.GetNewClosure())
+    $panel.Controls.Add($closeBtn)
 
     $footer = New-Object System.Windows.Forms.Label
     $footer.Text = 'FULL GAMING TUNER  •  DARK DASHBOARD  •  REVERSIBLE BACKUP'
@@ -3623,34 +3638,20 @@ function Show-WorkerProgressWpf {
                     $done = $true; $bar.Value = 100; $percentText.Text = '100%'
                     $stageText.Text = 'เสร็จสมบูรณ์'
                     $summaryTxt = if ($total -gt 0) { "ปรับไปแล้ว $current จาก $total รายการ" } else { 'ทำงานเสร็จสมบูรณ์' }
-                    $hintText.Text = "$summaryTxt - กำลังปิดหน้าต่าง..."
+                    $hintText.Text = $summaryTxt
                     try {
                         $bk = Find-LatestBackup
                         if ($bk) { $openBackupBtn.Tag = $bk; $openBackupBtn.Visible = $true }
                     } catch {}
-                    # Play the completion sound, then give the user a moment to read the
-                    # summary / click "Open Backup Folder" before auto-closing.
+                    # Stay on the 100% screen - the user closes it themselves (button below),
+                    # which then returns to the main menu instead of exiting the app outright.
                     Play-GuiSound -Kind Done
                     $timer.Stop()
-                    $closeTimer = New-Object System.Windows.Forms.Timer
-                    $closeTimer.Interval = 1600
-                    $closeTimer.Add_Tick({
-                        param($sender, $eventArgs)
-                        try { $sender.Stop() } catch {}
-                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
-                    }.GetNewClosure())
-                    $closeTimer.Start()
+                    $closeBtn.Visible = $true
                 } elseif ([string]$evt.type -eq 'error') {
                     $done = $true; $stageText.Text = 'เกิดข้อผิดพลาด'; $hintText.Text = [string]$evt.message
                     Play-GuiSound -Kind Error; $timer.Stop()
-                    $closeTimer = New-Object System.Windows.Forms.Timer
-                    $closeTimer.Interval = 2500
-                    $closeTimer.Add_Tick({
-                        param($sender, $eventArgs)
-                        try { $sender.Stop() } catch {}
-                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
-                    }.GetNewClosure())
-                    $closeTimer.Start()
+                    $closeBtn.Visible = $true
                 }
             }
             if ($null -eq $worker) {
@@ -3673,14 +3674,7 @@ function Show-WorkerProgressWpf {
                     $hintText.Text = "โปรเซสจบการทำงาน (รหัส $($worker.ExitCode)) - ไม่พบรายละเอียดเพิ่มเติม อาจถูกโปรแกรมป้องกันไวรัสบล็อก"
                 }
                 Play-GuiSound -Kind Error; $timer.Stop()
-                $closeTimer = New-Object System.Windows.Forms.Timer
-                $closeTimer.Interval = 2500
-                $closeTimer.Add_Tick({
-                        param($sender, $eventArgs)
-                        try { $sender.Stop() } catch {}
-                        try { if ($null -ne $form -and -not $form.IsDisposed) { $form.Close() } } catch {}
-                    }.GetNewClosure())
-                $closeTimer.Start()
+                $closeBtn.Visible = $true
             }
         } catch {
             try {
@@ -3736,13 +3730,20 @@ if ($HpetToggle) {
 }
 
 try {
-    $sel = Show-MainMenuWpf
-    $uiAction = switch ($sel) { '1' { 'Apply' }; '2' { 'Reset' }; default { $null } }
-    if ($uiAction) {
-        foreach ($openWindow in @([System.Windows.Application]::Current.Windows)) {
-            try { $openWindow.Hide() } catch {}
+    $keepRunning = $true
+    while ($keepRunning) {
+        $sel = Show-MainMenuWpf
+        $uiAction = switch ($sel) { '1' { 'Apply' }; '2' { 'Reset' }; default { $null } }
+        if ($uiAction) {
+            foreach ($openWindow in @([System.Windows.Application]::Current.Windows)) {
+                try { $openWindow.Hide() } catch {}
+            }
+            Show-WorkerProgressWpf -Action $uiAction
+            # Falls through here once the user closes the progress window - loop back
+            # to a fresh main menu instead of exiting the app.
+        } else {
+            $keepRunning = $false
         }
-        Show-WorkerProgressWpf -Action $uiAction
     }
 } catch {
     # Keep failures inside the GUI flow. No console is shown here.
