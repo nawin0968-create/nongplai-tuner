@@ -155,7 +155,7 @@ $script:GuiWorker = [bool]$Worker
 $script:GuiLogPath = $GuiLogPath
 $script:GuiStage = 'startup'
 $script:LegacyStepCount = 0
-$script:LegacyStepTotal = 42  # 39 legacy steps + MMCSS, process priority, and TRIM verification
+$script:LegacyStepTotal = 44  # 39 legacy steps + MMCSS/ProcessPriority/TRIM + NIC-MSI + multi-game
 $script:InputQueueSize = 20
 $script:HwInfo = $null
 $script:GuiReady = $false
@@ -672,6 +672,88 @@ function Get-ActiveAdapter {
     return Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
 }
 
+# ---------------------------------------------------------------------------
+# v2.2: multi-game support (PUBG, VALORANT) alongside FiveM.
+# Same discovery approach as Find-FiveMExe - checks the running process first
+# (most reliable, any install location), then falls back to well-known default
+# install paths on every fixed drive.
+# ---------------------------------------------------------------------------
+function Find-GameExe {
+    param(
+        [Parameter(Mandatory)][string]$ProcessName,   # e.g. 'TslGame' (no .exe)
+        [Parameter(Mandatory)][string[]]$DefaultRelativePaths  # e.g. 'Steam\steamapps\common\PUBG\TslGame\Binaries\Win64\TslGame.exe'
+    )
+    try {
+        $proc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($proc -and $proc.Path) { return $proc.Path }
+    } catch {}
+    try {
+        foreach ($drv in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+            foreach ($rel in $DefaultRelativePaths) {
+                foreach ($progFiles in @('Program Files','Program Files (x86)','')) {
+                    $guess = if ($progFiles) { Join-Path $drv.Root (Join-Path $progFiles $rel) } else { Join-Path $drv.Root $rel }
+                    if (Test-Path $guess) { return $guess }
+                }
+            }
+        }
+    } catch {}
+    return $null
+}
+
+function Get-TargetGames {
+    # AntiCheatSensitive = $true means: skip IFEO CPU/IO/Page-priority + MMCSS registration for
+    # this exe. Kernel-level anti-cheats (Riot Vanguard for VALORANT, and to a lesser extent
+    # BattlEye for PUBG) actively watch for registry-level tampering with their protected game
+    # process and can flag/ban accounts over it. GPU preference, fullscreen-optimization-off,
+    # and Defender exclusions are left/right of the game process itself (Windows-side, not
+    # touching the process's own priority/scheduling) and are safe for all of them.
+    return @(
+        [PSCustomObject]@{ Label='PUBG';     ExeName='TslGame.exe';                     ProcessBase='TslGame';
+            DefaultPaths=@('Steam\steamapps\common\PUBG\TslGame\Binaries\Win64\TslGame.exe');
+            AntiCheatSensitive=$true; AntiCheatName='BattlEye' }
+        [PSCustomObject]@{ Label='VALORANT'; ExeName='VALORANT-Win64-Shipping.exe';      ProcessBase='VALORANT-Win64-Shipping';
+            DefaultPaths=@('Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe');
+            AntiCheatSensitive=$true; AntiCheatName='Riot Vanguard' }
+    )
+}
+
+function Invoke-MultiGameOptimize {
+    # Applies the same class of tweaks FiveM already gets (GPU preference, fullscreen
+    # optimizations off, process-level Defender exclusion) to any other supported game found
+    # on this PC, without touching anything the game's anti-cheat is likely to watch.
+    foreach ($game in (Get-TargetGames)) {
+        $exePath = Find-GameExe -ProcessName $game.ProcessBase -DefaultRelativePaths $game.DefaultPaths
+        if (-not $exePath) {
+            Write-Host "$($game.Label): not found on this PC, skipped"
+            continue
+        }
+        Write-Host "$($game.Label): detected at $exePath"
+
+        # GPU preference (High-performance GPU on laptops with hybrid graphics).
+        Set-Reg 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' $game.ExeName 'GpuPreference=2;' 'String' | Out-Null
+
+        # Fullscreen optimizations off - lets exclusive/borderless fullscreen bypass DWM composition.
+        Set-Reg 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers' $exePath '~ DISABLEDXMAXIMIZEDWINDOWEDMODE HIGHDPIAWARE' 'String' | Out-Null
+
+        # Defender process exclusion - removes real-time per-frame scan overhead.
+        try {
+            Add-MpPreference -ExclusionProcess $game.ExeName -ErrorAction Stop
+            $script:Changes.Add([PSCustomObject]@{ Kind='DefenderExclusionProcess'; Name=$game.ExeName })
+            Write-Host "$($game.Label): Defender process exclusion added"
+        } catch {
+            $script:PendingExclusions.Processes.Add($game.ExeName) | Out-Null
+            Write-Host "$($game.Label): Defender process exclusion skipped (see diagnosis at the end of this run)"
+        }
+
+        if ($game.AntiCheatSensitive) {
+            Write-Host "$($game.Label): skipped CPU/IO priority + MMCSS registration on purpose - $($game.AntiCheatName) treats registry-level process tampering as suspicious and this can risk a ban. Network/system-wide tweaks elsewhere in this run still help $($game.Label)'s latency and 1% lows."
+        } else {
+            Invoke-ProcessPriorityHigh $game.ExeName | Out-Null
+            Invoke-MmcssRegister $game.ExeName | Out-Null
+        }
+    }
+}
+
 function Set-ScheduledTaskDisabled {
     param([Parameter(Mandatory)][string]$TaskPath)
     try {
@@ -857,7 +939,7 @@ function Invoke-ApplyUltra {
     # on this network (previously used the default timeout, which can appear as a "stuck" GUI).
     try { Test-Connection -ComputerName 1.1.1.1 -Count 2 -TimeoutSeconds 2 -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-Host } catch {}
 
-    $script:Total = 42  # v2.1: 39 legacy + 3 new (MMCSS, ProcessPriority, TrimVerify)
+    $script:Total = 44  # v2.2: 39 legacy + MMCSS/ProcessPriority/TrimVerify + NIC-MSI + multi-game (PUBG/VALORANT)
     $n = 0
 
     Invoke-Step (++$n) $Total "Applying background, search, Game DVR, Delivery Optimization, telemetry policies..." {
@@ -1099,6 +1181,29 @@ function Invoke-ApplyUltra {
         } catch { Write-Host "MSI Mode: skipped - $($_.Exception.Message)" }
     }
 
+    Invoke-Step (++$n) $Total "Enabling MSI Mode for the active network adapter (lower/steadier ping)..." {
+        # MSI (Message Signaled Interrupts) lets the NIC interrupt the CPU directly instead of
+        # sharing/polling a legacy IRQ line - this is the single biggest "why is my ping spiky
+        # under load" fix on many boards. Helps every online game equally (PUBG/Valorant/FiveM),
+        # since it works below the game - at the network driver level.
+        try {
+            $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+            if (-not $adapters -or $adapters.Count -eq 0) {
+                Write-Host "NIC MSI Mode: no active physical network adapter found, skipped"
+            } else {
+                foreach ($nic in $adapters) {
+                    try {
+                        $pnp = Get-PnpDevice -InstanceId $nic.PnPDeviceID -ErrorAction SilentlyContinue
+                        if (-not $pnp) { continue }
+                        $devPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($nic.PnPDeviceID)\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties"
+                        Set-Reg $devPath 'MSISupported' 1 'DWord' | Out-Null
+                        Write-Host "NIC MSI Mode: enabled for $($nic.Name) ($($nic.InterfaceDescription))"
+                    } catch { Write-Log "  ! NIC MSI mode failed for $($nic.Name): $($_.Exception.Message)" }
+                }
+            }
+        } catch { Write-Host "NIC MSI Mode: skipped - $($_.Exception.Message)" }
+    }
+
     Invoke-Step (++$n) $Total "Setting NVIDIA Low Latency Mode (if NVIDIA GPU present)..." {
         try {
             $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'NVIDIA' }
@@ -1168,6 +1273,10 @@ function Invoke-ApplyUltra {
                 Write-Host "Process exclusion: $gtaName skipped (see diagnosis at the end of this run)"
             }
         }
+    }
+
+    Invoke-Step (++$n) $Total "Applying the same GPU/fullscreen/Defender tweaks for other detected games (PUBG, VALORANT)..." {
+        Invoke-MultiGameOptimize
     }
 
     Invoke-Step (++$n) $Total "Tuning TCP ephemeral port range and TIME_WAIT delay..." {
@@ -1778,7 +1887,8 @@ function Invoke-RemoveDefenderPolicy {
 function Invoke-MmcssRegister {
     param([string]$ProcessName = 'FiveM.exe')
     try {
-        $taskPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\FiveM'
+        $taskLabel = $ProcessName -replace '\.exe$', ''
+        $taskPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\$taskLabel"
         $keyExisted = Test-Path $taskPath
         if ($script:DryRun) {
             Write-Host ("  [DRYRUN] would register {0} to MMCSS with High priority" -f $ProcessName) -ForegroundColor DarkCyan
@@ -1790,14 +1900,18 @@ function Invoke-MmcssRegister {
         Set-Reg "$taskPath" 'Priority' 8 'DWord' | Out-Null  # High Priority in multimedia class
         Set-Reg "$taskPath" 'GPU Priority' 8 'DWord' | Out-Null
         Set-Reg "$taskPath" 'Latency Sensitive' 1 'DWord' | Out-Null
-        Set-Reg "$taskPath\Process" 'FiveM.exe' '' 'String' | Out-Null
-        $gtaName = Find-GtaProcessName
-        if ($gtaName) {
-            Set-Reg "$taskPath\Process" $gtaName '' 'String' | Out-Null
-            Write-Ok "MMCSS registered: FiveM.exe + $gtaName with High Priority, Latency Sensitive=1"
-        } else {
-            Write-Ok "MMCSS registered: FiveM.exe with High Priority, Latency Sensitive=1"
+        Set-Reg "$taskPath\Process" $ProcessName '' 'String' | Out-Null
+        # FiveM specifically also runs a second process (GTAProcess.exe) that needs the same
+        # treatment - every other supported game is a single process, so this is a no-op for them.
+        if ($ProcessName -eq 'FiveM.exe') {
+            $gtaName = Find-GtaProcessName
+            if ($gtaName) {
+                Set-Reg "$taskPath\Process" $gtaName '' 'String' | Out-Null
+                Write-Ok "MMCSS registered: FiveM.exe + $gtaName with High Priority, Latency Sensitive=1"
+                return $true
+            }
         }
+        Write-Ok "MMCSS registered: $ProcessName with High Priority, Latency Sensitive=1"
         return $true
     } catch {
         Write-Log ("  ! MMCSS registration failed: {0}" -f $_.Exception.Message)
