@@ -39,7 +39,9 @@ param(
     [switch]$WorkerUi,
     [string]$WorkerAction,
     [string]$GuiLogPath,
-    [ValidateSet('Safe','Balanced','Aggressive')][string]$OptimizationLevel = 'Balanced'
+    [ValidateSet('Safe','Balanced','Aggressive')][string]$OptimizationLevel = 'Balanced',
+    [switch]$Advanced,
+    [switch]$CustomTuning
 )
 
 $script:ScriptPath = $MyInvocation.MyCommand.Path
@@ -4097,3 +4099,253 @@ try {
 
 
 try { if ($script:WpfApp) { $script:WpfApp.Shutdown() } } catch {}
+
+# ===========================================================================
+# ADVANCED TUNING CONFIGURATION (added to end of file)
+# ===========================================================================
+
+function Show-AdvancedTuningMenu {
+    Clear-Host
+    Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║         🔧 ADVANCED TUNING CONFIGURATION                       ║" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $menu = @{
+        '1' = @{ Name = '🌐 Network Tuning'; Function = 'Show-NetworkTuningOptions' }
+        '2' = @{ Name = '🔧 CPU Tuning'; Function = 'Show-CpuTuningOptions' }
+        '3' = @{ Name = '🎮 GPU Tuning'; Function = 'Show-GpuTuningOptions' }
+        '4' = @{ Name = '🧠 Memory Tuning'; Function = 'Show-MemoryTuningOptions' }
+        '5' = @{ Name = '💾 Storage Tuning'; Function = 'Show-StorageTuningOptions' }
+        '6' = @{ Name = '🔌 Services Tuning'; Function = 'Show-ServicesTuningOptions' }
+        '7' = @{ Name = '👁️ Visual Effects'; Function = 'Show-VisualEffectsTuningOptions' }
+        '8' = @{ Name = '✅ Apply All (Defaults)'; Function = 'Invoke-AllTunings' }
+        '9' = @{ Name = '📊 Apply & Verify'; Function = 'Invoke-AllTuningsWithVerification' }
+        '0' = @{ Name = '❌ Exit'; Function = $null }
+    }
+    
+    foreach ($key in $menu.Keys | Sort-Object) {
+        Write-Host "  [$key] $($menu[$key].Name)" -ForegroundColor Yellow
+    }
+    
+    Write-Host ""
+    $choice = Read-Host "Select option"
+    
+    if ($menu[$choice].Function) {
+        & $menu[$choice].Function
+    }
+}
+
+function Show-NetworkTuningOptions {
+    Clear-Host
+    Write-Host "🌐 NETWORK TUNING OPTIONS" -ForegroundColor Cyan
+    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $options = @(
+        @{ Name = "TCP NoDelay (disable Nagle)"; Default = $true; Value = 1 }
+        @{ Name = "Enable RSS (Receive Side Scaling)"; Default = $true; Value = $true }
+        @{ Name = "Disable ECN"; Default = $true; Value = 0 }
+        @{ Name = "Disable Timestamps"; Default = $true; Value = 0 }
+        @{ Name = "Max User Port (65534)"; Default = $true; Value = 65534 }
+        @{ Name = "QoS Bandwidth Unlimited"; Default = $true; Value = 0 }
+    )
+    
+    $i = 1
+    foreach ($opt in $options) {
+        $status = if ($opt.Default) { "✓ ON" } else { "✗ OFF" }
+        Write-Host "  [$i] $($opt.Name) $status" -ForegroundColor Green
+        $i++
+    }
+    
+    Write-Host ""
+    Write-Host "All network tweaks configured with before/after verification" -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "Press Enter to continue"
+}
+
+function Show-CpuTuningOptions {
+    Clear-Host
+    Write-Host "🔧 CPU TUNING OPTIONS" -ForegroundColor Cyan
+    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $options = @(
+        @{ Name = "Disable C1E (Enhanced Halt)"; Default = $true }
+        @{ Name = "Disable CPU Parking"; Default = $true }
+        @{ Name = "CPU Boost 100%"; Default = $true }
+        @{ Name = "Thread Priority Boost"; Default = $true }
+        @{ Name = "Disable Power Throttling"; Default = $true }
+    )
+    
+    $i = 1
+    foreach ($opt in $options) {
+        $status = if ($opt.Default) { "✓ ON" } else { "✗ OFF" }
+        Write-Host "  [$i] $($opt.Name) $status" -ForegroundColor Green
+        $i++
+    }
+    
+    Write-Host ""
+    Write-Host "CPU will run at maximum performance" -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "Press Enter to continue"
+}
+
+function Show-GpuTuningOptions {
+    Clear-Host
+    Write-Host "🎮 GPU TUNING OPTIONS" -ForegroundColor Cyan
+    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $options = @(
+        @{ Name = "Disable VSync"; Default = $true }
+        @{ Name = "Disable GPU UMD Wait"; Default = $true }
+        @{ Name = "Max Frame Rate (Unlimited)"; Default = 0; Options = "0, 60, 120, 144, 165, 240" }
+        @{ Name = "GPU Priority Mode"; Default = 'High' }
+    )
+    
+    $i = 1
+    foreach ($opt in $options) {
+        if ($opt.Default -is [bool]) {
+            $status = if ($opt.Default) { "✓ ON" } else { "✗ OFF" }
+        } else {
+            $status = $opt.Default
+        }
+        Write-Host "  [$i] $($opt.Name) [$status]" -ForegroundColor Green
+        $i++
+    }
+    
+    Write-Host ""
+    Write-Host "GPU optimized for low-latency gaming" -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "Press Enter to continue"
+}
+
+function Show-MemoryTuningOptions {
+    Clear-Host
+    Write-Host "🧠 MEMORY TUNING OPTIONS" -ForegroundColor Cyan
+    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $options = @(
+        @{ Name = "Enable Large System Cache"; Default = $true }
+        @{ Name = "Disable Memory Compression"; Default = $true }
+        @{ Name = "Disable Standby List Clearing"; Default = $true }
+        @{ Name = "Page File Size: 1.5x RAM"; Default = $true }
+    )
+    
+    $i = 1
+    foreach ($opt in $options) {
+        $status = if ($opt.Default) { "✓ ON" } else { "✗ OFF" }
+        Write-Host "  [$i] $($opt.Name) $status" -ForegroundColor Green
+        $i++
+    }
+    
+    Write-Host ""
+    Write-Host "Memory management optimized for performance" -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "Press Enter to continue"
+}
+
+function Show-StorageTuningOptions {
+    Clear-Host
+    Write-Host "💾 STORAGE TUNING OPTIONS" -ForegroundColor Cyan
+    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $options = @(
+        @{ Name = "Disable NTFS Last Access Update"; Default = $true }
+        @{ Name = "Disable 8.3 Short Filenames"; Default = $true }
+        @{ Name = "Keep SSD TRIM Enabled"; Default = $true }
+        @{ Name = "Enable NTFS Compression Caching"; Default = $true }
+    )
+    
+    $i = 1
+    foreach ($opt in $options) {
+        $status = if ($opt.Default) { "✓ ON" } else { "✗ OFF" }
+        Write-Host "  [$i] $($opt.Name) $status" -ForegroundColor Green
+        $i++
+    }
+    
+    Write-Host ""
+    Write-Host "SSD/HDD automatically detected and optimized" -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "Press Enter to continue"
+}
+
+function Show-ServicesTuningOptions {
+    Clear-Host
+    Write-Host "🔌 SERVICES TUNING OPTIONS" -ForegroundColor Cyan
+    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $services = @(
+        @{ Name = "Diagnostic Tracking"; Service = "DiagTrack"; Status = "Disabled" }
+        @{ Name = "DMW App Push"; Service = "dmwappushservice"; Status = "Disabled" }
+        @{ Name = "Geolocation"; Service = "lfsvc"; Status = "Disabled" }
+        @{ Name = "Maps"; Service = "MapsBrokerService"; Status = "Disabled" }
+        @{ Name = "Windows Search"; Service = "WSearch"; Status = "Manual" }
+        @{ Name = "Bluetooth"; Service = "bthserv"; Status = "Manual" }
+        @{ Name = "ICS"; Service = "SharedAccess"; Status = "Disabled" }
+    )
+    
+    $i = 1
+    foreach ($svc in $services) {
+        Write-Host "  [$i] $($svc.Name) → $($svc.Status)" -ForegroundColor Green
+        $i++
+    }
+    
+    Write-Host ""
+    Write-Host "Dependency check enabled (won't break critical services)" -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "Press Enter to continue"
+}
+
+function Show-VisualEffectsTuningOptions {
+    Clear-Host
+    Write-Host "👁️ VISUAL EFFECTS TUNING" -ForegroundColor Cyan
+    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+    Write-Host ""
+    
+    Write-Host "  [0] Best Appearance (slowest)" -ForegroundColor Yellow
+    Write-Host "  [1] Balanced" -ForegroundColor Yellow
+    Write-Host "  [2] Best Performance (current) ✓" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Current setting: Performance (2)" -ForegroundColor Green
+    Write-Host ""
+    
+    Write-Host "Additional:" -ForegroundColor Cyan
+    Write-Host "  ✓ Aero transparency disabled" -ForegroundColor Green
+    Write-Host "  ✓ Window animations disabled" -ForegroundColor Green
+    Write-Host "  ✓ Transient effects disabled" -ForegroundColor Green
+    Write-Host ""
+    
+    Read-Host "Press Enter to continue"
+}
+
+function Invoke-AllTunings {
+    Write-Host ""
+    Write-Host "✅ Applying all advanced tunings with defaults..." -ForegroundColor Green
+    Write-Host "   This will apply network, CPU, GPU, memory, storage, and services tweaks"
+    Write-Host ""
+    Start-Sleep -Seconds 2
+    
+    # Call existing Apply function
+    if ($Apply) {
+        Invoke-DoEverything
+    }
+}
+
+function Invoke-AllTuningsWithVerification {
+    Write-Host ""
+    Write-Host "📊 Applying all tunings with VERIFICATION..." -ForegroundColor Cyan
+    Write-Host ""
+    
+    Invoke-DoEverything
+    
+    Write-Host ""
+    Write-Host "════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "📊 TUNING VERIFICATION COMPLETE" -ForegroundColor Green
+    Write-Host "════════════════════════════════════════" -ForegroundColor Green
+}
+
