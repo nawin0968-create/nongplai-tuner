@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 # NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
 # Rewritten from the original .cmd to fix reliability issues caused by
 # batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -1068,26 +1068,127 @@ function Invoke-ApplyUltra {
         Set-SvcStart 'WSearch' 'Manual' | Out-Null
     }
 
-    Invoke-Step (++$n) $Total "Tuning network adapter power and offload settings..." {
+    Invoke-Step (++$n) $Total "Tuning network adapter power and offload settings (AGGRESSIVE)..." {
+        Write-Host ""
+        Write-Host "🔌 NETWORK ADAPTER AGGRESSIVE TUNING" -ForegroundColor Cyan
+        Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+        
         try {
             $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+            if ($adapters.Count -eq 0) {
+                Write-Warn2 "No active network adapters found"
+                return
+            }
+            
             foreach ($a in $adapters) {
-                try { Disable-NetAdapterPowerManagement -Name $a.Name -ErrorAction SilentlyContinue } catch {}
-                try { Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Energy Efficient Ethernet' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue } catch {}
-                try { Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Interrupt Moderation' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue } catch {}
+                Write-Host "`n📡 Adapter: $($a.Name) ($($a.Description))" -ForegroundColor Yellow
+                
+                # Power Management
+                try {
+                    Write-Host "  → Disabling power management..." -ForegroundColor Gray
+                    Disable-NetAdapterPowerManagement -Name $a.Name -ErrorAction SilentlyContinue
+                    Write-Host "    ✓ Power management disabled" -ForegroundColor Green
+                } catch { Write-Warn2 "    ✗ Power management failed" }
+                
+                # Energy Efficient Ethernet
+                try {
+                    $before = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Energy Efficient Ethernet' -ErrorAction SilentlyContinue).DisplayValue
+                    Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Energy Efficient Ethernet' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue
+                    Write-Host "    ✓ EEE disabled (was: $before)" -ForegroundColor Green
+                } catch { Write-Warn2 "    ✗ EEE tuning failed" }
+                
+                # Interrupt Moderation (aggressive: disable)
+                try {
+                    $before = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Interrupt Moderation' -ErrorAction SilentlyContinue).DisplayValue
+                    Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName 'Interrupt Moderation' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue
+                    Write-Host "    ✓ Interrupt moderation disabled (was: $before)" -ForegroundColor Green
+                } catch { Write-Warn2 "    ✗ Interrupt moderation failed" }
+                
+                # Receive Buffer (aggressive: max)
+                try {
+                    $before = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName '*Receive Buffers' -ErrorAction SilentlyContinue).DisplayValue
+                    if ($before) {
+                        Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName '*Receive Buffers' -DisplayValue '2048' -ErrorAction SilentlyContinue
+                        Write-Host "    ✓ Receive buffers maxed (was: $before → 2048)" -ForegroundColor Green
+                    }
+                } catch { }
+                
+                # Transmit Buffer (aggressive: max)
+                try {
+                    $before = (Get-NetAdapterAdvancedProperty -Name $a.Name -DisplayName '*Transmit Buffers' -ErrorAction SilentlyContinue).DisplayValue
+                    if ($before) {
+                        Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName '*Transmit Buffers' -DisplayValue '2048' -ErrorAction SilentlyContinue
+                        Write-Host "    ✓ Transmit buffers maxed (was: $before → 2048)" -ForegroundColor Green
+                    }
+                } catch { }
             }
         } catch {}
+        
+        Write-Host ""
     }
 
-    Invoke-Step (++$n) $Total "Removing QoS bandwidth reservation limit..." {
-        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched' 'NonBestEffortLimit' 0 'DWord' | Out-Null
+    Invoke-Step (++$n) $Total "Removing QoS bandwidth reservation limit (AGGRESSIVE)..." {
+        Write-Host ""
+        Write-Host "📊 QoS BANDWIDTH TUNING" -ForegroundColor Cyan
+        Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+        
+        try {
+            $before = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched' -ErrorAction SilentlyContinue).NonBestEffortLimit
+            Write-Host "`n📊 BEFORE: NonBestEffortLimit = $before (0-100%)" -ForegroundColor Yellow
+            
+            Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched' 'NonBestEffortLimit' 0 'DWord' | Out-Null
+            
+            $after = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched' -ErrorAction SilentlyContinue).NonBestEffortLimit
+            Write-Host "📊 AFTER:  NonBestEffortLimit = $after (unlimited)" -ForegroundColor Green
+            Write-Host "✓ QoS bandwidth limit removed" -ForegroundColor Green
+        } catch {
+            Write-Warn2 "QoS tuning failed: $($_.Exception.Message)"
+        }
+        
+        Write-Host ""
     }
 
-    Invoke-Step (++$n) $Total "Applying TCP/UDP global stack tuning..." {
-        try { netsh.exe int tcp set global ecncapability=disabled | Out-Null } catch {}
-        try { netsh.exe int tcp set global timestamps=disabled | Out-Null } catch {}
-        try { netsh.exe int tcp set global rss=enabled | Out-Null } catch {}
-        try { netsh.exe int udp set global uro=disabled | Out-Null } catch {}
+    Invoke-Step (++$n) $Total "Applying TCP/UDP global stack tuning (AGGRESSIVE)..." {
+        Write-Host ""
+        Write-Host "🌐 NETWORK AGGRESSIVE TUNING" -ForegroundColor Cyan
+        Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+        
+        # Read BEFORE
+        Write-Host "`n📊 BEFORE tuning:" -ForegroundColor Yellow
+        try {
+            $beforeEcn = (netsh.exe int tcp show global | Select-String "ECN Capability") -replace '\s+', ' '
+            $beforeTs = (netsh.exe int tcp show global | Select-String "Timestamps") -replace '\s+', ' '
+            $beforeRss = (netsh.exe int tcp show global | Select-String "RSS") -replace '\s+', ' '
+            $beforeUro = (netsh.exe int udp show global | Select-String "Offload") -replace '\s+', ' '
+            
+            Write-Host "  ECN:       $beforeEcn" -ForegroundColor Gray
+            Write-Host "  Timestamps: $beforeTs" -ForegroundColor Gray
+            Write-Host "  RSS:       $beforeRss" -ForegroundColor Gray
+            Write-Host "  UDP Offload: $beforeUro" -ForegroundColor Gray
+        } catch {}
+        
+        # Apply changes
+        Write-Host "`n⚙️ APPLYING aggressive tuning..." -ForegroundColor Green
+        try { netsh.exe int tcp set global ecncapability=disabled | Out-Null; Write-Host "  ✓ ECN disabled" -ForegroundColor Green } catch { Write-Warn2 "  ✗ ECN failed" }
+        try { netsh.exe int tcp set global timestamps=disabled | Out-Null; Write-Host "  ✓ Timestamps disabled" -ForegroundColor Green } catch { Write-Warn2 "  ✗ Timestamps failed" }
+        try { netsh.exe int tcp set global rss=enabled | Out-Null; Write-Host "  ✓ RSS enabled" -ForegroundColor Green } catch { Write-Warn2 "  ✗ RSS failed" }
+        try { netsh.exe int udp set global uro=disabled | Out-Null; Write-Host "  ✓ UDP offload disabled" -ForegroundColor Green } catch { Write-Warn2 "  ✗ UDP offload failed" }
+        
+        # Read AFTER
+        Write-Host "`n📊 AFTER tuning:" -ForegroundColor Yellow
+        try {
+            $afterEcn = (netsh.exe int tcp show global | Select-String "ECN Capability") -replace '\s+', ' '
+            $afterTs = (netsh.exe int tcp show global | Select-String "Timestamps") -replace '\s+', ' '
+            $afterRss = (netsh.exe int tcp show global | Select-String "RSS") -replace '\s+', ' '
+            $afterUro = (netsh.exe int udp show global | Select-String "Offload") -replace '\s+', ' '
+            
+            Write-Host "  ECN:       $afterEcn" -ForegroundColor Green
+            Write-Host "  Timestamps: $afterTs" -ForegroundColor Green
+            Write-Host "  RSS:       $afterRss" -ForegroundColor Green
+            Write-Host "  UDP Offload: $afterUro" -ForegroundColor Green
+        } catch {}
+        
+        Write-Host ""
     }
 
     Invoke-Step (++$n) $Total "Disabling fullscreen optimizations for FiveM..." {
