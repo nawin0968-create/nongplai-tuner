@@ -1,5 +1,5 @@
-#requires -Version 5.1
-# NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
+﻿# NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
+# Requires Windows PowerShell 5.1 or later (built into Windows 10/11 by default).
 # Rewritten from the original .cmd to fix reliability issues caused by
 # batch's fragile multi-line parsing and by spawning a fresh powershell.exe
 # process for almost every step. This version runs as a single PowerShell
@@ -26,23 +26,55 @@
 #
 # หมายเหตุ: สคริปต์นี้ออกแบบให้เปิดจากไฟล์ nongplai.ps1 ที่บันทึกอยู่ในเครื่องเท่านั้น
 
-param(
-    [switch]$Apply,
-    [switch]$Reset,
-    [switch]$Scan,
-    [switch]$Report,
-    [switch]$NoGui,
-    [switch]$Help,
-    [switch]$HpetToggle,
-    [switch]$DryRun,
-    [switch]$Worker,
-    [switch]$WorkerUi,
-    [string]$WorkerAction,
-    [string]$GuiLogPath,
-    [ValidateSet('Safe','Balanced','Aggressive')][string]$OptimizationLevel = 'Balanced',
-    [switch]$Advanced,
-    [switch]$CustomTuning
-)
+# --- Manual argument parsing (NOT using param()) ---------------------------
+# This script deliberately does NOT use a formal param() block. param() must
+# be the literal first statement in the file, and if a stray UTF-8 BOM
+# character ever leaks into the executed text (this happens under some
+# invocation paths - right-click "Run with PowerShell", `irm | iex`, etc,
+# which use -Command semantics instead of -File), the corrupted first
+# "statement" bumps param() out of first position and the whole file fails
+# to parse. Reading $args manually has no such positional requirement, so a
+# leaked BOM only ever produces one harmless, non-fatal error on line 1
+# instead of breaking the entire script. See also the header note above.
+function Test-SwitchArg { param([string]$Name) return ($args -contains "-$Name") }
+$script:RawScriptArgs = @($args)
+$Apply             = $args -contains '-Apply'
+$Reset             = $args -contains '-Reset'
+$Scan              = $args -contains '-Scan'
+$Report            = $args -contains '-Report'
+$NoGui             = $args -contains '-NoGui'
+$Help              = $args -contains '-Help'
+$HpetToggle        = $args -contains '-HpetToggle'
+$DryRun            = $args -contains '-DryRun'
+$NetworkDiagnose   = $args -contains '-NetworkDiagnose'
+$NetworkCustom     = $args -contains '-NetworkCustom'
+$Worker            = $args -contains '-Worker'
+$WorkerUi          = $args -contains '-WorkerUi'
+$Advanced          = $args -contains '-Advanced'
+$CustomTuning      = $args -contains '-CustomTuning'
+# This build is intentionally console-only. All tuning and backup functions
+# remain available; only the WPF/WinForms presentation layer is bypassed.
+$ConsoleOnly       = $true
+$NoGui             = $true
+function Get-NamedArgValue {
+    param([string]$Name, [string]$Default = '')
+    # `$args inside this function contains only unnamed arguments passed to the
+    # function, not the script's original command-line arguments. The worker
+    # launcher passes -WorkerAction and -GuiLogPath as script arguments, so read
+    # the captured script-level array instead.
+    for ($i = 0; $i -lt $script:RawScriptArgs.Count - 1; $i++) {
+        if ([string]$script:RawScriptArgs[$i] -ieq "-$Name") {
+            return [string]$script:RawScriptArgs[$i + 1]
+        }
+    }
+    return $Default
+}
+$WorkerAction      = Get-NamedArgValue -Name 'WorkerAction' -Default ''
+$GuiLogPath        = Get-NamedArgValue -Name 'GuiLogPath' -Default ''
+$OptimizationLevel = Get-NamedArgValue -Name 'OptimizationLevel' -Default 'Balanced'
+if ($OptimizationLevel -notin @('Safe','Balanced','Aggressive')) { $OptimizationLevel = 'Balanced' }
+if ($WorkerAction -and $WorkerAction -notin @('','Apply','Reset','Scan','Hpet','Report','NetworkDiagnose','NetworkCustom')) { $WorkerAction = '' }
+# -----------------------------------------------------------------------------
 
 $script:ScriptPath = $MyInvocation.MyCommand.Path
 $script:OptimizationLevel = $OptimizationLevel
@@ -53,7 +85,7 @@ if ([string]::IsNullOrWhiteSpace($script:ScriptPath)) {
     $inlineScript = $null
     $sourceVariable = $null
     try { $sourceVariable = $ExecutionContext.SessionState.PSVariable.Get('s').Value } catch {}
-    if ($sourceVariable -is [string] -and $sourceVariable -match '(?s)#requires.*param\(') {
+    if ($sourceVariable -is [string] -and $sourceVariable -match '(?s)NongPlaiShop.*function Invoke-ApplyUltra') {
         $inlineScript = $sourceVariable
     }
     if ([string]::IsNullOrWhiteSpace($inlineScript)) {
@@ -90,15 +122,17 @@ if (-not (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
 $currentId = [Security.Principal.WindowsIdentity]::GetCurrent()
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal($currentId)
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $launchConsole = [bool]($Apply -or $Reset -or $Scan -or $Report -or $HpetToggle -or $Help -or $NoGui)
+    $launchConsole = [bool]($Apply -or $Reset -or $Scan -or $Report -or $HpetToggle -or $NetworkDiagnose -or $NetworkCustom -or $Help -or $NoGui)
     $launcherPowerShell = Join-Path $PSHOME 'powershell.exe'
     if (-not (Test-Path $launcherPowerShell)) { $launcherPowerShell = 'powershell.exe' }
-    $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ScriptPath)`"")
+    $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $($script:ScriptPath))
     if (-not $launchConsole -or $Worker -or $WorkerUi) { $argList += @('-WindowStyle', 'Hidden') }
     if ($Apply) { $argList += '-Apply' }
     if ($Reset) { $argList += '-Reset' }
     if ($Scan) { $argList += '-Scan' }
     if ($Report) { $argList += '-Report' }
+    if ($NetworkDiagnose) { $argList += '-NetworkDiagnose' }
+    if ($NetworkCustom) { $argList += '-NetworkCustom' }
     if ($NoGui) { $argList += '-NoGui' }
     if ($Help) { $argList += '-Help' }
     if ($HpetToggle) { $argList += '-HpetToggle' }
@@ -159,7 +193,7 @@ $script:GuiWorker = [bool]$Worker
 $script:GuiLogPath = $GuiLogPath
 $script:GuiStage = 'startup'
 $script:LegacyStepCount = 0
-$script:LegacyStepTotal = 44  # 39 legacy steps + MMCSS/ProcessPriority/TRIM + NIC-MSI + multi-game
+$script:LegacyStepTotal = 48  # 39 legacy + MMCSS/ProcessPriority/TRIM + NIC-MSI + multi-game + v2.2 (DynamicTick/CState, USB-MSI, NetThrottle)
 $script:InputQueueSize = 20
 $script:HwInfo = $null
 $script:GuiReady = $false
@@ -167,12 +201,14 @@ $script:PowerShellExe = Get-PowerShellExePath
 
 function Get-RequestedAction {
     $selected = New-Object System.Collections.Generic.List[string]
-    if ($Apply)      { $selected.Add('Apply') }
-    if ($Reset)      { $selected.Add('Reset') }
-    if ($Scan)       { $selected.Add('Scan') }
-    if ($Report)     { $selected.Add('Report') }
-    if ($HpetToggle) { $selected.Add('Hpet') }
-    if ($Help)       { $selected.Add('Help') }
+    if ($Apply)            { $selected.Add('Apply') }
+    if ($Reset)            { $selected.Add('Reset') }
+    if ($Scan)             { $selected.Add('Scan') }
+    if ($Report)           { $selected.Add('Report') }
+    if ($HpetToggle)       { $selected.Add('Hpet') }
+    if ($NetworkDiagnose)  { $selected.Add('NetworkDiagnose') }
+    if ($NetworkCustom)    { $selected.Add('NetworkCustom') }
+    if ($Help)             { $selected.Add('Help') }
     if ($selected.Count -gt 1) {
         throw ('ระบุคำสั่งมากกว่าหนึ่งแบบพร้อมกันไม่ได้: ' + ($selected -join ', '))
     }
@@ -201,6 +237,12 @@ function Show-Usage {
     Write-Host ""
     Write-Host "  powershell -ExecutionPolicy Bypass -File .\nongplai.ps1 -HpetToggle"
     Write-Host "      เปิดเมนู HPET"
+    Write-Host ""
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\nongplai.ps1 -NetworkDiagnose"
+    Write-Host "      ตรวจค่าเครือข่ายอย่างเดียว ไม่แก้ระบบ"
+    Write-Host ""
+    Write-Host "  powershell -ExecutionPolicy Bypass -File .\nongplai.ps1 -NetworkCustom"
+    Write-Host "      ตั้งค่าเครือข่ายแบบเลือกเอง พร้อม snapshot/restore"
     Write-Host ""
     Write-Host "  ตัวเลือกเสริม: -DryRun, -NoGui, -Help" -ForegroundColor DarkGray
     Write-Host ""
@@ -231,7 +273,7 @@ function Initialize-GuiRuntime {
 }
 
 $script:RequestedAction = Get-RequestedAction
-$script:ExplicitConsoleMode = [bool]($Apply -or $Reset -or $Scan -or $Report -or $HpetToggle -or $Help -or $NoGui)
+$script:ExplicitConsoleMode = [bool]($Apply -or $Reset -or $Scan -or $Report -or $HpetToggle -or $NetworkDiagnose -or $NetworkCustom -or $Help -or $NoGui)
 
 function Show-MainMenuConsole {
     while ($true) {
@@ -241,20 +283,12 @@ function Show-MainMenuConsole {
         Write-BoxDivider
         Write-MenuItem -Key '1' -Label 'APPLY EVERYTHING' -Desc 'ปรับจูนทั้งหมดทันที'
         Write-MenuItem -Key '2' -Label 'RESET ALL' -Desc 'คืนค่าจาก backup ล่าสุด' -KeyColor 'Yellow'
-        Write-MenuItem -Key '3' -Label 'SCAN HARDWARE' -Desc 'ดูสเปกและ profile ที่ตรวจเจอ' -KeyColor 'Cyan'
-        Write-MenuItem -Key '4' -Label 'EXPORT REPORT' -Desc 'สร้างรายงาน HTML บน Desktop' -KeyColor 'Cyan'
-        Write-MenuItem -Key '5' -Label 'HPET TOOL' -Desc 'เปิดเมนู HPET แยกต่างหาก' -KeyColor 'Magenta'
-        Write-MenuItem -Key '6' -Label 'HELP' -Desc 'ดูตัวอย่างคำสั่ง command line' -KeyColor 'Gray'
         Write-MenuItem -Key '0' -Label 'EXIT' -Desc 'ปิดโปรแกรม' -KeyColor 'Red'
         Write-BoxBottom
         Write-Host ""
         switch (Read-Host 'Select') {
             '1' { Invoke-DoEverything; return }
             '2' { Invoke-ResetUltra; return }
-            '3' { Invoke-HardwareScanOnly; return }
-            '4' { Invoke-ExportReport; return }
-            '5' { Invoke-HpetToggle; return }
-            '6' { Show-Usage; Read-Host 'Press Enter to continue' | Out-Null }
             '0' { return }
             default {
                 Write-Warn2 'กรุณาเลือกหมายเลขที่ถูกต้อง'
@@ -265,14 +299,16 @@ function Show-MainMenuConsole {
 }
 
 function Invoke-RequestedAction {
-    param([Parameter(Mandatory)][ValidateSet('Apply','Reset','Scan','Report','Hpet','Help')][string]$Action)
+    param([Parameter(Mandatory)][ValidateSet('Apply','Reset','Scan','Report','Hpet','NetworkDiagnose','NetworkCustom','Help')][string]$Action)
     switch ($Action) {
-        'Apply'  { Invoke-DoEverything }
-        'Reset'  { Invoke-ResetUltra }
-        'Scan'   { Invoke-HardwareScanOnly }
-        'Report' { Invoke-ExportReport }
-        'Hpet'   { Invoke-HpetToggle }
-        'Help'   { Show-Usage }
+        'Apply'           { Invoke-DoEverything }
+        'Reset'           { Invoke-ResetUltra }
+        'Scan'            { Invoke-HardwareScanOnly }
+        'Report'          { Invoke-ExportReport }
+        'Hpet'            { Invoke-HpetToggle }
+        'NetworkDiagnose' { Invoke-NetworkDiagnoseOnly }
+        'NetworkCustom'   { Invoke-NetworkCustomAdditive }
+        'Help'            { Show-Usage }
     }
 }
 
@@ -444,13 +480,16 @@ function Set-Reg {
         $had = $false; $old = $null
         $prop = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
         if ($null -ne $prop -and ($prop.PSObject.Properties.Name -contains $Name)) { $had = $true; $old = $prop.$Name }
+        New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
         $script:Changes.Add([PSCustomObject]@{
             Kind = 'RegValue'; Path = $Path; Name = $Name
             KeyCreated = (-not $keyExisted); HadValue = $had; OldValue = $old; Type = $Type
         })
-        New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
         return $true
     } catch {
+        if (-not $keyExisted -and (Test-Path $Path)) {
+            Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Write-Log ("  ! Set-Reg failed for {0}\{1}: {2}" -f $Path, $Name, $_.Exception.Message)
         return $false
     }
@@ -479,12 +518,12 @@ function Set-SvcStart {
         }
         $wmi = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
         $oldStart = if ($wmi) { $wmi.StartMode } else { 'Automatic' }
+        Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop
         $script:Changes.Add([PSCustomObject]@{ Kind='Service'; Name=$Name; OldStart=$oldStart })
-        Set-Service -Name $Name -StartupType $StartupType -ErrorAction SilentlyContinue
         if ($StartupType -ne 'Automatic' -and $svc.Status -eq 'Running') {
-            Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+            Stop-Service -Name $Name -Force -ErrorAction Stop
         } elseif ($StartupType -eq 'Automatic' -and $svc.Status -ne 'Running') {
-            Start-Service -Name $Name -ErrorAction SilentlyContinue
+            Start-Service -Name $Name -ErrorAction Stop
         }
         return $true
     } catch {
@@ -840,8 +879,44 @@ function Invoke-DeepAggressiveTuning {
     Write-Ok "Deep aggressive tuning applied"
 }
 
+function Set-OptimalMTU1500 {
+    Write-Host "🌐 Setting MTU to 1500 on active physical network adapters..." -ForegroundColor Cyan
+    try {
+        $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+        if (-not $adapters) { return }
+        
+        foreach ($a in $adapters) {
+            try {
+                $ipIf = Get-NetIPInterface -InterfaceIndex $a.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+                if ($ipIf) {
+                    $oldMtu = [int]$ipIf.NlMtuBytes
+                    if ($oldMtu -le 0) {
+                        $subinterfaceLines = @(netsh.exe interface ipv4 show subinterfaces 2>$null)
+                        $mtuLine = $subinterfaceLines | Where-Object {
+                            $_ -match '^\s*\d+\s+\d+\s+\d+\s+\d+\s+(.+?)\s*$' -and $Matches[1].Trim() -eq $a.Name
+                        } | Select-Object -First 1
+                        if ($mtuLine -and $mtuLine -match '^\s*(\d+)\s+') { $oldMtu = [int]$Matches[1] }
+                    }
+                    if ($oldMtu -le 0) { throw "Could not read the current MTU for $($a.Name); skipped to protect reset accuracy" }
+                    Set-NetIPInterface -InterfaceIndex $a.IfIndex -AddressFamily IPv4 -NlMtuBytes 1500 -ErrorAction Stop
+                    $script:Changes.Add([PSCustomObject]@{
+                        Kind = 'Mtu'
+                        IfIndex = $a.IfIndex
+                        AddressFamily = 'IPv4'
+                        OldMtu = $oldMtu
+                    })
+                    Write-Ok "MTU on $($a.Name) set to 1500 (Was: $oldMtu)"
+                }
+            } catch {
+                Write-Warn2 "Failed to set MTU on $($a.Name): $($_.Exception.Message)"
+            }
+        }
+    } catch {}
+}
+
 function Invoke-NetworkAggressiveTuning {
     Write-Host "Applying aggressive FiveM network tuning..." -ForegroundColor Magenta
+    Set-OptimalMTU1500
 
     # DNS client cache: reduce stale/negative cache retention for frequently changing servers.
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters' 'MaxCacheTtl' 30 'DWord' | Out-Null
@@ -860,7 +935,7 @@ function Invoke-NetworkAggressiveTuning {
     foreach ($svc in 'BITS','DoSvc','wuauserv') { Set-SvcStart $svc 'Manual' | Out-Null }
 
     # Apply low-latency global stack profile. Existing Reset restores the global defaults.
-    try { netsh.exe int tcp set global autotuninglevel=disabled | Out-Null } catch {}
+    try { netsh.exe int tcp set global autotuninglevel=normal | Out-Null } catch {}
     try { netsh.exe int tcp set global rss=enabled | Out-Null } catch {}
     try { netsh.exe int tcp set global rsc=disabled | Out-Null } catch {}
     try { netsh.exe int tcp set global ecncapability=disabled | Out-Null } catch {}
@@ -896,6 +971,11 @@ function Invoke-ApplyUltra {
 
     New-BackupFolder | Out-Null
     $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
+
+    Write-GuiEvent -Type 'progress' -Current 2 -Total $script:LegacyStepTotal -Label 'กำลังวัดค่าเน็ตก่อนปรับ (Before benchmark)' -Message 'วัดจริง 30 ครั้งต่อเป้าหมาย ใช้เวลาสักครู่...'
+    Write-Host "Measuring baseline network latency (real samples, for a genuine before/after comparison later)..."
+    try { $script:NetBenchmarkBefore = Invoke-NetworkLatencyBenchmark -Context 'Before' }
+    catch { Write-Warn2 "Before-benchmark skipped: $($_.Exception.Message)"; $script:NetBenchmarkBefore = @() }
 
     Write-GuiEvent -Type 'progress' -Current 2 -Total $script:LegacyStepTotal -Label 'กำลังตรวจสอบเครื่อง' -Message 'กำลังอ่าน CPU, RAM, GPU และอุปกรณ์เครือข่าย...'
     Write-Host "Checking system..."
@@ -943,7 +1023,7 @@ function Invoke-ApplyUltra {
     # on this network (previously used the default timeout, which can appear as a "stuck" GUI).
     try { Test-Connection -ComputerName 1.1.1.1 -Count 2 -TimeoutSeconds 2 -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-Host } catch {}
 
-    $script:Total = 44  # v2.2: 39 legacy + MMCSS/ProcessPriority/TrimVerify + NIC-MSI + multi-game (PUBG/VALORANT)
+    $script:Total = 48  # v2.2: 39 legacy + MMCSS/ProcessPriority/TrimVerify + NIC-MSI + multi-game (PUBG/VALORANT) + DynamicTick/CState + USB-MSI + NetThrottle
     $n = 0
 
     Invoke-Step (++$n) $Total "Applying background, search, Game DVR, Delivery Optimization, telemetry policies..." {
@@ -956,7 +1036,9 @@ function Invoke-ApplyUltra {
     }
 
     Invoke-Step (++$n) $Total "Applying power and multimedia scheduling tweaks..." {
-        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PowerThrottling' 'PowerThrottlingOff' 1 'DWord' | Out-Null
+        # Keep Windows' global power management. Per-process handling is applied
+        # only to FiveM/GTA when those processes are actually detected.
+        Write-Info2 "Global Power Throttling: Windows default (no global disable)"
         Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'NetworkThrottlingIndex' 0xffffffff 'DWord' | Out-Null
         Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'SystemResponsiveness' 0 'DWord' | Out-Null
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' 'Win32PrioritySeparation' 38 'DWord' | Out-Null
@@ -1004,7 +1086,7 @@ function Invoke-ApplyUltra {
                 }
             }
         } catch {}
-        try { netsh.exe int tcp set global autotuninglevel=experimental | Out-Null } catch {}
+        try { netsh.exe int tcp set global autotuninglevel=normal | Out-Null } catch {}
         try { netsh.exe int tcp set global congestionprovider=ctcp | Out-Null } catch {}
         try { netsh.exe int tcp set global ecncapability=disabled | Out-Null } catch {}
         try { netsh.exe int tcp set global timestamps=disabled | Out-Null } catch {}
@@ -1020,8 +1102,9 @@ function Invoke-ApplyUltra {
         } catch { Write-Log "  ! QoS policy failed: $($_.Exception.Message)" }
     }
 
-    Invoke-Step (++$n) $Total "Requesting lower kernel timer resolution..." {
+    Invoke-Step (++$n) $Total "Requesting lower kernel timer resolution (0.5ms, persists across reboot)..." {
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests' 1 'DWord' | Out-Null
+        Invoke-TimerResolutionLock | Out-Null
     }
 
     Invoke-Step (++$n) $Total "Registering FiveM/GTAProcess to MMCSS (Multimedia Class Scheduler) with High priority..." {
@@ -1040,6 +1123,25 @@ function Invoke-ApplyUltra {
         Invoke-TrimVerify | Out-Null
     }
 
+    Invoke-Step (++$n) $Total "Applying low-latency timer profile (desktop only; C-State stays Windows default)..." {
+        $laptopNow = Get-HwIsLaptop
+        Invoke-DynamicTickDisable -IsLaptop $laptopNow | Out-Null
+        Write-Info2 "C-State/PROCIDLEDISABLE: Windows default kept (test-only option, not applied by default)"
+    }
+
+    Invoke-Step (++$n) $Total "Enabling MSI interrupt mode on USB Host Controller (mouse/keyboard latency)..." {
+        $usbCpuMask = 0
+        try {
+            $threadCount = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1).NumberOfLogicalProcessors
+            if ($threadCount -ge 2) { $usbCpuMask = 2 }   # logical core 1, kept off core 0 to avoid piling onto the busiest core
+        } catch {}
+        Invoke-UsbControllerMsiMode -CanSetIrqAffinity ($usbCpuMask -gt 0) -TargetCpuMask $usbCpuMask | Out-Null
+    }
+
+    Invoke-Step (++$n) $Total "Disabling Network Throttling Index (removes multimedia bandwidth cap)..." {
+        Invoke-NetworkThrottlingDisable | Out-Null
+    }
+
     Invoke-Step (++$n) $Total "Disabling USB selective suspend on active power plan..." {
         try {
             powercfg.exe /setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 | Out-Null
@@ -1050,7 +1152,7 @@ function Invoke-ApplyUltra {
 
     Invoke-Step (++$n) $Total "Applying graphics latency profile (HAGS, DWM)..." {
         Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm' 'OverlayTestMode' 5 'DWord' | Out-Null
-        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2 'DWord' | Out-Null
+        Write-Info2 "HAGS: current value kept; use explicit ON/OFF A/B test only"
     }
 
     Invoke-Step (++$n) $Total "Applying 1:1 mouse curve and keyboard response..." {
@@ -1425,10 +1527,9 @@ function Invoke-ApplyUltra {
     }
 
     Invoke-Step (++$n) $Total "Tuning RAM: keep kernel paged-out code in physical memory..." {
-        # DisablePagingExecutive keeps kernel/driver code resident in RAM instead of letting it
-        # get paged to disk under memory pressure - avoids random micro-stalls from disk paging.
-        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'DisablePagingExecutive' 1 'DWord' | Out-Null
-        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'IoPageLockLimit' 0x4000000 'DWord' | Out-Null
+        # Leave paging policy and obsolete IoPageLockLimit at Windows defaults;
+        # the adaptive RAM phase verifies the profile without forcing legacy values.
+        Write-Info2 "Paging executive/IoPageLockLimit: adaptive phase will verify; no legacy force"
     }
 
     Invoke-Step (++$n) $Total "Checking pagefile configuration..." {
@@ -1543,43 +1644,76 @@ function Invoke-ApplyUltra {
     Save-Changes
 
     # ---- Verify ----
+    # NOTE (honest scope note, not a claim of full spec-29 compliance): this reports
+    # EXPECTED vs ACTUAL vs RESULT per setting. It does NOT capture a true "OLD" (pre-apply)
+    # value for these 17 legacy checks - that would require snapshotting each one before the
+    # very first step runs, which this function does not currently do. Treat the "OLD" column
+    # as "not captured for this check" until that snapshot exists.
     Write-Host ""
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  DONE" -ForegroundColor Green
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    $checks = @(
-        { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PowerThrottling' -Name PowerThrottlingOff -EA SilentlyContinue) -ne $null }
-        { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FiveM.exe\PerfOptions' -Name CpuPriorityClass -EA SilentlyContinue) -ne $null }
-        { (Get-ItemProperty 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' -Name 'FiveM.exe' -EA SilentlyContinue) -ne $null }
-        { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' -Name GlobalTimerResolutionRequests -EA SilentlyContinue) -ne $null }
-        { (Get-ItemProperty 'HKCU:\Control Panel\Keyboard' -Name KeyboardDelay -EA SilentlyContinue) -ne $null }
-        { (Get-CimInstance Win32_Service -Filter "Name='SysMain'" -EA SilentlyContinue).StartMode -eq 'Manual' }
-        { (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched' -Name NonBestEffortLimit -EA SilentlyContinue) -ne $null }
-        { (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name VisualFXSetting -EA SilentlyContinue) -ne $null }
-        { (Get-CimInstance Win32_Service -Filter "Name='wuauserv'" -EA SilentlyContinue).StartMode -eq 'Manual' }
-        { (Get-MpPreference -EA SilentlyContinue).ExclusionPath -contains $fiveMRoot }
-        { -not (Test-Path (Join-Path $env:SystemDrive 'hiberfil.sys')) }
-        { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games' -Name 'GPU Priority' -EA SilentlyContinue) -ne $null }
-        { (Get-ItemProperty 'HKCU:\Software\Microsoft\GameBar' -Name AutoGameModeEnabled -EA SilentlyContinue).AutoGameModeEnabled -eq 0 }
-        { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name MaxUserPort -EA SilentlyContinue) -ne $null }
-        { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name DisablePagingExecutive -EA SilentlyContinue).DisablePagingExecutive -eq 1 }
-        { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\mouclass\Parameters' -Name MouseDataQueueSize -EA SilentlyContinue).MouseDataQueueSize -eq $script:InputQueueSize }
-        { $a = Get-ActiveAdapter; if ($a) { -not (Get-NetAdapterRsc -Name $a.Name -EA SilentlyContinue).IPv4Enabled } else { $true } }
+    $verifyItems = @(
+        @{ Name='PowerThrottling';       Expected='Registry value present (off for FiveM)'; Check={ (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PowerThrottling' -Name PowerThrottlingOff -EA SilentlyContinue) -ne $null } }
+        @{ Name='FiveM-CPU-priority';    Expected='CpuPriorityClass set in PerfOptions';     Check={ (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FiveM.exe\PerfOptions' -Name CpuPriorityClass -EA SilentlyContinue) -ne $null } }
+        @{ Name='FiveM-GPU-preference';  Expected='UserGpuPreferences entry present';        Check={ (Get-ItemProperty 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' -Name 'FiveM.exe' -EA SilentlyContinue) -ne $null } }
+        @{ Name='Timer-resolution';      Expected='GlobalTimerResolutionRequests present';   Check={ (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' -Name GlobalTimerResolutionRequests -EA SilentlyContinue) -ne $null } }
+        @{ Name='Keyboard-response';     Expected='KeyboardDelay value present';             Check={ (Get-ItemProperty 'HKCU:\Control Panel\Keyboard' -Name KeyboardDelay -EA SilentlyContinue) -ne $null } }
+        @{ Name='SysMain-service';       Expected='StartMode = Manual';                      Check={ (Get-CimInstance Win32_Service -Filter "Name='SysMain'" -EA SilentlyContinue).StartMode -eq 'Manual' } }
+        @{ Name='QoS-reservation';       Expected='NonBestEffortLimit present';               Check={ (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched' -Name NonBestEffortLimit -EA SilentlyContinue) -ne $null } }
+        @{ Name='Visual-effects';        Expected='VisualFXSetting present';                  Check={ (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name VisualFXSetting -EA SilentlyContinue) -ne $null } }
+        @{ Name='Windows-Update-pause';  Expected='StartMode = Manual';                       Check={ (Get-CimInstance Win32_Service -Filter "Name='wuauserv'" -EA SilentlyContinue).StartMode -eq 'Manual' } }
+        @{ Name='Defender-exclusion';    Expected="ExclusionPath contains FiveM folder";      Check={ (Get-MpPreference -EA SilentlyContinue).ExclusionPath -contains $fiveMRoot } }
+        @{ Name='Hibernation-off';       Expected='hiberfil.sys absent';                      Check={ -not (Test-Path (Join-Path $env:SystemDrive 'hiberfil.sys')) } }
+        @{ Name='Games-task-priority';   Expected="'GPU Priority' present under Tasks\Games"; Check={ (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games' -Name 'GPU Priority' -EA SilentlyContinue) -ne $null } }
+        @{ Name='GameBar-disabled';      Expected='AutoGameModeEnabled = 0';                  Check={ (Get-ItemProperty 'HKCU:\Software\Microsoft\GameBar' -Name AutoGameModeEnabled -EA SilentlyContinue).AutoGameModeEnabled -eq 0 } }
+        @{ Name='TCP-port-range';        Expected='MaxUserPort present';                      Check={ (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name MaxUserPort -EA SilentlyContinue) -ne $null } }
+        @{ Name='RAM-paging-tweak';      Expected='DisablePagingExecutive = 1';               Check={ (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name DisablePagingExecutive -EA SilentlyContinue).DisablePagingExecutive -eq 1 } }
+        @{ Name='HID-queue-size';        Expected="MouseDataQueueSize = $($script:InputQueueSize)"; Check={ (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\mouclass\Parameters' -Name MouseDataQueueSize -EA SilentlyContinue).MouseDataQueueSize -eq $script:InputQueueSize } }
+        @{ Name='RSC-off';               Expected='IPv4Enabled = False on active adapter';    Check={ $a = Get-ActiveAdapter; if ($a) { -not (Get-NetAdapterRsc -Name $a.Name -EA SilentlyContinue).IPv4Enabled } else { $true } } }
     )
-    $names = 'PowerThrottling','FiveM-CPU-priority','FiveM-GPU-preference','Timer-resolution','Keyboard-response','SysMain-service','QoS-reservation','Visual-effects','Windows-Update-pause','Defender-exclusion','Hibernation-off','Games-task-priority','GameBar-disabled','TCP-port-range','RAM-paging-tweak','HID-queue-size','RSC-off'
     $ok = 0; $failed = @()
-    for ($i = 0; $i -lt $checks.Count; $i++) {
-        try { if (& $checks[$i]) { $ok++ } else { $failed += $names[$i] } } catch { $failed += $names[$i] }
+    Write-Host ("  {0,-22} {1,-42} {2}" -f 'SETTING', 'EXPECTED', 'RESULT') -ForegroundColor DarkGray
+    foreach ($item in $verifyItems) {
+        $actual = $false
+        try { $actual = & $item.Check } catch { $actual = $false }
+        $resultTag = if ($actual) { '[OK]' } else { '[FAIL]' }
+        $resultColor = if ($actual) { 'Green' } else { 'Red' }
+        Write-Host ("  {0,-22} {1,-42} " -f $item.Name, $item.Expected) -NoNewline
+        Write-Host $resultTag -ForegroundColor $resultColor
+        if ($actual) { $ok++ } else { $failed += $item.Name }
     }
     Write-ProgressBar -Current $script:Total -Total $script:Total -Label 'Ultra profile applied'
     Write-Host ""
-    $passColor = if ($ok -eq $checks.Count) { 'Green' } elseif ($ok -ge ($checks.Count * 0.7)) { 'Yellow' } else { 'Red' }
-    Write-Host "Checks passed: $ok/$($checks.Count)" -ForegroundColor $passColor
+    $passColor = if ($ok -eq $verifyItems.Count) { 'Green' } elseif ($ok -ge ($verifyItems.Count * 0.7)) { 'Yellow' } else { 'Red' }
+    Write-Host "Checks passed: $ok/$($verifyItems.Count)" -ForegroundColor $passColor
     if ($failed.Count -gt 0) { Write-Warn2 ("Not applied: " + ($failed -join ', ') + " - see backup folder or check manually.") }
     Write-Info2 "Restart Windows, then test FiveM. Choose Reset if needed."
     Write-Host "Log saved to: $script:LogFile" -ForegroundColor DarkGray
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    Write-Log "Apply finished. Checks passed: $ok/$($checks.Count). Not applied: $($failed -join ', ')"
+    Write-Log "Apply finished. Checks passed: $ok/$($verifyItems.Count). Not applied: $($failed -join ', ')"
+
+    # ---- Real before/after network benchmark (no fabricated numbers - if a target was
+    # unreachable either time, that comparison line is skipped rather than guessed) ----
+    if ($script:NetBenchmarkBefore -and $script:NetBenchmarkBefore.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Network latency: before vs after (real measured samples)" -ForegroundColor Cyan
+        try {
+            $afterResults = Invoke-NetworkLatencyBenchmark -Context 'After'
+            foreach ($before in $script:NetBenchmarkBefore) {
+                $after = $afterResults | Where-Object { $_.Label -eq $before.Label } | Select-Object -First 1
+                if (-not $after -or -not $before.Reachable -or -not $after.Reachable) {
+                    Write-Info2 "$($before.Label): [SKIP] not reachable in one of the two measurements - no comparison possible"
+                    continue
+                }
+                $delta = [math]::Round($after.Average - $before.Average, 1)
+                $arrow = if ($delta -lt 0) { "ดีขึ้น" } elseif ($delta -gt 0) { "แย่ลง" } else { "ไม่เปลี่ยนแปลง" }
+                $deltaColor = if ($delta -lt 0) { 'Green' } elseif ($delta -gt 0) { 'Yellow' } else { 'Gray' }
+                Write-Host ("  {0,-10} avg: {1,6}ms -> {2,6}ms  (เปลี่ยน {3:+0.0;-0.0;0}ms, {4})  jitter: {5}ms -> {6}ms  loss: {7}% -> {8}%" -f `
+                    $before.Label, $before.Average, $after.Average, $delta, $arrow, $before.Jitter, $after.Jitter, $before.PacketLossPct, $after.PacketLossPct) -ForegroundColor $deltaColor
+            }
+        } catch { Write-Warn2 "After-benchmark skipped: $($_.Exception.Message)" }
+    }
 
     # ---- Auto-help for Defender exclusions that Tamper Protection blocked ----
     # v2.1: Cleanup backups and logs
@@ -1609,8 +1743,8 @@ function Invoke-ApplyUltra {
                 Write-Host "not 'managed by your organization'). This pattern is most often caused by:"
                 Write-Host "  - A Windows activation crack / KMS-HWID activator hiding itself from Defender"
                 Write-Host "  - Malware or a cheat/loader tool that disabled Defender to avoid detection"
-                Write-Host "This PC currently has NO active antivirus protection. Recommended: after using"
-                Write-Host "option [4] in the main menu to remove this policy and restart, immediately run a"
+                Write-Host "This PC currently has NO active antivirus protection. Recommended: resolve this policy"
+                Write-Host "manually with an administrator, restart Windows, and immediately run a"
                 Write-Host "full Windows Defender scan (Windows Security > Virus & threat protection > Scan options"
                 Write-Host "> Full scan) to check nothing malicious is present."
             }
@@ -1743,11 +1877,23 @@ function Invoke-ResetUltra {
                 'ScheduledTask' {
                     if ($c.WasEnabled) { Enable-ScheduledTask -TaskPath $c.TaskPath -TaskName $c.TaskName -ErrorAction SilentlyContinue | Out-Null }
                 }
+                'TimerResolutionTask' {
+                    try {
+                        Unregister-ScheduledTask -TaskName $c.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                            Where-Object { $_.CommandLine -and $_.CommandLine -like "*TimerResolutionHold.ps1*" } |
+                            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+                        if ($c.HelperPath -and (Test-Path $c.HelperPath)) { Remove-Item -Path $c.HelperPath -Force -ErrorAction SilentlyContinue }
+                    } catch {}
+                }
                 'Mtu' {
                     if ($c.OldMtu) { Set-NetIPInterface -InterfaceIndex $c.IfIndex -AddressFamily $c.AddressFamily -NlMtuBytes ([int]$c.OldMtu) -ErrorAction SilentlyContinue }
                 }
                 'NetworkProfile' {
                     if ($c.OldCategory) { Set-NetConnectionProfile -InterfaceIndex $c.IfIndex -NetworkCategory $c.OldCategory -ErrorAction SilentlyContinue }
+                }
+                'NetworkSnapshot' {
+                    if ($c.Path) { Restore-NetworkSnapshot -SnapshotPath $c.Path -Quiet | Out-Null }
                 }
                 'HidPower' {
                     try {
@@ -1757,6 +1903,48 @@ function Invoke-ResetUltra {
                             if ($powerDevice) { Set-CimInstance -InputObject $powerDevice -Property @{ Enable = $true } -ErrorAction SilentlyContinue }
                         }
                     } catch {}
+                }
+                'BcdDynamicTick' {
+                    try { bcdedit.exe /deletevalue disabledynamictick 2>$null | Out-Null } catch {}
+                }
+                'CStateDisable' {
+                    try {
+                        powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCIDLEDISABLE 0 | Out-Null
+                        powercfg.exe /setactive SCHEME_CURRENT | Out-Null
+                    } catch {}
+                }
+                'PowerSetting' {
+                    try {
+                        powercfg.exe /setacvalueindex SCHEME_CURRENT $c.SubGroup $c.Setting ([int]$c.OldValue) 2>$null | Out-Null
+                        powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
+                    } catch { Write-Log "  ! Power setting restore failed: $($_.Exception.Message)" }
+                }
+                'AdapterAdvancedProperty' {
+                    try {
+                        if ($c.OldDisplayValue) {
+                            Set-NetAdapterAdvancedProperty -Name $c.AdapterName -DisplayName $c.DisplayName -DisplayValue $c.OldDisplayValue -ErrorAction SilentlyContinue
+                        } elseif ($c.OldRegistryValue) {
+                            Set-NetAdapterAdvancedProperty -Name $c.AdapterName -DisplayName $c.DisplayName -RegistryValue $c.OldRegistryValue -ErrorAction SilentlyContinue
+                        }
+                    } catch { Write-Log "  ! Adapter property restore failed: $($_.Exception.Message)" }
+                }
+                'Netbios' {
+                    try {
+                        $config = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "Index=$($c.IfIndex)" -ErrorAction SilentlyContinue
+                        if ($config) {
+                            Invoke-CimMethod -InputObject $config -MethodName EnableNetbios -Arguments @{ TcpipNetbiosOptions = [uint32]$c.OldValue } -ErrorAction SilentlyContinue | Out-Null
+                        }
+                    } catch { Write-Log "  ! NetBIOS restore failed: $($_.Exception.Message)" }
+                }
+                'WlanAutoConfig' {
+                    try {
+                        $state = if ($c.OldEnabled) { 'yes' } else { 'no' }
+                        netsh.exe wlan set autoconfig enabled=$state interface="$($c.InterfaceName)" 2>$null | Out-Null
+                    } catch { Write-Log "  ! Wi-Fi autoconfig restore failed: $($_.Exception.Message)" }
+                }
+                'NetshCongestionProvider' {
+                    try { netsh.exe int tcp set global congestionprovider=default 2>$null | Out-Null }
+                    catch { Write-Log "  ! TCP congestion provider restore failed: $($_.Exception.Message)" }
                 }
             }
             $count++
@@ -1811,7 +1999,17 @@ function Invoke-ResetUltra {
     } catch {}
 
     Write-Host "Undid $count tracked changes, plus global network/power defaults."
-    
+
+    # Additive network snapshots contain the actual state before an opt-in DNS/QoS change.
+    # Restore again after legacy default restoration so the exact user configuration wins.
+    try {
+        $networkSnapshot = Get-NetworkSnapshotPath -BackupDir $dir
+        if (Test-Path $networkSnapshot) {
+            Restore-NetworkSnapshot -SnapshotPath $networkSnapshot -Quiet | Out-Null
+            Write-Ok 'Restored exact DNS/MTU/network-profile state from additive network snapshot.'
+        }
+    } catch { Write-Warn2 "Additive network snapshot restore skipped: $($_.Exception.Message)" }
+
     # v2.1: Verify reset success
     Write-Host "Verifying reset success..."
     $verifyOk = Invoke-ResetVerify -Changes $list
@@ -1989,6 +2187,101 @@ function Invoke-RemoveDefenderPolicy {
 # ===========================================================================
 # v2.1 — MMCSS (Multimedia Class Scheduler) REGISTRATION FOR FiveM
 # ===========================================================================
+function Invoke-TimerResolutionLock {
+    # v3.0: This is now RUNTIME-ONLY, not permanent. Windows' fine-grained timer
+    # resolution (the same thing third-party "Timer Resolution" utilities set) is
+    # NOT a registry value - it's a live Win32/NT API state that only stays in
+    # effect for as long as SOME process is actively holding it open.
+    #
+    # The old design held 0.5ms permanently from every Windows logon onward, even
+    # while just sitting on the desktop doing nothing - burning a little extra
+    # power/heat for zero benefit outside of an actual gaming session. This
+    # version instead installs a lightweight watcher that polls for FiveM's
+    # process names and only holds the high-resolution timer WHILE one of them is
+    # actually running, releasing it back to Windows' normal ~15.6ms default the
+    # moment none of them are running anymore (including after a crash, since the
+    # watcher notices the process is gone within a few seconds either way - no
+    # separate crash-specific cleanup logic is needed for that reason).
+    try {
+        $rootDir = Join-Path $env:ProgramData 'NongPlaiShop'
+        if (-not (Test-Path $rootDir)) { New-Item -ItemType Directory -Path $rootDir -Force | Out-Null }
+        $helperPath = Join-Path $rootDir 'TimerResolutionHold.ps1'
+        $taskName = 'NongPlaiShop_TimerResolutionLock'
+
+        if ($script:DryRun) {
+            Write-Host "  [DRYRUN] would create $helperPath and register scheduled task $taskName (0.5ms timer resolution, ONLY while FiveM/GTA is actually running, starts watcher at logon)" -ForegroundColor DarkCyan
+            return $true
+        }
+
+        $helperSource = @'
+# Auto-generated by NongPlaiShop - holds Windows timer resolution at 0.5ms ONLY
+# while a FiveM/GTA process is actually running. Releases back to Windows'
+# default resolution the rest of the time (including after a crash, since a
+# process that is gone is simply no longer matched on the next poll).
+# Do not run this manually; it is started by the "NongPlaiShop_TimerResolutionLock"
+# scheduled task and is meant to stay running in the background as a watcher.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class NongPlaiTimer {
+    [DllImport("ntdll.dll", SetLastError = true)]
+    public static extern int NtSetTimerResolution(uint DesiredResolution, bool SetResolution, ref uint CurrentResolution);
+}
+"@
+$targetNames = @('FiveM','FiveM_GTAProcess','GTA5','CitizenFX','PlayGTAV')
+$current = [uint32]0
+$holding = $false
+while ($true) {
+    $running = $false
+    foreach ($n in $targetNames) {
+        if (Get-Process -Name $n -ErrorAction SilentlyContinue) { $running = $true; break }
+    }
+    if ($running -and -not $holding) {
+        # 5000 * 100ns = 0.5ms - matches the "0.5" shown by third-party timer resolution tools.
+        [NongPlaiTimer]::NtSetTimerResolution(5000, $true, [ref]$current) | Out-Null
+        $holding = $true
+    } elseif (-not $running -and $holding) {
+        [NongPlaiTimer]::NtSetTimerResolution(5000, $false, [ref]$current) | Out-Null
+        $holding = $false
+    }
+    Start-Sleep -Seconds 3
+}
+'@
+        Set-Content -Path $helperPath -Value $helperSource -Encoding UTF8 -Force
+
+        # Kill any previous holder before registering (idempotent - safe to re-apply).
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like "*TimerResolutionHold.ps1*" } |
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+
+        try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$helperPath`""
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force | Out-Null
+
+        # Start the watcher right now too - it will sit idle (Windows default
+        # resolution) until it actually sees FiveM/GTA running, no waiting for
+        # next logon needed to have it armed.
+        Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $helperPath) `
+            -WindowStyle Hidden | Out-Null
+
+        $script:Changes.Add([PSCustomObject]@{ Kind='TimerResolutionTask'; TaskName=$taskName; HelperPath=$helperPath })
+        Write-Ok "Timer resolution watcher installed via scheduled task '$taskName' - holds 0.5ms ONLY while FiveM/GTA is running, Windows default the rest of the time"
+        return $true
+    } catch {
+        Write-Warn2 "Timer resolution lock skipped: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+
 function Invoke-MmcssRegister {
     param([string]$ProcessName = 'FiveM.exe')
     try {
@@ -2072,6 +2365,262 @@ function Invoke-HagsToggle {
     } catch {
         Write-Log ("  ! HAGS toggle failed: {0}" -f $_.Exception.Message)
         return $false
+    }
+}
+
+# ===========================================================================
+# v2.2 — DYNAMIC TICK DISABLE (bcdedit) - universal, all games, reduces timer
+# coalescing jitter that affects input timing and 1% lows. Desktop-safe;
+# skipped automatically on laptops since dynamic tick exists mainly to save
+# battery there and disabling it can noticeably shorten battery life.
+# ===========================================================================
+function Invoke-DynamicTickDisable {
+    param([Parameter(Mandatory)][bool]$IsLaptop)
+    try {
+        if ($IsLaptop) {
+            Write-Info2 "Dynamic Tick: skipped (laptop detected - this setting exists mainly to save battery; disabling costs battery life for a timing benefit that matters most on desktops)"
+            return $true
+        }
+        $before = (bcdedit.exe /enum '{current}' | Select-String 'disabledynamictick').ToString()
+        if ($script:DryRun) { Write-Host "  [DRYRUN] would run: bcdedit /set disabledynamictick yes" -ForegroundColor DarkCyan; return $true }
+        $result = bcdedit.exe /set disabledynamictick yes 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $script:Changes.Add([PSCustomObject]@{ Kind='BcdDynamicTick'; OldRaw=$before })
+            Write-Ok "Dynamic Tick disabled (bcdedit) - reduces timer-interrupt coalescing jitter, takes effect after reboot"
+            return $true
+        } else {
+            Write-Warn2 "Dynamic Tick disable failed: $result"
+            return $false
+        }
+    } catch {
+        Write-Log ("  ! Dynamic Tick disable failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+# ===========================================================================
+# v2.2 — C-STATE / PROCESSOR IDLE DISABLE - forces CPU cores to stay in C0
+# (never sleep) while the machine is on AC power. Removes core wake-up
+# latency that causes random 1%-low spikes and input-lag stutters. Skipped
+# on laptops (battery/heat) and only applied to the AC power source, never
+# battery, even on a desktop with a UPS reporting as battery.
+# ===========================================================================
+function Invoke-CStateDisable {
+    param([Parameter(Mandatory)][bool]$IsLaptop)
+    try {
+        if ($IsLaptop) {
+            Write-Info2 "C-State disable: skipped (laptop detected - forcing C0 raises heat and drains battery fast; only worth it on a desktop with good cooling)"
+            return $true
+        }
+        if ($script:DryRun) { Write-Host "  [DRYRUN] would run: powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCIDLEDISABLE 1" -ForegroundColor DarkCyan; return $true }
+        $before = (powercfg.exe /query SCHEME_CURRENT SUB_PROCESSOR PROCIDLEDISABLE 2>$null) -join "`n"
+        powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCIDLEDISABLE 1 | Out-Null
+        powercfg.exe /setactive SCHEME_CURRENT | Out-Null
+        $script:Changes.Add([PSCustomObject]@{ Kind='CStateDisable'; OldRaw=$before })
+        Write-Ok "C-States disabled on AC power (cores stay in C0) - removes idle wake-up latency behind random 1% lows. Expect higher idle temps/power draw."
+        return $true
+    } catch {
+        Write-Log ("  ! C-State disable failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+# ===========================================================================
+# v2.2 — USB HOST CONTROLLER MSI MODE + IRQ AFFINITY - same trick already
+# applied to the GPU and NIC, extended to the USB controller the mouse and
+# keyboard are plugged into. This is the most input-latency-direct tweak in
+# the whole script: every mouse move and keypress arrives through this IRQ.
+# ===========================================================================
+function Invoke-UsbControllerMsiMode {
+    param([Parameter(Mandatory)][bool]$CanSetIrqAffinity, [int]$TargetCpuMask = 0)
+    try {
+        $controllers = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+            Where-Object { $_.PNPClass -eq 'USB' -and ($_.Name -match 'Host Controller|xHCI|eXtensible') }
+        if (-not $controllers -or $controllers.Count -eq 0) {
+            Write-Warn2 "No USB Host Controller entries found via WMI - skipping USB MSI tuning"
+            return $false
+        }
+        $done = 0
+        foreach ($ctrl in $controllers) {
+            try {
+                $instanceId = $ctrl.PNPDeviceID
+                $devPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$instanceId\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties"
+                if ($script:DryRun) { Write-Host "  [DRYRUN] would enable MSI mode for USB controller: $($ctrl.Name)" -ForegroundColor DarkCyan; continue }
+                Set-Reg $devPath 'MSISupported' 1 'DWord' | Out-Null
+                if ($CanSetIrqAffinity -and $TargetCpuMask -gt 0) {
+                    $affPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$instanceId\Device Parameters\Interrupt Management\Affinity Policy"
+                    Set-Reg $affPath 'DevicePolicy' 4 'DWord' | Out-Null   # 4 = IrqPolicySpecifiedProcessors
+                    Set-Reg $affPath 'AssignmentSetOverride' ([byte[]]([BitConverter]::GetBytes([int64]$TargetCpuMask))) 'Binary' | Out-Null
+                }
+                $done++
+            } catch { Write-Log "  ! USB MSI tuning failed for $($ctrl.Name): $($_.Exception.Message)" }
+        }
+        if ($done -gt 0) { Write-Ok "USB Host Controller MSI mode enabled on $done controller(s) - lowers mouse/keyboard interrupt latency, separated from GPU/NIC IRQ load" }
+        return ($done -gt 0)
+    } catch {
+        Write-Log ("  ! USB controller MSI tuning failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+# ===========================================================================
+# v2.2 — NETWORK THROTTLING INDEX - Windows reserves a slice of network
+# bandwidth for background multimedia scheduling by default; FiveM's mix of
+# voice/audio + game traffic both count as "multimedia" so this reservation
+# can throttle the game's own network stack. Disabling it removes that cap.
+# ===========================================================================
+function Invoke-NetworkThrottlingDisable {
+    try {
+        if ($script:DryRun) { Write-Host "  [DRYRUN] would set NetworkThrottlingIndex = 0xffffffff (disabled)" -ForegroundColor DarkCyan; return $true }
+        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'NetworkThrottlingIndex' 0xffffffff 'DWord' | Out-Null
+        Write-Ok "Network Throttling Index disabled - removes Windows' reserved bandwidth cap for multimedia-classified processes"
+        return $true
+    } catch {
+        Write-Log ("  ! Network throttling disable failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+# ===========================================================================
+# v2.2 — DDC/CI MONITOR INFO (diagnostic only, NOT auto-applied) - lists
+# connected monitors and whether they respond to DDC/CI, and dumps whatever
+# VCP capability string the monitor reports. There is no universal VCP code
+# for "Overdrive"/"Response Time" across brands (most are vendor-proprietary,
+# unlike brightness/contrast which ARE standardized), so this deliberately
+# stops at reporting instead of blindly writing VCP values that could set a
+# monitor to a mode its OSD can't even show/reset from.
+# ===========================================================================
+function Invoke-MonitorDdcCiInfo {
+    try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class NongPlaiMonitor {
+    [DllImport("user32.dll")]
+    public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+    public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, IntPtr lprcMonitor, IntPtr dwData);
+    [DllImport("dxva2.dll")]
+    public static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, ref uint pdwNumberOfPhysicalMonitors);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct PHYSICAL_MONITOR { public IntPtr hPhysicalMonitor; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string szPhysicalMonitorDescription; }
+    [DllImport("dxva2.dll")]
+    public static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, uint dwPhysicalMonitorArraySize, [Out] PHYSICAL_MONITOR[] pPhysicalMonitorArray);
+    [DllImport("dxva2.dll")]
+    public static extern bool CapabilitiesRequestAndCapabilitiesReply(IntPtr hMonitor, StringBuilder pszASCIICapabilitiesString, uint dwCapabilitiesStringLengthInCharacters);
+    [DllImport("dxva2.dll")]
+    public static extern bool GetCapabilitiesStringLength(IntPtr hMonitor, ref uint pdwCapabilitiesStringLengthInCharacters);
+}
+"@ -ErrorAction Stop
+
+        $foundAny = $false
+        $enumCallback = {
+            param($hMonitor, $hdcMonitor, $lprcMonitor, $dwData)
+            $count = [uint32]0
+            [NongPlaiMonitor]::GetNumberOfPhysicalMonitorsFromHMONITOR($hMonitor, [ref]$count) | Out-Null
+            if ($count -gt 0) {
+                $arr = New-Object 'NongPlaiMonitor+PHYSICAL_MONITOR[]' $count
+                if ([NongPlaiMonitor]::GetPhysicalMonitorsFromHMONITOR($hMonitor, $count, $arr)) {
+                    foreach ($pm in $arr) {
+                        $script:foundAny = $true
+                        $lenRef = [uint32]0
+                        if ([NongPlaiMonitor]::GetCapabilitiesStringLength($pm.hPhysicalMonitor, [ref]$lenRef) -and $lenRef -gt 0) {
+                            $sb = New-Object System.Text.StringBuilder([int]$lenRef)
+                            [NongPlaiMonitor]::CapabilitiesRequestAndCapabilitiesReply($pm.hPhysicalMonitor, $sb, $lenRef) | Out-Null
+                            Write-Ok "Monitor '$($pm.szPhysicalMonitorDescription)': DDC/CI responded, supports $($lenRef) chars of capability data"
+                            Write-Host "    (raw VCP capability string logged - brand-specific codes needed to change Overdrive/Response Time, not attempted automatically)" -ForegroundColor Gray
+                        } else {
+                            Write-Warn2 "Monitor '$($pm.szPhysicalMonitorDescription)': found but did not respond to DDC/CI (cable/port or monitor firmware may not support it)"
+                        }
+                    }
+                }
+            }
+            return $true
+        }
+        [NongPlaiMonitor]::EnumDisplayMonitors([IntPtr]::Zero, [IntPtr]::Zero, $enumCallback, [IntPtr]::Zero) | Out-Null
+        if (-not $foundAny) { Write-Warn2 "No physical monitors responded to DDC/CI enumeration" }
+    } catch {
+        Write-Log ("  ! Monitor DDC/CI info failed: {0}" -f $_.Exception.Message)
+    }
+}
+
+# ===========================================================================
+# v2.2 — REALTIME PROCESS PRIORITY (opt-in ONLY - not called by Apply Ultra)
+# REALTIME_PRIORITY_CLASS sits above every normal Windows priority level,
+# including the OS's own input-handling threads. If the game's thread ever
+# spins or blocks while holding this priority, keyboard/mouse for the WHOLE
+# system can freeze until it clears - this has bitten real users of similar
+# tools. It is implemented here because it was asked for, but is NOT wired
+# into the default Apply flow; call it manually and test for several
+# minutes before trusting it, and prefer Invoke-ProcessPriorityHigh normally.
+# ===========================================================================
+function Invoke-ProcessPriorityRealtime {
+    param([string]$ProcessName = 'FiveM.exe')
+    try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class NongPlaiRealtime {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetPriorityClass(IntPtr hProcess, uint dwPriorityClass);
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+"@ -ErrorAction SilentlyContinue
+
+        $proc = Get-Process -Name ($ProcessName -replace '\.exe$','') -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $proc) {
+            Write-Warn2 "$ProcessName is not currently running - start the game first, then call this again"
+            return $false
+        }
+        $PROCESS_SET_INFORMATION = 0x0200
+        $REALTIME_PRIORITY_CLASS = 0x00000100
+        $handle = [NongPlaiRealtime]::OpenProcess($PROCESS_SET_INFORMATION, $false, $proc.Id)
+        if ($handle -eq [IntPtr]::Zero) { Write-Warn2 "Could not open $ProcessName for priority change"; return $false }
+        try {
+            $ok = [NongPlaiRealtime]::SetPriorityClass($handle, $REALTIME_PRIORITY_CLASS)
+            if ($ok) {
+                Write-Ok "$ProcessName set to REALTIME priority. ⚠ Watch system responsiveness for the next few minutes - if keyboard/mouse feel sluggish anywhere in Windows, lower it back immediately via Task Manager."
+            } else {
+                Write-Warn2 "SetPriorityClass(REALTIME) failed for $ProcessName"
+            }
+            return $ok
+        } finally {
+            [NongPlaiRealtime]::CloseHandle($handle) | Out-Null
+        }
+    } catch {
+        Write-Log ("  ! Realtime priority failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+# ===========================================================================
+# v2.2 — DPC LATENCY DIAGNOSTIC via built-in xperf/wpr (report-only, safe).
+# Captures a short kernel trace and summarizes which driver spends the most
+# time in DPC (deferred procedure call) routines - the #1 cause of DPC-
+# latency-driven micro-stutter/input lag that no registry tweak can fix,
+# since the fix is "update or replace that driver", not a setting.
+# ===========================================================================
+function Invoke-DpcLatencyDiagnostic {
+    param([int]$DurationSeconds = 20)
+    try {
+        $wpr = Get-Command wpr.exe -ErrorAction SilentlyContinue
+        if (-not $wpr) { Write-Warn2 "wpr.exe (Windows Performance Recorder) not found on this system - cannot run DPC diagnostic"; return }
+        $etlPath = Join-Path $env:TEMP "NongPlai_DpcTrace_$(Get-Date -Format 'yyMMdd_HHmmss').etl"
+        Write-Info2 "Recording a $DurationSeconds-second kernel trace to find slow drivers (DPC latency)... do not close this window"
+        wpr.exe -start DPC -filemode 2>$null | Out-Null
+        Start-Sleep -Seconds $DurationSeconds
+        wpr.exe -stop $etlPath 2>$null | Out-Null
+        if (-not (Test-Path $etlPath)) { Write-Warn2 "DPC trace failed to produce an output file"; return }
+        Write-Ok "DPC trace saved to: $etlPath"
+        Write-Host "  Open this file with Windows Performance Analyzer (wpa.exe, free from the Windows SDK) and look at the" -ForegroundColor Gray
+        Write-Host "  'DPC/ISR Duration by Module' graph - whichever driver has the longest total time is your latency culprit." -ForegroundColor Gray
+        Write-Host "  This is diagnostic only; NongPlaiShop cannot fix a bad driver, only point at which one to update." -ForegroundColor Gray
+    } catch {
+        Write-Log ("  ! DPC latency diagnostic failed: {0}" -f $_.Exception.Message)
+        try { wpr.exe -cancel 2>$null | Out-Null } catch {}
     }
 }
 
@@ -2478,18 +3027,31 @@ function Invoke-CpuAdaptive {
         $lockTxt = if ($Cpu.Unlocked) { 'unlocked (K/KS/KF)' } else { 'locked SKU' }
         Write-Info2 "Intel CPU detected: $genTxt, $lockTxt, $($Cpu.Tier)-core tier - removing OS-level power limits"
         try {
-            # Boost mode = Aggressive (3) and min processor state = 100% on BOTH AC and battery,
+            # Boost mode = Aggressive (2) and min processor state = 100% on BOTH AC and battery,
             # on every SKU (locked or unlocked). This is the OS-level power-limit ceiling Windows
             # itself controls; locked SKUs are still hard-capped in hardware by Intel underneath
             # this (PL1/PL2), so this setting won't let a locked chip exceed its silicon limit, but
             # it removes every OS-side throttle so nothing is held back from what the chip can do.
-            powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 2>$null | Out-Null
-            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 3 2>$null | Out-Null
+            powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 2 2>$null | Out-Null
+            powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 2 2>$null | Out-Null
             powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c 100 2>$null | Out-Null
             $dcMin = if ($IsLaptop) { 50 } else { 100 }
             powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR 893dee8e-2bef-41e0-89c6-b55d0929964c $dcMin 2>$null | Out-Null
             powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
-            Write-Ok "Boost=Aggressive, min processor state=100% on AC and ${dcMin}% on battery - tuned for this chassis"
+            Write-Ok "Boost=Aggressive (2), min processor state=100% on AC and ${dcMin}% on battery - tuned for this chassis"
+            # EPP is optional and hardware/firmware-dependent. Only write it
+            # when powercfg exposes the setting; never create a fake registry value.
+            $eppGuid = '36687f9e-e3a5-4dbf-b1dc-15eb381c6863'
+            $eppQuery = @(powercfg.exe /query SCHEME_CURRENT SUB_PROCESSOR $eppGuid 2>$null) -join "`n"
+            if ($eppQuery -and $eppQuery -notmatch 'Invalid Parameters|cannot find') {
+                $eppBefore = ($eppQuery | Select-String 'Current AC Power Setting Index|Current DC Power Setting Index') -join '; '
+                powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR $eppGuid 0 2>$null | Out-Null
+                powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR $eppGuid $(if ($IsLaptop) { 50 } else { 0 }) 2>$null | Out-Null
+                $eppAfter = @(powercfg.exe /query SCHEME_CURRENT SUB_PROCESSOR $eppGuid 2>$null | Select-String 'Current AC Power Setting Index|Current DC Power Setting Index') -join '; '
+                Write-Ok "EPP supported: BEFORE [$eppBefore] AFTER [$eppAfter]"
+            } else {
+                Write-Info2 "EPP: SKIPPED (PERFEPP is not exposed by this CPU/firmware/power plan)"
+            }
             if ($IsLaptop) { Write-Info2 "Laptop battery profile: AC stays at maximum responsiveness; battery uses ${dcMin}% minimum to reduce heat and power drain." }
         } catch { Write-Warn2 "Some Intel powercfg tweaks failed: $($_.Exception.Message)" }
         Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\be337238-0d82-4146-a960-4f3749d470c7' 'Attributes' 2 'DWord' | Out-Null
@@ -2530,6 +3092,20 @@ function Invoke-CpuAdaptive {
     else {
         Write-Warn2 "CPU brand not recognized - skipping CPU-specific deep tweaks (generic power tweaks from Apply Ultra still apply)"
     }
+
+    # Core parking is a SEPARATE mechanism from min-processor-state above: even at 100% min
+    # P-state, Windows can still fully "park" (idle-off) logical cores under light load and
+    # un-park them on demand - that park/unpark transition is a real, measurable source of
+    # 1%-low stutters in bursty game workloads (a core parks during a quiet frame, then a
+    # sudden AI/physics/network spike needs it NOW and pays the wake-up latency). Setting both
+    # the parked-core minimum AND maximum to 100% keeps every logical core awake at all times.
+    try {
+        $cpGuid = '0cc5b647-c1df-4637-891a-dec35c318583'   # SUB_PROCESSOR core parking min/max cores
+        powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR $cpGuid 100 2>$null | Out-Null
+        powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR $cpGuid 100 2>$null | Out-Null
+        powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
+        Write-Ok "CPU core parking disabled (100% of logical cores stay unparked) - removes park/unpark wake-up latency from 1% lows"
+    } catch { Write-Warn2 "Core parking tweak failed: $($_.Exception.Message)" }
 }
 
 # ===========================================================================
@@ -2606,28 +3182,21 @@ function Invoke-RamAdaptive {
     if ($Ram.TotalGB -lt 8) {
         Write-Info2 "RAM < 8GB ($($Ram.TotalGB)GB) - applying low-memory profile"
         Set-Reg $mm 'DisablePagingExecutive' 0 'DWord' | Out-Null   # keep paging exec ON, don't starve RAM
-        Set-Reg $mm 'IoPageLockLimit' 0x1000000 'DWord' | Out-Null  # smaller lock limit (16MB)
-        Write-Ok "Aggressive pagefile allowed, standby list kept small, ReadyBoost recommended if you have a spare USB stick"
+        Write-Ok "Low-memory profile: paging executive kept pageable; IoPageLockLimit unchanged"
     }
     elseif ($Ram.TotalGB -lt 16) {
         Write-Info2 "RAM 8-15GB ($($Ram.TotalGB)GB) - applying balanced profile"
         Set-Reg $mm 'DisablePagingExecutive' 0 'DWord' | Out-Null
-        Set-Reg $mm 'IoPageLockLimit' 0x4000000 'DWord' | Out-Null  # 256MB
-        Write-Ok "Balanced profile: paging executive kept, IoPageLockLimit=256MB"
+        Write-Ok "Balanced profile: paging executive kept; IoPageLockLimit unchanged"
     }
     else {
-        Write-Info2 "RAM >= 16GB ($($Ram.TotalGB)GB) - applying high-memory profile"
-        Set-Reg $mm 'DisablePagingExecutive' 1 'DWord' | Out-Null   # keep kernel code resident
-        # Speed tier drives how large a lock limit is actually worth reserving - fast RAM can
-        # move data in/out of that reserve fast enough to make a bigger limit worthwhile, slow
-        # RAM just reserves memory it can't service any quicker with.
-        $lockLimit = switch ($Ram.SpeedTier) { 'Fast' { 0xC000000 }; 'Slow' { 0x6000000 }; default { 0x8000000 } }  # 192MB fast / 96MB slow / 128MB mid
-        Set-Reg $mm 'IoPageLockLimit' $lockLimit 'DWord' | Out-Null
+        Write-Info2 "RAM >= 16GB ($($Ram.TotalGB)GB) - applying adaptive memory profile"
+        Set-Reg $mm 'DisablePagingExecutive' 0 'DWord' | Out-Null
         try {
-            if ($Ram.TotalGB -ge 15) { Disable-MMAgent -mc -ErrorAction SilentlyContinue; Write-Ok "Memory compression disabled" }
+            if ($Ram.TotalGB -ge 32) { Disable-MMAgent -mc -ErrorAction SilentlyContinue; Write-Ok "Memory compression disabled (>=32GB default)" }
+            else { Enable-MMAgent -mc -ErrorAction SilentlyContinue; Write-Ok "Memory compression kept on (16-31GB safe default)" }
         } catch {}
-        $lockMB = [math]::Round($lockLimit / 1MB, 0)
-        Write-Ok "DisablePagingExecutive=1, IoPageLockLimit=${lockMB}MB (scaled for $($Ram.SpeedTier)-tier $($Ram.SpeedMHz)MHz RAM), memory compression off"
+        Write-Ok "DisablePagingExecutive=0; IoPageLockLimit unchanged"
     }
     if ($Ram.ChannelConfig -eq 'Single-channel') {
         Write-Warn2 "Single-channel RAM detected ($($Ram.Slots) stick installed) - this halves memory bandwidth vs dual-channel and is one of the biggest silent FPS killers on a PC like this. No registry tweak can fix this - adding a second matched stick in the other slot is the actual fix."
@@ -2704,6 +3273,98 @@ function Invoke-StorageAdaptive {
 # ===========================================================================
 # v2.0 — NETWORK ADAPTIVE DEEP TWEAKS
 # ===========================================================================
+function Invoke-InputUsbAdaptive {
+    param($Cpu = $null)
+    # Everything here targets ONE thing: the time between a physical mouse/keyboard event
+    # reaching the USB controller and it reaching the game's input loop. Network and CPU
+    # tuning elsewhere in this run affect 1%-lows and ping; this is the one function that
+    # is purely about raw input latency.
+    $canSetIrqAffinity = [bool]($Cpu -and $Cpu.Threads -ge 2)
+    $irqMask = [byte[]](2,0,0,0,0,0,0,0)
+
+    # 1) USB Link Power Management (LPM/U1/U2 states): USB 3.x controllers can drop a port
+    # into a low-power link state between packets to save power. Waking back up from that
+    # state adds real, inconsistent latency to every mouse/keyboard report - the exact
+    # opposite of what a competitive setup wants. Disabling this per-hub is more thorough
+    # than the power-plan-wide "USB selective suspend" toggle already applied earlier.
+    $usbHubsTouched = 0
+    try {
+        $hubClass = 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB'
+        Get-ChildItem $hubClass -ErrorAction SilentlyContinue | ForEach-Object {
+            Get-ChildItem $_.PSPath -ErrorAction SilentlyContinue | ForEach-Object {
+                $paramsPath = Join-Path $_.PSPath 'Device Parameters'
+                if (Test-Path $paramsPath) {
+                    try {
+                        Set-Reg $paramsPath 'EnhancedPowerManagementEnabled' 0 'DWord' | Out-Null
+                        $usbHubsTouched++
+                    } catch {}
+                }
+            }
+        }
+        if ($usbHubsTouched -gt 0) {
+            Write-Ok "USB Link Power Management (U1/U2 low-power link states) disabled on $usbHubsTouched USB device node(s) - removes link-wake latency from every input report"
+        } else {
+            Write-Info2 "No USB device nodes exposed a Link Power Management setting to disable (normal on some chipsets)"
+        }
+    } catch { Write-Warn2 "USB Link Power Management pass skipped: $($_.Exception.Message)" }
+
+    # 2) Per-device selective suspend for HID input devices specifically (mice, keyboards,
+    # and their composite USB parents) - belt-and-suspenders on top of the power-plan-wide
+    # setting, since some HID composite devices manage their own suspend policy independent
+    # of the plan-level toggle.
+    $hidTouched = 0
+    try {
+        $hidDevices = Get-PnpDevice -Class 'HIDClass','Mouse','Keyboard' -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'OK' }
+        foreach ($dev in $hidDevices) {
+            try {
+                $devKey = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)\Device Parameters"
+                if (Test-Path $devKey) {
+                    Set-Reg $devKey 'EnhancedPowerManagementEnabled' 0 'DWord' | Out-Null
+                    $hidTouched++
+                }
+            } catch {}
+        }
+        if ($hidTouched -gt 0) { Write-Ok "Selective suspend disabled directly on $hidTouched HID input device(s) (mouse/keyboard/composite)" }
+    } catch { Write-Warn2 "Per-device HID power tweak skipped: $($_.Exception.Message)" }
+
+    # 3) IRQ affinity for USB host controllers - same reasoning as the NIC IRQ steering
+    # earlier: keep USB interrupt handling off Core 0 so a busy Core 0 (where Windows and
+    # most game main-threads default to) never delays processing a fresh input report.
+    try {
+        $usbCtrlClass = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{36fc9e60-c465-11cf-8056-444553540000}'
+        $ctrls = Get-ChildItem $usbCtrlClass -ErrorAction SilentlyContinue | Where-Object {
+            (Get-ItemProperty $_.PSPath -Name 'DriverDesc' -ErrorAction SilentlyContinue).DriverDesc -match 'Host Controller|xHCI|eXtensible'
+        }
+        $steered = 0
+        foreach ($ctrl in $ctrls) {
+            if (-not $canSetIrqAffinity) { break }
+            try {
+                Set-Reg $ctrl.PSPath 'MessageSignaledInterruptProperties\MSISupported' 1 'DWord' | Out-Null
+                $affPath = Join-Path $ctrl.PSPath 'Interrupt Management\Affinity Policy'
+                Set-Reg $affPath 'DevicePolicy' 4 'DWord' | Out-Null
+                Set-Reg $affPath 'AssignmentSetOverride' $irqMask 'Binary' | Out-Null
+                $steered++
+            } catch {}
+        }
+        if ($steered -gt 0) { Write-Ok "IRQ affinity steered away from Core 0 for $steered USB host controller(s), MSI mode enabled" }
+        elseif (-not $canSetIrqAffinity) { Write-Info2 "USB IRQ affinity skipped: CPU exposes fewer than 2 logical threads" }
+    } catch { Write-Warn2 "USB host controller IRQ affinity step skipped: $($_.Exception.Message)" }
+
+    # 4) Tighten the HID input queue size one notch further on higher-end hardware. The
+    # legacy step earlier already scales this by chassis/CPU/RAM (20-32); on a CPU with
+    # 16+ threads that easily drains the queue every frame, an even smaller buffer shaves a
+    # little more worst-case buffering delay without risking dropped reports.
+    try {
+        if ($Cpu -and $Cpu.Threads -ge 16 -and $script:InputQueueSize -gt 16) {
+            $script:InputQueueSize = 16
+            Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\mouclass\Parameters' 'MouseDataQueueSize' $script:InputQueueSize 'DWord' | Out-Null
+            Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\kbdclass\Parameters' 'KeyboardDataQueueSize' $script:InputQueueSize 'DWord' | Out-Null
+            Write-Ok "HID input queue tightened further to $($script:InputQueueSize) for this $($Cpu.Threads)-thread CPU"
+        }
+    } catch {}
+}
+
+
 function Invoke-NetworkAdaptive {
     param([Parameter(Mandatory)]$NicList, $Cpu = $null)
     if ($NicList.Count -eq 0) { Write-Warn2 "No active physical NIC detected - skipping network deep tweaks"; return }
@@ -2840,19 +3501,46 @@ function Invoke-NetworkAdaptive {
     }
     try { netsh.exe int tcp set global rss=enabled | Out-Null } catch {}
     try { netsh.exe int tcp set global ecncapability=disabled | Out-Null } catch {}
-    try { netsh.exe int tcp set global autotuninglevel=experimental | Out-Null } catch {}
+    # NORMAL is the Windows default; experimental is reserved for an explicit
+    # A/B test and must not be silently applied as a permanent gaming tweak.
+    try { netsh.exe int tcp set global autotuninglevel=normal | Out-Null } catch {}
     try { netsh.exe int tcp set global timestamps=disabled | Out-Null } catch {}
     try { netsh.exe int tcp set global rsc=disabled | Out-Null } catch {}
     try { netsh.exe int tcp set global fastopen=enabled | Out-Null } catch {}
     try { netsh.exe int tcp set supplemental template=internet icw=10 | Out-Null } catch {}
     try { netsh.exe int udp set global uro=disabled | Out-Null } catch {}    # UDP Receive Offload off - FiveM traffic is mostly UDP, offload batching adds latency here
+    # Extreme mode: lower the initial retransmission timeout from the 3000ms default down to
+    # 300ms (fastest Windows allows) so a single dropped SYN/packet recovers ten times faster;
+    # disable TCP's Hybrid Slow Start (its heuristics can misfire as "congestion" on a genuinely
+    # clean, low-latency gaming line and needlessly throttle); and disable send pacing, which
+    # deliberately spaces packets out to smooth bursty senders - the opposite of what a real-time
+    # game connection with small, frequent packets wants.
+    # Keep TCP retransmission, HyStart and pacing at Windows defaults. These
+    # affect TCP recovery/throughput, not FiveM UDP RTT directly.
     try {
         $tcpParams = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
         Set-Reg $tcpParams 'TcpTimedWaitDelay' 30 'DWord' | Out-Null
         Set-Reg $tcpParams 'MaxUserPort' 65534 'DWord' | Out-Null
         Set-Reg $tcpParams 'FastSendDatagramThreshold' 1500 'DWord' | Out-Null   # send small UDP datagrams (like game packets) immediately, not queued
     } catch {}
-    Write-Ok "Global: RSS=ON, ECN/Timestamps/RSC=Off, AutoTuning=Experimental, TCP Fast Open=On, ICW=10, UDP receive offload off, fast small-datagram send path"
+    # Belt-and-suspenders: disable Nagle/enable immediate ACK on EVERY interface registered
+    # under Tcpip\Parameters\Interfaces, not just the physical NICs detected above. This also
+    # catches VPN/tunnel/virtual adapters (common for players routing FiveM through a VPN) that
+    # the physical-NIC-only loop earlier in this function does not see.
+    $extraIfCount = 0
+    try {
+        Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces' -ErrorAction SilentlyContinue | ForEach-Object {
+            $ip = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+            if ($ip.DhcpIPAddress -or $ip.IPAddress) {
+                Set-Reg $_.PSPath 'TcpAckFrequency' 1 'DWord' | Out-Null
+                Set-Reg $_.PSPath 'TCPNoDelay' 1 'DWord' | Out-Null
+                Set-Reg $_.PSPath 'TcpDelAckTicks' 0 'DWord' | Out-Null
+                $extraIfCount++
+            }
+        }
+    } catch {}
+    Write-Ok "Global: RSS=ON, ECN/Timestamps/RSC=Off, AutoTuning=Normal, TCP Fast Open=On, ICW=10, UDP receive offload off"
+    Write-Info2 "TCP recovery/pacing defaults kept; Nagle/immediate-ACK verified on $extraIfCount active interface(s) (TCP only)"
 }
 
 function Invoke-NetworkEnvironmentAdaptive {
@@ -2872,11 +3560,27 @@ function Invoke-NetworkEnvironmentAdaptive {
                 @{ Name='U-APSD support'; Value='Disabled' },
                 @{ Name='Preferred Band'; Value='Prefer 5GHz band' },
                 @{ Name='ARP offload for WoWLAN'; Value='Disabled' },
-                @{ Name='NS offload for WoWLAN'; Value='Disabled' }
+                @{ Name='NS offload for WoWLAN'; Value='Disabled' },
+                @{ Name='Power Saving Mode'; Value='No Power Saving' },
+                @{ Name='PSM'; Value='Disabled' },
+                @{ Name='WoWLAN'; Value='Disable' }
+                # Wireless mode is intentionally not forced; select the highest
+                # stable mode supported by the AP/driver in Windows itself.
             )) {
                 try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
             }
-            Write-Ok "Wi-Fi profile applied: power-save off, roaming/tx power optimized"
+            # Driver-independent power policy fallback: some Wi-Fi drivers do not expose "Power
+            # Saving Mode" as an advanced property at all, only through the network adapter's
+            # own power management tab (already handled by Disable-NetAdapterPowerManagement
+            # above) plus this registry mirror that a few chipsets (Intel/Realtek) read directly.
+            try {
+                $wifiDevPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}"
+                $wifiSub = Get-ChildItem $wifiDevPath -ErrorAction SilentlyContinue | Where-Object {
+                    (Get-ItemProperty $_.PSPath -Name 'DriverDesc' -ErrorAction SilentlyContinue).DriverDesc -eq $nic.Model
+                } | Select-Object -First 1
+                if ($wifiSub) { Set-Reg $wifiSub.PSPath 'PowerSaveMode' 0 'DWord' | Out-Null }
+            } catch {}
+            Write-Ok "Wi-Fi profile applied: power-save/roaming settings adjusted where supported; wireless mode left to driver/AP"
         }
         else {
             foreach ($prop in @(
@@ -2885,20 +3589,39 @@ function Invoke-NetworkEnvironmentAdaptive {
                 @{ Name='Interrupt Moderation'; Value='Disabled' },
                 @{ Name='Energy Efficient Ethernet'; Value='Disabled' },
                 @{ Name='Green Ethernet'; Value='Disabled' },
-                @{ Name='Wake on Magic Packet'; Value='Disabled' }
+                @{ Name='Wake on Magic Packet'; Value='Disabled' },
+                @{ Name='Gigabit Lite'; Value='Disabled' },
+                @{ Name='EEE'; Value='Disabled' }
             )) {
                 try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $prop.Name -DisplayValue $prop.Value -ErrorAction SilentlyContinue } catch {}
             }
-            Write-Ok "LAN profile applied: low-latency link settings"
+            # Push the NIC's own hardware ring buffers (Receive/Transmit Buffers) to their
+            # maximum. A bigger hardware queue absorbs short bursts (alt-tab, loading screens,
+            # a sudden spike of game state packets) without dropping frames - a real, direct
+            # 1%-low and packet-loss fix, distinct from every OS-side buffer already tuned
+            # elsewhere. Property names vary by vendor, so every known naming variant is tried;
+            # each is a silent no-op on adapters that don't expose it.
+            foreach ($bufName in 'Receive Buffers','Receive Descriptors','RxBuffers','Transmit Buffers','Transmit Descriptors','TxBuffers') {
+                try {
+                    $advProp = Get-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $bufName -ErrorAction SilentlyContinue
+                    if ($advProp -and $advProp.ValidDisplayValues) {
+                        $maxVal = ($advProp.ValidDisplayValues | ForEach-Object { [int]$_ } | Sort-Object -Descending | Select-Object -First 1)
+                        if ($maxVal) { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $bufName -DisplayValue "$maxVal" -ErrorAction SilentlyContinue }
+                    } elseif ($advProp -and $advProp.RegistryValue) {
+                        # Numeric-range property without an enumerated list - registry max isn't
+                        # exposed via this cmdlet, so use a generically safe high value instead.
+                        Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $bufName -RegistryValue 2048 -ErrorAction SilentlyContinue
+                    }
+                } catch {}
+            }
+            Write-Ok "LAN profile applied: low-latency link settings, hardware Rx/Tx ring buffers maximized where the driver exposes them"
         }
 
         # Keep the adapter MTU at a standard value only when it is not a VPN/virtual interface.
         try {
             $ipIf = Get-NetIPInterface -InterfaceIndex $nic.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-            if ($ipIf -and $ipIf.NlMtuBytes -gt 1500 -and $nic.Model -notmatch 'VPN|Virtual|TAP|Hyper-V|VMware|VirtualBox') {
-                $script:Changes.Add([PSCustomObject]@{ Kind='Mtu'; IfIndex=$nic.IfIndex; AddressFamily='IPv4'; OldMtu=[int]$ipIf.NlMtuBytes })
-                Set-NetIPInterface -InterfaceIndex $nic.IfIndex -AddressFamily IPv4 -NlMtuBytes 1500 -ErrorAction SilentlyContinue
-                Write-Ok "MTU normalized to 1500 on $($nic.Name)"
+            if ($ipIf) {
+                Write-Info2 "MTU on $($nic.Name): $($ipIf.NlMtuBytes) bytes (detected only; no automatic MTU rewrite)"
             }
         } catch {}
 
@@ -2980,15 +3703,12 @@ function Invoke-SystemAdaptiveProfile {
         Write-Ok "Storage profile: HDD detected / background prefetch kept compatible"
     }
 
-    # GPU tier: only force HAGS on real display hardware; integrated-only machines keep Windows default.
-    $hasHighTierGpu = @($Hw.Gpu | Where-Object { -not $_.IsVirtual -and $_.Brand -in @('NVIDIA','AMD') -and $_.Tier -eq 'High' }).Count -gt 0
-    if ($hasHighTierGpu) {
-        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2 'DWord' | Out-Null
-        Write-Ok "GPU profile: HAGS enabled for high-tier discrete GPU"
-    } else {
-        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 1 'DWord' | Out-Null
-        Write-Ok "GPU profile: conservative scheduling for integrated, entry/mid-tier, or unknown GPU"
-    }
+    # HAGS is a hardware/driver/game-dependent A/B test. Keep the current
+    # value instead of selecting ON/OFF from a coarse GPU tier heuristic.
+    $hagsPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'
+    $hags = Get-ItemProperty -Path $hagsPath -Name 'HwSchMode' -ErrorAction SilentlyContinue
+    if ($null -ne $hags) { Write-Info2 "HAGS: current value kept ($($hags.HwSchMode)); test ON/OFF separately if needed" }
+    else { Write-Info2 "HAGS: current Windows default kept (no explicit value detected)" }
 
     $profileName = if ($isLaptop) { 'Laptop' } else { 'Desktop' }
     $profileName += if ($cpuThreads -ge 16) { '-HighThread' } elseif ($cpuThreads -ge 8) { '-MidThread' } else { '-LowThread' }
@@ -3061,6 +3781,7 @@ function Invoke-SmartApply {
         @{ Name = 'GPU adaptive tweaks';     Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
         @{ Name = 'RAM adaptive tweaks';     Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
         @{ Name = 'Storage adaptive tweaks'; Action = { Invoke-StorageAdaptive -StorageList $hw.Storage } },
+        @{ Name = 'Input/USB adaptive tweaks'; Action = { Invoke-InputUsbAdaptive -Cpu $hw.Cpu } },
         @{ Name = 'Network adaptive tweaks'; Action = { Invoke-NetworkAdaptive -NicList $hw.Nic -Cpu $hw.Cpu; Invoke-NetworkEnvironmentAdaptive -NicList $hw.Nic } }
     )
     $total = $modules.Count
@@ -3118,10 +3839,165 @@ function Invoke-ExportReport {
 
 # ===========================================================================
 # v2.0 — DO EVERYTHING (Legacy Apply Ultra + Hardware Scan + Adaptive Deep Tweaks, one shot)
+function Get-HardwareCapabilities {
+    param([Parameter(Mandatory)]$Hw)
+    $physicalGpu = @($Hw.Gpu | Where-Object { -not $_.IsVirtual })
+    $caps = [ordered]@{
+        CPU = [ordered]@{ Brand=$Hw.Cpu.Brand; Cores=$Hw.Cpu.Cores; Threads=$Hw.Cpu.Threads; Hybrid=$Hw.Cpu.Hybrid; EPP=$false; Boost=$true }
+        GPU = [ordered]@{ Physical=($physicalGpu.Count -gt 0); Virtual=(@($Hw.Gpu | Where-Object IsVirtual).Count -gt 0); HAGS=$false; Vendors=(@($physicalGpu | ForEach-Object Brand) -join ',') }
+        RAM = [ordered]@{ TotalGB=$Hw.Ram.TotalGB; Compression=$true; Pagefile=$true; Channels=$Hw.Ram.ChannelConfig }
+        Storage = [ordered]@{ Count=@($Hw.Storage).Count; Fast=(@($Hw.Storage | Where-Object Kind -in @('NVMe','SATA SSD')).Count -gt 0) }
+        Network = [ordered]@{ Count=@($Hw.Nic).Count; WiFi=(@($Hw.Nic | Where-Object IsWireless).Count -gt 0); LAN=(@($Hw.Nic | Where-Object { -not $_.IsWireless }).Count -gt 0); RSS=$true }
+    }
+    try {
+        $eppGuid = '36687f9e-e3a5-4dbf-b1dc-15eb381c6863'
+        $q = @(powercfg.exe /query SCHEME_CURRENT SUB_PROCESSOR $eppGuid 2>$null) -join "`n"
+        $caps.CPU.EPP = [bool]($q -and $q -notmatch 'Invalid Parameters|cannot find')
+    } catch {}
+    try {
+        $h = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -Name HwSchMode -ErrorAction SilentlyContinue
+        $caps.GPU.HAGS = [bool]($null -ne $h)
+    } catch {}
+    return [PSCustomObject]$caps
+}
+
+function Get-SupportedFeatures {
+    param([Parameter(Mandatory)]$Capabilities)
+    [ordered]@{
+        EPP = if ($Capabilities.CPU.EPP) { 'Supported' } else { 'Unsupported' }
+        HAGS = if ($Capabilities.GPU.HAGS) { 'Supported/Current value detected' } else { 'Unknown/Windows default' }
+        RSS = if ($Capabilities.Network.RSS) { 'Supported/verify per adapter' } else { 'Unknown' }
+        GPUProfile = if ($Capabilities.GPU.Physical) { 'Physical GPU detected' } else { 'SKIP: no physical GPU' }
+        WiFiProfile = if ($Capabilities.Network.WiFi) { 'Supported/adapter-specific' } else { 'SKIP: no Wi-Fi adapter' }
+        LanProfile = if ($Capabilities.Network.LAN) { 'Supported/adapter-specific' } else { 'SKIP: no LAN adapter' }
+    }
+}
 # ===========================================================================
 # ===========================================================================
 # AGGRESSIVE OPTIMIZATION MODULE
 # ===========================================================================
+function Set-HardcorePowerSetting {
+    param(
+        [Parameter(Mandatory)][string]$SubGroup,
+        [Parameter(Mandatory)][string]$Setting,
+        [Parameter(Mandatory)][int]$Value,
+        [Parameter(Mandatory)][string]$Label
+    )
+    try {
+        $query = @(powercfg.exe /query SCHEME_CURRENT $SubGroup $Setting 2>$null) -join "`n"
+        $oldMatch = [regex]::Match($query, '(?im)Current AC Power Setting Index:\s+0x([0-9a-f]+)')
+        if (-not $oldMatch.Success) { throw "Power setting is not exposed by the active plan" }
+        $oldValue = [convert]::ToInt32($oldMatch.Groups[1].Value, 16)
+        if ($oldValue -eq $Value) {
+            Write-Info2 "$Label already set to $Value"
+            return
+        }
+        if ($script:DryRun) {
+            Write-Host "  [DRYRUN] would set $Label to $Value" -ForegroundColor DarkCyan
+            return
+        }
+        powercfg.exe /setacvalueindex SCHEME_CURRENT $SubGroup $Setting $Value 2>$null | Out-Null
+        powercfg.exe /setactive SCHEME_CURRENT 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "powercfg returned exit code $LASTEXITCODE" }
+        $script:Changes.Add([PSCustomObject]@{
+            Kind = 'PowerSetting'
+            SubGroup = $SubGroup
+            Setting = $Setting
+            OldValue = $oldValue
+        })
+        Write-Host "  [OK] $Label disabled" -ForegroundColor Green
+    } catch {
+        Write-Warn2 "$Label skipped: $($_.Exception.Message)"
+    }
+}
+
+function Set-HardcoreNetworkTweaks {
+    Write-Host ""; Write-Host "HARDCORE NETWORK & WI-FI" -ForegroundColor Red
+
+    try {
+        netsh.exe int tcp set global congestionprovider=cubic 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "netsh returned exit code $LASTEXITCODE" }
+        $script:Changes.Add([PSCustomObject]@{ Kind = 'NetshCongestionProvider'; OldValue = 'default' })
+        Write-Host "  [OK] TCP congestion provider set to CUBIC" -ForegroundColor Green
+    } catch { Write-Warn2 "TCP congestion provider skipped: $($_.Exception.Message)" }
+
+    $adapters = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+    foreach ($adapter in $adapters) {
+        foreach ($propertyName in 'Large Send Offload V2 (IPv4)','Large Send Offload V2 (IPv6)') {
+            try {
+                $property = Get-NetAdapterAdvancedProperty -Name $adapter.Name -DisplayName $propertyName -ErrorAction SilentlyContinue
+                if (-not $property) { continue }
+                Set-NetAdapterAdvancedProperty -Name $adapter.Name -DisplayName $propertyName -DisplayValue 'Disabled' -ErrorAction Stop
+                $script:Changes.Add([PSCustomObject]@{
+                    Kind = 'AdapterAdvancedProperty'
+                    AdapterName = $adapter.Name
+                    DisplayName = $property.DisplayName
+                    OldDisplayValue = [string]$property.DisplayValue
+                    OldRegistryValue = [string]$property.RegistryValue
+                })
+                Write-Host "  [OK] $($adapter.Name): $propertyName disabled" -ForegroundColor Green
+            } catch { Write-Warn2 "$($adapter.Name): $propertyName skipped: $($_.Exception.Message)" }
+        }
+
+        try {
+            $config = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "Index=$($adapter.IfIndex)" -ErrorAction Stop
+            if ($config -and $config.IPEnabled) {
+                $oldNetbios = if ($null -eq $config.TcpipNetbios) { 0 } else { [int]$config.TcpipNetbios }
+                if ($oldNetbios -ne 2) {
+                    Invoke-CimMethod -InputObject $config -MethodName EnableNetbios -Arguments @{ TcpipNetbiosOptions = [uint32]2 } -ErrorAction Stop | Out-Null
+                    $script:Changes.Add([PSCustomObject]@{ Kind = 'Netbios'; IfIndex = $adapter.IfIndex; OldValue = $oldNetbios })
+                    Write-Host "  [OK] $($adapter.Name): NetBIOS over TCP/IP disabled" -ForegroundColor Green
+                }
+            }
+        } catch { Write-Warn2 "$($adapter.Name): NetBIOS change skipped: $($_.Exception.Message)" }
+    }
+
+    foreach ($wifi in @($adapters | Where-Object { $_.Name -match '(?i)wi-?fi|wireless|802\.11' -or $_.InterfaceDescription -match '(?i)wi-?fi|wireless|802\.11' })) {
+        try {
+            $autoConfigState = @(netsh.exe wlan show autoconfig interface="$($wifi.Name)" 2>$null) -join "`n"
+            if ($autoConfigState -notmatch '(?i)enabled|disabled') {
+                Write-Warn2 "Wi-Fi autoconfig state could not be read on $($wifi.Name); skipped to protect reset accuracy"
+                continue
+            }
+            $oldEnabled = $autoConfigState -match '(?i)enabled'
+            if (-not $oldEnabled) {
+                Write-Info2 "Wi-Fi autoconfig is already disabled on $($wifi.Name); skipped"
+                continue
+            }
+            netsh.exe wlan set autoconfig enabled=no interface="$($wifi.Name)" 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "netsh returned exit code $LASTEXITCODE" }
+            $script:Changes.Add([PSCustomObject]@{ Kind = 'WlanAutoConfig'; InterfaceName = $wifi.Name; OldEnabled = $oldEnabled })
+            Write-Host "  [WARNING] Wi-Fi autoconfig disabled on $($wifi.Name). New Wi-Fi networks will not appear until Reset or manual re-enable." -ForegroundColor Yellow
+        } catch { Write-Warn2 "Wi-Fi autoconfig skipped on $($wifi.Name): $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-HardcoreGamingFullSystem {
+    Write-Host ""; Write-Host "HARDCORE GAMING FULL-SYSTEM OVERHAUL" -ForegroundColor Red
+    Set-HardcoreNetworkTweaks
+
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' 'Win32PrioritySeparation' 38 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'SystemResponsiveness' 0 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games' 'GPU Priority' '8' 'String' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games' 'Priority' '6' 'String' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games' 'Scheduling Category' 'High' 'String' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games' 'SFIO Priority' 'High' 'String' | Out-Null
+    Write-Host "  [OK] Foreground priority and Games MMCSS profile applied" -ForegroundColor Green
+    Set-HardcorePowerSetting -SubGroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '5d76a2ca-e8c0-402f-a133-2158492d58ad' -Value 1 -Label 'Processor idle disable'
+
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm' 'OverlayTestMode' 5 'DWord' | Out-Null
+    Set-HardcorePowerSetting -SubGroup '501a4d13-42af-4429-9fd1-a8218c268e20' -Setting 'ee12f906-d277-404b-b6da-e5fa1a558deb' -Value 0 -Label 'PCIe ASPM'
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' 'EnablePrefetcher' 0 'DWord' | Out-Null
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' 'EnableSuperfetch' 0 'DWord' | Out-Null
+    Write-Host "  [OK] MPO, PCIe ASPM, Prefetcher and Superfetch disabled" -ForegroundColor Green
+
+    Set-Reg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0 'DWord' | Out-Null
+    Set-Reg 'HKCU:\System\GameConfigStore' 'GameDVR_FSEBehaviorMode' 2 'DWord' | Out-Null
+    Set-Reg 'HKCU:\Control Panel\Desktop' 'MenuShowDelay' '0' 'String' | Out-Null
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting' 'Disabled' 1 'DWord' | Out-Null
+    Write-Host "  [OK] GameDVR, menu delay and Windows Error Reporting disabled" -ForegroundColor Green
+}
+
 function Invoke-AggressiveOptimization {
     Write-Host ""
     Write-Host "════ AGGRESSIVE OPTIMIZATIONS ════" -ForegroundColor Red
@@ -3180,6 +4056,8 @@ function Invoke-AggressiveOptimization {
         # 8. Disable notifications
         Write-Host "📢 Disabling notifications..." -ForegroundColor Cyan
         Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings' 'NOC_GLOBAL_SETTING_TOASTS_ENABLED' 0 'DWord'
+
+        Invoke-HardcoreGamingFullSystem
         
         Write-Host "✅ Aggressive optimizations applied" -ForegroundColor Green
     } catch {
@@ -3188,14 +4066,32 @@ function Invoke-AggressiveOptimization {
 }
 
 function Invoke-DoEverything {
-    Clear-Host
+    if (-not $script:GuiWorker) { try { Clear-Host } catch {} }
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     Write-Host "  NONGPLAISHOP - APPLY EVERYTHING (Ultra + Adaptive Deep Tweak)" -ForegroundColor Cyan
     Write-Host "  📊 Optimization Level: $script:OptimizationLevel" -ForegroundColor Yellow
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
     if ($script:DryRun) { Write-Warn2 "DRY RUN MODE - preview only, nothing will actually be changed" }
     Write-Host ""
-    
+
+    # v3.0: Detect-before-touch. Hardware/capability detection now runs FIRST,
+    # before ANY setting gets written - including the legacy/aggressive steps
+    # below. This is a hard ordering requirement: nothing may write a setting
+    # to this machine without first knowing what hardware/capability profile
+    # it actually has. The scan result ($hw/$capabilities/$features) is passed
+    # down to every module that follows, including the legacy stage.
+    $script:GuiStage = 'scan'
+    Write-Host "  🔍 STEP 1/3: Detecting hardware and capabilities (before any change is written)..." -ForegroundColor Cyan
+    $hw = Invoke-HardwareScan
+    $capabilities = Get-HardwareCapabilities -Hw $hw
+    $features = Get-SupportedFeatures -Capabilities $capabilities
+    Write-Info2 "Universal capability scan completed; unsupported features will be skipped"
+    foreach ($feature in $features.GetEnumerator()) {
+        Write-Host ("  [CAPABILITY] {0}: {1}" -f $feature.Key, $feature.Value) -ForegroundColor DarkCyan
+    }
+    Show-HardwareSummary -Hw $hw
+    Write-Host ""
+
     # Apply level-specific tweaks
     if ($script:OptimizationLevel -eq 'Aggressive') {
         Write-Host "🔥 Applying AGGRESSIVE optimization tweaks..." -ForegroundColor Red
@@ -3207,6 +4103,7 @@ function Invoke-DoEverything {
     }
     Write-Host ""
 
+    Write-Host "  ⚙️  STEP 2/3: Legacy + aggressive tuning modules..." -ForegroundColor Cyan
     # --- Part 1: full legacy 39-step Apply Ultra (creates backup folder + restore point) ---
     $script:GuiStage = 'legacy'
     $script:LegacyStepCount = 0
@@ -3217,19 +4114,19 @@ function Invoke-DoEverything {
     Invoke-DeepAggressiveTuning
     Invoke-NetworkAggressiveTuning
 
-    # Scan first, then select every system profile from this machine's actual hardware.
-    # The adaptive profile is applied before CPU/GPU/RAM/Storage/Network modules.
+    # Hardware/capability data was already collected at the very top of this
+    # function (before any write happened) - reuse it here instead of
+    # re-scanning, so the whole run works from one single, consistent
+    # snapshot of the machine's hardware/capabilities.
     $script:GuiStage = 'adaptive'
-    $hw = Invoke-HardwareScan
     Invoke-SystemAdaptiveProfile -Hw $hw
     Invoke-AdaptiveFiveMRuntime -Hw $hw
 
     # --- Part 2: apply hardware-specific adaptive modules and layer on adaptive CPU/GPU/RAM/Storage/Network tweaks ---
     Write-Host ""
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    Write-Host "  HARDWARE PROFILE -> ADAPTIVE DEEP TWEAK" -ForegroundColor Cyan
+    Write-Host "  STEP 3/3: HARDWARE PROFILE -> ADAPTIVE DEEP TWEAK" -ForegroundColor Cyan
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
-    Show-HardwareSummary -Hw $hw
 
     if (-not $script:BackupDir) { New-BackupFolder | Out-Null }
 
@@ -3238,6 +4135,7 @@ function Invoke-DoEverything {
         @{ Name = 'GPU adaptive tweaks';     Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
         @{ Name = 'RAM adaptive tweaks';     Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
         @{ Name = 'Storage adaptive tweaks'; Action = { Invoke-StorageAdaptive -StorageList $hw.Storage } },
+        @{ Name = 'Input/USB adaptive tweaks'; Action = { Invoke-InputUsbAdaptive -Cpu $hw.Cpu } },
         @{ Name = 'Network adaptive tweaks'; Action = { Invoke-NetworkAdaptive -NicList $hw.Nic -Cpu $hw.Cpu } }
     )
     $total = $modules.Count
@@ -3261,6 +4159,503 @@ function Invoke-DoEverything {
         Write-Info2 "Use menu option [2] RESET ALL any time to undo everything."
     }
     if (-not $script:GuiWorker) { Read-Host "Press Enter to return to menu" }
+}
+
+# ===========================================================================
+# v2.3 — ADDITIVE / NON-DESTRUCTIVE NETWORK AND GAME PROFILE TOOLS
+# ---------------------------------------------------------------------------
+# These commands intentionally do not replace the legacy Apply Everything flow.
+# A Windows setting cannot have duplicate value names, so a setting that already
+# exists is skipped. Settings that require an explicit replacement (DNS) always
+# take a complete snapshot first and can be restored from that snapshot.
+# ===========================================================================
+
+function Add-RegIfMissing {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Value,
+        [ValidateSet('DWord','String','Binary','QWord','ExpandString')][string]$Type = 'DWord'
+    )
+    try {
+        $existing = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+        if ($existing -and ($existing.PSObject.Properties.Name -contains $Name)) {
+            Write-Info2 "Skipped existing value: ${Path}\${Name}"
+            return $false
+        }
+        return (Set-Reg -Path $Path -Name $Name -Value $Value -Type $Type)
+    } catch {
+        Write-Warn2 "Could not inspect ${Path}\${Name} - $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-NetworkSnapshotPath {
+    param([Parameter(Mandatory)][string]$BackupDir)
+    return (Join-Path $BackupDir 'network-snapshot.json')
+}
+
+function New-NetworkSnapshot {
+    param([string]$BackupDir = $script:BackupDir, [switch]$Quiet)
+
+    if ($script:DryRun) {
+        if (-not $Quiet) { Write-Host '  [DRYRUN] would capture DNS, TCP, NIC, MTU, network-profile, and power-plan state.' -ForegroundColor DarkCyan }
+        return $null
+    }
+    if (-not $BackupDir) { $BackupDir = New-BackupFolder }
+
+    $path = Get-NetworkSnapshotPath -BackupDir $BackupDir
+    if (Test-Path $path) { return $path }
+
+    try {
+        $dns = @(
+            Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    InterfaceIndex = [int]$_.InterfaceIndex
+                    InterfaceAlias = [string]$_.InterfaceAlias
+                    ServerAddresses = @($_.ServerAddresses)
+                }
+            }
+        )
+        $interfaces = @(
+            Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    InterfaceIndex = [int]$_.InterfaceIndex
+                    InterfaceAlias = [string]$_.InterfaceAlias
+                    NlMtuBytes = [int]$_.NlMtuBytes
+                    Dhcp = [string]$_.Dhcp
+                }
+            }
+        )
+        $profiles = @(
+            Get-NetConnectionProfile -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    InterfaceIndex = [int]$_.InterfaceIndex
+                    Name = [string]$_.Name
+                    NetworkCategory = [string]$_.NetworkCategory
+                }
+            }
+        )
+        $adapters = @(
+            Get-NetAdapter -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $adapter = $_
+                $advanced = @(
+                    Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction SilentlyContinue |
+                    ForEach-Object {
+                        [PSCustomObject]@{
+                            DisplayName = [string]$_.DisplayName
+                            DisplayValue = [string]$_.DisplayValue
+                            RegistryKeyword = [string]$_.RegistryKeyword
+                            RegistryValue = @($_.RegistryValue)
+                        }
+                    }
+                )
+                [PSCustomObject]@{
+                    Name = [string]$adapter.Name
+                    InterfaceDescription = [string]$adapter.InterfaceDescription
+                    Status = [string]$adapter.Status
+                    MacAddress = [string]$adapter.MacAddress
+                    LinkSpeed = [string]$adapter.LinkSpeed
+                    AdvancedProperties = $advanced
+                }
+            }
+        )
+        $snapshot = [ordered]@{
+            SchemaVersion = 1
+            CapturedAt = (Get-Date).ToString('o')
+            Dns = $dns
+            Interfaces = $interfaces
+            NetworkProfiles = $profiles
+            Adapters = $adapters
+            TcpGlobal = @(netsh.exe int tcp show global 2>$null)
+            UdpGlobal = @(netsh.exe int udp show global 2>$null)
+            ActivePowerScheme = @(powercfg.exe /getactivescheme 2>$null)
+        }
+        $snapshot | ConvertTo-Json -Depth 8 | Set-Content -Path $path -Encoding UTF8
+        $script:Changes.Add([PSCustomObject]@{ Kind='NetworkSnapshot'; Path=$path })
+        Save-Changes
+        if (-not $Quiet) { Write-Ok "Network snapshot saved: $path" }
+        return $path
+    } catch {
+        Write-Warn2 "Network snapshot failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Restore-NetworkSnapshot {
+    param([Parameter(Mandatory)][string]$SnapshotPath, [switch]$Quiet)
+
+    if (-not (Test-Path $SnapshotPath)) {
+        if (-not $Quiet) { Write-Warn2 "Network snapshot not found: $SnapshotPath" }
+        return $false
+    }
+    try {
+        $snapshot = Get-Content -Path $SnapshotPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        $restored = 0
+        foreach ($entry in @($snapshot.Dns)) {
+            if ($null -eq $entry.InterfaceIndex) { continue }
+            $servers = @($entry.ServerAddresses | Where-Object { $_ })
+            if ($servers.Count -gt 0) {
+                Set-DnsClientServerAddress -InterfaceIndex ([int]$entry.InterfaceIndex) -ServerAddresses $servers -ErrorAction SilentlyContinue
+            } else {
+                Set-DnsClientServerAddress -InterfaceIndex ([int]$entry.InterfaceIndex) -ResetServerAddresses -ErrorAction SilentlyContinue
+            }
+            $restored++
+        }
+        foreach ($entry in @($snapshot.Interfaces)) {
+            if ($entry.InterfaceIndex -and $entry.NlMtuBytes -gt 0) {
+                Set-NetIPInterface -InterfaceIndex ([int]$entry.InterfaceIndex) -AddressFamily IPv4 -NlMtuBytes ([int]$entry.NlMtuBytes) -ErrorAction SilentlyContinue
+            }
+        }
+        foreach ($entry in @($snapshot.NetworkProfiles)) {
+            if ($entry.InterfaceIndex -and $entry.NetworkCategory -in @('Public','Private')) {
+                Set-NetConnectionProfile -InterfaceIndex ([int]$entry.InterfaceIndex) -NetworkCategory $entry.NetworkCategory -ErrorAction SilentlyContinue
+            }
+        }
+        if (-not $Quiet) { Write-Ok "Restored DNS/MTU/network-profile state from snapshot ($restored DNS interface(s))." }
+        return $true
+    } catch {
+        if (-not $Quiet) { Write-Warn2 "Network snapshot restore failed: $($_.Exception.Message)" }
+        return $false
+    }
+}
+
+function Get-AdditiveNetworkBackup {
+    if ($script:DryRun) {
+        Write-Host '  [DRYRUN] would create a backup folder and capture a network snapshot before changing anything.' -ForegroundColor DarkCyan
+        return $null
+    }
+    if (-not $script:BackupDir) { New-BackupFolder | Out-Null }
+    return (New-NetworkSnapshot -BackupDir $script:BackupDir -Quiet)
+}
+
+function Invoke-DnsBenchmark {
+    # Section 15 of the spec: measures REAL resolution time against the current DNS and three
+    # well-known public resolvers, using the same well-known hostname against each so the
+    # comparison is apples-to-apples. Never changes DNS automatically - only reports numbers;
+    # applying a different DNS remains a separate, explicit, user-confirmed action elsewhere.
+    param([int]$Samples = 8, [string]$TestHost = 'www.google.com')
+
+    $currentServers = @()
+    try {
+        $activeIf = Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ConnectionState -eq 'Connected' } | Select-Object -First 1
+        if ($activeIf) {
+            $currentServers = @((Get-DnsClientServerAddress -InterfaceIndex $activeIf.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses | Where-Object { $_ })
+        }
+    } catch {}
+
+    $candidates = [ordered]@{
+        'Current' = $currentServers
+        'Cloudflare (1.1.1.1)' = @('1.1.1.1')
+        'Google (8.8.8.8)' = @('8.8.8.8')
+        'Quad9 (9.9.9.9)' = @('9.9.9.9')
+    }
+
+    $results = @()
+    foreach ($label in $candidates.Keys) {
+        $servers = $candidates[$label]
+        if (-not $servers -or $servers.Count -eq 0) {
+            $results += [PSCustomObject]@{ Label = $label; Reachable = $false; Average = $null; Median = $null; P95 = $null; Failures = $Samples; Samples = $Samples }
+            continue
+        }
+        $times = New-Object System.Collections.Generic.List[double]
+        $fail = 0
+        for ($i = 0; $i -lt $Samples; $i++) {
+            try {
+                Clear-DnsClientCache -ErrorAction SilentlyContinue
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                Resolve-DnsName -Name $TestHost -Server $servers[0] -DnsOnly -ErrorAction Stop | Out-Null
+                $sw.Stop()
+                $times.Add($sw.Elapsed.TotalMilliseconds)
+            } catch { $fail++ }
+        }
+        if ($times.Count -eq 0) {
+            $results += [PSCustomObject]@{ Label = $label; Reachable = $false; Average = $null; Median = $null; P95 = $null; Failures = $fail; Samples = $Samples }
+            continue
+        }
+        $sorted = $times | Sort-Object
+        $n = $sorted.Count
+        $median = if ($n % 2 -eq 0) { ($sorted[$n/2 - 1] + $sorted[$n/2]) / 2 } else { $sorted[[int][math]::Floor($n/2)] }
+        $p95Idx = [math]::Min($n - 1, [int][math]::Ceiling(0.95 * $n) - 1)
+        $results += [PSCustomObject]@{
+            Label = $label; Reachable = $true
+            Average = [math]::Round(($times | Measure-Object -Average).Average, 1)
+            Median  = [math]::Round($median, 1)
+            P95     = [math]::Round($sorted[$p95Idx], 1)
+            Failures = $fail; Samples = $Samples
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  DNS resolution benchmark (resolving '$TestHost', $Samples samples each):" -ForegroundColor Cyan
+    foreach ($r in $results) {
+        if (-not $r.Reachable) {
+            Write-Bad ("  {0,-24} [SKIP] unreachable or no server configured ({1}/{2} failed)" -f $r.Label, $r.Failures, $r.Samples)
+        } else {
+            Write-Host ("  {0,-24} avg={1,-6}ms median={2,-6}ms P95={3,-6}ms failures={4}/{5}" -f $r.Label, $r.Average, $r.Median, $r.P95, $r.Failures, $r.Samples)
+        }
+    }
+    Write-Info2 "No DNS setting was changed by this benchmark. To apply a different DNS, use the DNS menu option and confirm explicitly."
+    return $results
+}
+
+function Get-NetworkLatencyReport {
+    # Real, measured statistics from N actual ping samples - never fewer than a handful of
+    # samples and never a guess. Returns $null (with a console note) if the target cannot be
+    # reached at all, rather than fabricating numbers.
+    param(
+        [Parameter(Mandatory)][string]$Target,
+        [string]$Label = $Target,
+        [int]$Samples = 30
+    )
+    $rtts = New-Object System.Collections.Generic.List[double]
+    $lost = 0
+    for ($i = 0; $i -lt $Samples; $i++) {
+        try {
+            $r = Test-Connection -ComputerName $Target -Count 1 -ErrorAction Stop
+            $ms = if ($r.PSObject.Properties.Name -contains 'Latency') { [double]$r.Latency } else { [double]$r.ResponseTime }
+            $rtts.Add($ms)
+        } catch {
+            $lost++
+        }
+        Start-Sleep -Milliseconds 150
+    }
+    $lossPct = [math]::Round(($lost / [double]$Samples) * 100, 1)
+    if ($rtts.Count -eq 0) {
+        return [PSCustomObject]@{
+            Target = $Target; Label = $Label; Reachable = $false; Samples = $Samples
+            Average = $null; Median = $null; Min = $null; Max = $null; P95 = $null; P99 = $null
+            Jitter = $null; PacketLossPct = 100.0
+        }
+    }
+    $sorted = $rtts | Sort-Object
+    $n = $sorted.Count
+    $median = if ($n % 2 -eq 0) { ($sorted[$n/2 - 1] + $sorted[$n/2]) / 2 } else { $sorted[[int][math]::Floor($n/2)] }
+    $p95Idx = [math]::Min($n - 1, [int][math]::Ceiling(0.95 * $n) - 1)
+    $p99Idx = [math]::Min($n - 1, [int][math]::Ceiling(0.99 * $n) - 1)
+    # Jitter: mean absolute difference between consecutive samples (RFC 3550-style approximation).
+    $diffs = for ($i = 1; $i -lt $rtts.Count; $i++) { [math]::Abs($rtts[$i] - $rtts[$i-1]) }
+    $jitter = if ($diffs) { ($diffs | Measure-Object -Average).Average } else { 0 }
+    [PSCustomObject]@{
+        Target = $Target; Label = $Label; Reachable = $true; Samples = $Samples
+        Average = [math]::Round(($rtts | Measure-Object -Average).Average, 1)
+        Median  = [math]::Round($median, 1)
+        Min     = [math]::Round(($sorted | Select-Object -First 1), 1)
+        Max     = [math]::Round(($sorted | Select-Object -Last 1), 1)
+        P95     = [math]::Round($sorted[$p95Idx], 1)
+        P99     = [math]::Round($sorted[$p99Idx], 1)
+        Jitter  = [math]::Round($jitter, 1)
+        PacketLossPct = $lossPct
+    }
+}
+
+function Write-NetworkLatencyReport {
+    param([Parameter(Mandatory)]$Report)
+    if (-not $Report.Reachable) {
+        Write-Bad "$($Report.Label): unreachable ($($Report.Samples) samples sent, $($Report.PacketLossPct)% loss) - [SKIP] no stats to report"
+        return
+    }
+    Write-Host ("  {0,-10} avg={1,-6}ms median={2,-6}ms min={3,-6}ms max={4,-6}ms P95={5,-6}ms P99={6,-6}ms jitter={7,-5}ms loss={8}%" -f `
+        $Report.Label, $Report.Average, $Report.Median, $Report.Min, $Report.Max, $Report.P95, $Report.P99, $Report.Jitter, $Report.PacketLossPct)
+}
+
+function Invoke-NetworkLatencyBenchmark {
+    # Section 19/20 of the spec: real gateway + internet latency, measured separately for
+    # whichever interfaces are actually up (LAN and/or Wi-Fi), never fewer than a real sample
+    # set, never summarized from 1-2 pings.
+    param([string]$Context = 'Benchmark')
+    Write-Host ""
+    Write-Host "  Network latency benchmark ($Context) - 30 samples per target, ~5s each, please wait..." -ForegroundColor Cyan
+    $results = @()
+    try {
+        $gw = (Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty NextHop)
+        if ($gw -and $gw -ne '0.0.0.0') {
+            $gwReport = Get-NetworkLatencyReport -Target $gw -Label 'Gateway'
+            Write-NetworkLatencyReport -Report $gwReport
+            $results += $gwReport
+        } else {
+            Write-Info2 "Gateway: [SKIP] no default route found"
+        }
+    } catch { Write-Warn2 "Gateway benchmark skipped: $($_.Exception.Message)" }
+    try {
+        $inetReport = Get-NetworkLatencyReport -Target '8.8.8.8' -Label 'Internet'
+        Write-NetworkLatencyReport -Report $inetReport
+        $results += $inetReport
+    } catch { Write-Warn2 "Internet benchmark skipped: $($_.Exception.Message)" }
+    return $results
+}
+
+
+function Invoke-NetworkDiagnoseOnly {
+    Clear-Host
+    Write-Host ('   ' + ('=' * 78)) -ForegroundColor Cyan
+    Write-Host '  NETWORK DIAGNOSE — READ ONLY / NO SETTINGS CHANGED' -ForegroundColor Green
+    Write-Host ('   ' + ('=' * 78)) -ForegroundColor Cyan
+    Write-Host ''
+
+    $routes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric)
+    $defaultRoute = $routes | Select-Object -First 1
+    if ($defaultRoute) { Write-Host "Default route: $($defaultRoute.NextHop) via interface $($defaultRoute.InterfaceIndex) (metric $($defaultRoute.RouteMetric))" }
+
+    $adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+    if ($adapters.Count -eq 0) {
+        Write-Warn2 'No active network adapter found.'
+    }
+    foreach ($adapter in $adapters) {
+        Write-Host ''
+        Write-Host "Adapter: $($adapter.Name)" -ForegroundColor Cyan
+        Write-Host "  Model: $($adapter.InterfaceDescription)"
+        Write-Host "  Link:  $($adapter.LinkSpeed)"
+        $ip = Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        if ($ip) { Write-Host "  MTU:   $($ip.NlMtuBytes)  DHCP: $($ip.Dhcp)" }
+        $dns = Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        $servers = @($dns.ServerAddresses | Where-Object { $_ })
+        Write-Host ("  DNS:   " + $(if ($servers.Count) { $servers -join ', ' } else { 'Automatic / none reported' }))
+        $rsc = Get-NetAdapterRsc -Name $adapter.Name -ErrorAction SilentlyContinue
+        if ($rsc) { Write-Host "  RSC:   IPv4=$($rsc.IPv4Enabled) IPv6=$($rsc.IPv6Enabled)" }
+        $rss = Get-NetAdapterRss -Name $adapter.Name -ErrorAction SilentlyContinue
+        if ($rss) { Write-Host "  RSS:   Enabled=$($rss.Enabled)" }
+        $props = @(Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'Interrupt Moderation|Energy.*Ethernet|Receive Buffers|Transmit Buffers|Large Send Offload|Jumbo Packet' })
+        foreach ($prop in $props) { Write-Host "  $($prop.DisplayName): $($prop.DisplayValue)" }
+    }
+
+    Write-Host ''
+    Write-Host 'TCP global state:' -ForegroundColor Cyan
+    netsh.exe int tcp show global 2>$null | ForEach-Object { Write-Host "  $_" }
+    Write-Host ''
+    Write-Host 'UDP global state:' -ForegroundColor Cyan
+    netsh.exe int udp show global 2>$null | ForEach-Object { Write-Host "  $_" }
+
+    Write-Host ''
+    Write-Host 'Latency benchmark (real measured samples, no settings changed):' -ForegroundColor Cyan
+    Invoke-NetworkLatencyBenchmark -Context 'Diagnose' | Out-Null
+
+    Write-Host ''
+    Write-Info2 'This diagnostic does not change DNS, TCP, NIC, MTU, services, or registry values.'
+}
+
+function Set-AdditiveDnsProfile {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string[]]$Servers
+    )
+
+    $adapter = Get-ActiveAdapter
+    if (-not $adapter) { Write-Warn2 'No active physical adapter found; DNS was not changed.'; return $false }
+    $current = Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    $oldServers = @($current.ServerAddresses | Where-Object { $_ })
+    if (($oldServers -join ',') -eq ($Servers -join ',')) {
+        Write-Info2 "DNS already uses $Label on $($adapter.Name); skipped."
+        return $true
+    }
+    $confirm = Read-Host "DNS on '$($adapter.Name)' will change from '$($oldServers -join ', ')' to '$($Servers -join ', ')'. Type APPLY to continue"
+    if ($confirm -cne 'APPLY') { Write-Host 'Cancelled. DNS was not changed.'; return $false }
+    Get-AdditiveNetworkBackup | Out-Null
+    if ($script:DryRun) {
+        Write-Host "  [DRYRUN] would set DNS on $($adapter.Name) to ${Label}: $($Servers -join ', ')" -ForegroundColor DarkCyan
+        return $true
+    }
+    try {
+        $script:Changes.Add([PSCustomObject]@{ Kind='Dns'; IfIndex=$adapter.ifIndex; OldServers=$oldServers })
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses $Servers -ErrorAction Stop
+        Save-Changes
+        Write-Ok "DNS set to $Label on $($adapter.Name). Reset restores the original snapshot."
+        return $true
+    } catch {
+        Write-Warn2 "DNS update failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Add-AdditiveQosPolicies {
+    $targets = @('FiveM.exe','CitizenFX.exe','GTA5.exe','PlayGTAV.exe')
+    Get-AdditiveNetworkBackup | Out-Null
+    $added = 0
+    foreach ($exe in $targets) {
+        $policyName = "NongPlaiAdditive_$($exe -replace '\\.exe$','')"
+        $existing = Get-NetQosPolicy -Name $policyName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Info2 "Skipped existing QoS policy: $policyName"
+            continue
+        }
+        if ($script:DryRun) {
+            Write-Host "  [DRYRUN] would add QoS DSCP 46 policy for $exe" -ForegroundColor DarkCyan
+            continue
+        }
+        try {
+            New-NetQosPolicy -Name $policyName -AppPathNameMatchCondition $exe -DSCPAction 46 -NetworkProfile All -ErrorAction Stop | Out-Null
+            $script:Changes.Add([PSCustomObject]@{ Kind='QosPolicy'; Name=$policyName })
+            $added++
+        } catch { Write-Warn2 "QoS policy skipped for ${exe}: $($_.Exception.Message)" }
+    }
+    if (-not $script:DryRun) { Save-Changes }
+    Write-Ok "Added $added QoS policy/policies. Router and ISP may ignore DSCP outside your LAN."
+}
+
+function Add-AdditiveGameProfile {
+    Write-Host 'Adding only missing per-user game settings; existing values are not overwritten.' -ForegroundColor Cyan
+    $added = 0
+    if (Add-RegIfMissing -Path 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' -Name 'FiveM.exe' -Value 'GpuPreference=2;' -Type String) { $added++ }
+    if (Add-RegIfMissing -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' -Name 'AppCaptureEnabled' -Value 0 -Type DWord) { $added++ }
+    if (Add-RegIfMissing -Path 'HKCU:\System\GameConfigStore' -Name 'GameDVR_Enabled' -Value 0 -Type DWord) { $added++ }
+    if (Add-RegIfMissing -Path 'HKCU:\Control Panel\Mouse' -Name 'MouseSpeed' -Value '0' -Type String) { $added++ }
+    if ($added -gt 0) { Save-Changes }
+    Write-Ok "Added $added missing game profile value(s); existing values were preserved."
+}
+
+function Invoke-NetworkCustomAdditive {
+    while ($true) {
+        Clear-Host
+        Write-Host ('   ' + ('=' * 78)) -ForegroundColor Cyan
+        Write-Host '  NETWORK CUSTOM — SNAPSHOT FIRST / EXISTING VALUES PRESERVED' -ForegroundColor Green
+        Write-Host ('   ' + ('=' * 78)) -ForegroundColor Cyan
+        Write-Host '  [1] Diagnose only (no changes)'
+        Write-Host '  [2] DNS: Cloudflare (1.1.1.1 / 1.0.0.1)'
+        Write-Host '  [3] DNS: Google (8.8.8.8 / 8.8.4.4)'
+        Write-Host '  [4] DNS: Quad9 (9.9.9.9 / 149.112.112.112)'
+        Write-Host '  [5] Add missing FiveM QoS policies (no policy is replaced)'
+        Write-Host '  [6] Add missing per-user game profile values (no value is overwritten)'
+        Write-Host '  [7] Restore latest network snapshot'
+        Write-Host '  [8] DNS benchmark (measure only, does not change DNS)'
+        Write-Host '  [0] Back'
+        Write-Host ''
+        switch (Read-Host 'Select') {
+            '1' { Invoke-NetworkDiagnoseOnly; Read-Host 'Press Enter to continue' | Out-Null }
+            '2' { Set-AdditiveDnsProfile -Label 'Cloudflare' -Servers @('1.1.1.1','1.0.0.1'); Read-Host 'Press Enter to continue' | Out-Null }
+            '3' { Set-AdditiveDnsProfile -Label 'Google' -Servers @('8.8.8.8','8.8.4.4'); Read-Host 'Press Enter to continue' | Out-Null }
+            '4' { Set-AdditiveDnsProfile -Label 'Quad9' -Servers @('9.9.9.9','149.112.112.112'); Read-Host 'Press Enter to continue' | Out-Null }
+            '5' { Add-AdditiveQosPolicies; Read-Host 'Press Enter to continue' | Out-Null }
+            '6' { if (-not $script:BackupDir -and -not $script:DryRun) { New-BackupFolder | Out-Null }; Add-AdditiveGameProfile; Read-Host 'Press Enter to continue' | Out-Null }
+            '7' { $backup = Find-LatestBackup; if ($backup) { Restore-NetworkSnapshot -SnapshotPath (Get-NetworkSnapshotPath -BackupDir $backup) } else { Write-Warn2 'No backup folder found.' }; Read-Host 'Press Enter to continue' | Out-Null }
+            '8' { Invoke-DnsBenchmark | Out-Null; Read-Host 'Press Enter to continue' | Out-Null }
+            '0' { return }
+            default { Write-Warn2 'Please select a valid option.' }
+        }
+    }
+}
+
+function Invoke-DoEverythingAdditive {
+    Clear-Host
+    Write-Host ('   ' + ('=' * 78)) -ForegroundColor Cyan
+    Write-Host '  ADDITIVE GAME PROFILE — NO EXISTING VALUE IS OVERWRITTEN' -ForegroundColor Green
+    Write-Host ('   ' + ('=' * 78)) -ForegroundColor Cyan
+    Write-Host 'This profile does not call the legacy Apply Everything flow.'
+    Write-Host 'It only adds missing per-user game settings and optional new QoS policies.'
+    $confirm = Read-Host 'Continue? [Y/N]'
+    if ($confirm -notmatch '^[Yy]') { Write-Host 'Cancelled.'; return }
+    if (-not $script:DryRun) {
+        New-BackupFolder | Out-Null
+        New-NetworkSnapshot -BackupDir $script:BackupDir | Out-Null
+    }
+    Add-AdditiveGameProfile
+    Add-AdditiveQosPolicies
+    Write-Ok 'Additive game profile complete. Existing registry values and QoS policies were preserved.'
 }
 
 # ---------------------------------------------------------------------------
@@ -3317,14 +4712,16 @@ function Write-MenuItem {
 # The heavy-lifting functions run in a hidden worker process. The WPF window remains
 # visible and receives progress events from the worker, so no PowerShell console is shown.
 # ---------------------------------------------------------------------------
-try {
-    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
-} catch {
+if (-not $ConsoleOnly) {
     try {
-        $popup = New-Object -ComObject WScript.Shell
-        $popup.Popup('ไม่สามารถโหลดส่วน GUI ได้ กรุณาใช้ Windows PowerShell 5.1 (powershell.exe) และคลิกขวาเลือก Run with PowerShell', 0, 'NongPlaiShop', 16) | Out-Null
-    } catch {}
-    exit 1
+        Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
+    } catch {
+        try {
+            $popup = New-Object -ComObject WScript.Shell
+            $popup.Popup('ไม่สามารถโหลดส่วน GUI ได้ กรุณาใช้ Windows PowerShell 5.1 (powershell.exe) และคลิกขวาเลือก Run with PowerShell', 0, 'NongPlaiShop', 0, 16) | Out-Null
+        } catch {}
+        exit 1
+    }
 }
 
 # Keep a single WPF Application/Dispatcher alive for the whole run. Without this, WPF can
@@ -3332,7 +4729,7 @@ try {
 # makes any later Window's ShowDialog() fail with "cannot call a method on a null-valued
 # expression" - exactly the error this fixes (main menu closes -> worker progress window
 # tries to open next and fails without a persistent Application).
-if (-not [System.Windows.Application]::Current) {
+if (-not $ConsoleOnly -and -not [System.Windows.Application]::Current) {
     try {
         $script:WpfApp = New-Object System.Windows.Application
         $script:WpfApp.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
@@ -3353,6 +4750,14 @@ $script:MenuCards = @(
     [PSCustomObject]@{
         Key='3'; Glyph='✕'; Title='EXIT'; Accent='#EB5757'
         Desc='Close NongPlaiShop'
+    },
+    [PSCustomObject]@{
+        Key='4'; Glyph='⌁'; Title='NETWORK DIAGNOSE'; Accent='#6FCF97'
+        Desc='Read-only network status'
+    },
+    [PSCustomObject]@{
+        Key='5'; Glyph='◉'; Title='NETWORK CUSTOM'; Accent='#56CCF2'
+        Desc='Opt-in DNS and additive profile'
     }
 )
 
@@ -3495,6 +4900,8 @@ function Show-MainMenuWpf {
         <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
           <Button Name="OpenBackupBtn" Content="BACKUP" Width="92" Height="25" Background="#20242C" Foreground="#D6A84F" BorderThickness="0" FontSize="10" Cursor="Hand" Margin="0,0,8,0"/>
           <Button Name="OpenReportBtn" Content="REPORT" Width="92" Height="25" Background="#20242C" Foreground="#56CCF2" BorderThickness="0" FontSize="10" Cursor="Hand"/>
+          <Button Name="NetworkDiagnoseBtn" Content="NET CHECK" Width="92" Height="25" Background="#20242C" Foreground="#6FCF97" BorderThickness="0" FontSize="10" Cursor="Hand" Margin="8,0,0,0"/>
+          <Button Name="NetworkCustomBtn" Content="NET CUSTOM" Width="102" Height="25" Background="#20242C" Foreground="#56CCF2" BorderThickness="0" FontSize="10" Cursor="Hand" Margin="8,0,0,0"/>
         </StackPanel>
       </StackPanel>
 
@@ -3522,12 +4929,17 @@ function Show-MainMenuWpf {
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
 
+    # The original WPF stage contains three visual cards. The two additive network
+    # actions are exposed through dedicated buttons below so existing card XAML and
+    # carousel behavior stay backward compatible.
     $cards = @($window.FindName('Card0'), $window.FindName('Card1'), $window.FindName('Card2'))
     $descTitle = $window.FindName('DescTitle')
     $descBody  = $window.FindName('DescBody')
     $quickStatus = $window.FindName('QuickStatus')
     $openBackupBtn = $window.FindName('OpenBackupBtn')
     $openReportBtn = $window.FindName('OpenReportBtn')
+    $networkDiagnoseBtn = $window.FindName('NetworkDiagnoseBtn')
+    $networkCustomBtn = $window.FindName('NetworkCustomBtn')
     $bigTitle  = $window.FindName('BigTitle')
     $runBtn    = $window.FindName('RunBtn')
     $closeBtn  = $window.FindName('CloseBtn')
@@ -3565,6 +4977,18 @@ function Show-MainMenuWpf {
         } catch {
             [System.Windows.MessageBox]::Show(('สร้าง Report ไม่สำเร็จ: ' + $_.Exception.Message), 'NongPlaiShop', 'OK', 'Error') | Out-Null
         }
+    })
+    $networkDiagnoseBtn.Add_Click({
+        try {
+            Invoke-NetworkDiagnoseOnly
+            [System.Windows.MessageBox]::Show('Network diagnose เสร็จแล้ว — ไม่มีค่าใดถูกเปลี่ยน', 'NongPlaiShop', 'OK', 'Information') | Out-Null
+        } catch {
+            [System.Windows.MessageBox]::Show(('Network diagnose ไม่สำเร็จ: ' + $_.Exception.Message), 'NongPlaiShop', 'OK', 'Error') | Out-Null
+        }
+    })
+    $networkCustomBtn.Add_Click({
+        try { Invoke-NetworkCustomAdditive }
+        catch { [System.Windows.MessageBox]::Show(('Network custom ไม่สำเร็จ: ' + $_.Exception.Message), 'NongPlaiShop', 'OK', 'Error') | Out-Null }
     })
 
     function Animate-CardSlot {
@@ -3733,12 +5157,17 @@ function Play-GuiSound {
 
 function Invoke-GuiWorkerAction {
     try {
+        # Emit a bootstrap event before any tuning code runs. This makes a bad
+        # argument/path or an early initialization failure visible in the GUI.
+        Write-GuiEvent -Type 'progress' -Current 1 -Total 100 -Label 'กำลังเริ่ม worker' -Message ("action={0} | log={1}" -f $WorkerAction, $GuiLogPath)
         Write-GuiEvent -Type 'progress' -Current 1 -Total 100 -Label 'กำลังเริ่ม worker' -Message 'กำลังตรวจสิทธิ์และเตรียมการ...'
         switch ($WorkerAction) {
             'Apply' { Invoke-DoEverything }
             'Reset' { Invoke-ResetUltra }
-            'Scan'  { Invoke-HardwareScanOnly }
-            'Hpet'  { Invoke-HpetToggle }
+            'Scan'            { Invoke-HardwareScanOnly }
+            'Hpet'            { Invoke-HpetToggle }
+            'NetworkDiagnose' { Invoke-NetworkDiagnoseOnly }
+            'NetworkCustom'   { Invoke-NetworkCustomAdditive }
             default { throw "ไม่พบคำสั่ง worker ที่ถูกต้อง: $WorkerAction" }
         }
         Write-GuiEvent -Type 'done' -Current 100 -Total 100 -Label 'เสร็จสมบูรณ์' -Message 'การทำงานเสร็จสมบูรณ์'
@@ -3746,7 +5175,11 @@ function Invoke-GuiWorkerAction {
         # the main menu again, and that new menu process performs final cleanup.
         exit 0
     } catch {
-        Write-GuiEvent -Type 'error' -Current 0 -Total 100 -Label 'เกิดข้อผิดพลาด' -Message $_.Exception.Message
+        $msg = $_.Exception.Message
+        try {
+            Write-GuiEvent -Type 'error' -Current 0 -Total 100 -Label 'เกิดข้อผิดพลาด' -Message $msg
+            Write-CrashLog -ErrorRecord $_ -Context 'Invoke-GuiWorkerAction' | Out-Null
+        } catch {}
         exit 1
     }
 }
@@ -3759,7 +5192,7 @@ function Start-GuiWorkerProcess {
     }
     $workerArgs = @(
         '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-        '-File', "`"$selfPath`"", '-Worker', '-WorkerAction', $Action,
+        '-File', $selfPath, '-Worker', '-WorkerAction', $Action,
         '-GuiLogPath', $LogPath
     )
     if ($script:DryRun) { $workerArgs += '-DryRun' }
@@ -3941,6 +5374,10 @@ function Show-WorkerProgressWpf {
     $timer.Interval = 350
     $timer.Add_Tick({
         try {
+            # A completion/error event stops the timer. Keep this guard as well
+            # because one already-queued WinForms tick may still be dispatched
+            # after Stop(), which used to overwrite the 100% success message.
+            if ($done) { $timer.Stop(); return }
             $latest = @(Get-Content -Path $logPath -Encoding UTF8 -ErrorAction SilentlyContinue |
                 Where-Object { $_ -like '__NONGPLAI_EVENT__*' } | Select-Object -Last 1)
             if ($latest.Count -eq 0) {
@@ -4021,9 +5458,13 @@ function Show-WorkerProgressWpf {
                 $closeBtn.Visible = $true
             }
         } catch {
+            # Never replace a completed 100% screen with a generic timer error.
+            # The detailed exception is still retained in the diagnostic log.
             try {
-                $hintText.Text = 'เกิดข้อผิดพลาดระหว่างอัปเดตสถานะ กรุณาตรวจสอบ NongPlaiGui_write_errors.log'
                 Write-CrashLog -ErrorRecord $_ -Context 'Show-WorkerProgressWpf Timer' | Out-Null
+                if (-not $done) {
+                    $hintText.Text = 'เกิดข้อผิดพลาดระหว่างอัปเดตสถานะ กรุณาตรวจสอบ NongPlaiGui_write_errors.log'
+                }
             } catch {}
         }
     }.GetNewClosure())
@@ -4062,13 +5503,37 @@ if ($WorkerUi) {
     exit 0
 }
 
-if ($HpetToggle) {
+if ($HpetToggle -and -not $ConsoleOnly) {
     try { Invoke-HpetToggle }
     catch {
         Write-Host ""
         Write-Host "  FATAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host "  $($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkGray
         Read-Host "Press Enter to close"
+    }
+    exit 0
+}
+
+if (($NetworkDiagnose -or $NetworkCustom) -and -not $ConsoleOnly) {
+    try {
+        if ($NetworkDiagnose) { Invoke-NetworkDiagnoseOnly }
+        if ($NetworkCustom) { Invoke-NetworkCustomAdditive }
+    } catch {
+        Write-Host ""
+        Write-Host "  FATAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  $($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkGray
+    }
+    exit 0
+}
+
+if ($ConsoleOnly -or $NoGui) {
+    try {
+        Show-MainMenuConsole
+    } catch {
+        Write-Host ""
+        Write-Host "  FATAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  $($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkGray
+        try { Read-Host 'Press Enter to close' | Out-Null } catch {}
     }
     exit 0
 }
@@ -4348,4 +5813,3 @@ function Invoke-AllTuningsWithVerification {
     Write-Host "📊 TUNING VERIFICATION COMPLETE" -ForegroundColor Green
     Write-Host "════════════════════════════════════════" -ForegroundColor Green
 }
-
