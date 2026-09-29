@@ -6237,54 +6237,70 @@ function Invoke-AllTuningsWithVerification {
     Write-Host "📊 TUNING VERIFICATION COMPLETE" -ForegroundColor Green
     Write-Host "════════════════════════════════════════" -ForegroundColor Green
 }
-# ==============================================================================================
-# 1. ล็อก DSCP Value ระดับ Layer 2/3 (DSCP & CoS Value) สำหรับ FiveM
-# ==============================================================================================
-# ลบ Policy เดิมทิ้งก่อนถ้ามี (เพื่อป้องกัน Error ตอนสร้างใหม่)
-Remove-NetQosPolicy -Name "FiveM_Extreme" -ErrorAction SilentlyContinue -Confirm:$false
-Remove-NetQosPolicy -Name "FiveM_Extreme_GTAProcess" -ErrorAction SilentlyContinue -Confirm:$false
 
-# สร้าง Policy ใหม่
-New-NetQosPolicy -Name "FiveM_Extreme" -AppPathNameMatchCondition "FiveM.exe" -IPProtocolMatchCondition UDP -DSCPAction 46 -NetworkProfile All | Out-Null
-New-NetQosPolicy -Name "FiveM_Extreme_GTAProcess" -AppPathNameMatchCondition "FiveM_b3258_GTAProcess.exe" -IPProtocolMatchCondition UDP -DSCPAction 46 -NetworkProfile All | Out-Null
+function Optimize-NetworkAndQoSGroupPolicy {
+    [CmdletBinding()]
+    param()
 
-# ==============================================================================================
-# 2. ปิดระบบสแกนและตรวจสอบข้อมูล Network ของ Windows (Pacer & Offloading)
-# ==============================================================================================
-$PschedPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
-if (!(Test-Path $PschedPath)) { New-Item -Path $PschedPath -Force | Out-Null }
-# Set timer resolution: Enabled -> 1
-Set-ItemProperty -Path $PschedPath -Name "TimerResolution" -Value 1 -Type DWord -Force
-# Limit outstanding packets: Enabled -> 0
-Set-ItemProperty -Path $PschedPath -Name "MaxOutstandingSends" -Value 0 -Type DWord -Force
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host " Applying Group Policy & FiveM QoS Extreme Tunings..." -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
 
-# ==============================================================================================
-# 3. ปิดระบบลบและรีเฟรช DNS (Disable Negative DNS Caching)
-# ==============================================================================================
-$DNSClientPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
-if (!(Test-Path $DNSClientPath)) { New-Item -Path $DNSClientPath -Force | Out-Null }
-# Turn off multicast name resolution (LLMNR): Enabled
-Set-ItemProperty -Path $DNSClientPath -Name "EnableMulticast" -Value 0 -Type DWord -Force
-# Turn off smart multi-homed name resolution: Enabled
-Set-ItemProperty -Path $DNSClientPath -Name "DisableSmartNameResolution" -Value 1 -Type DWord -Force
+    # 1. QoS สำหรับ FiveM (DSCP 46, UDP)
+    Write-Host " [+] Configuring Policy-based QoS for FiveM (DSCP 46, UDP)..." -ForegroundColor Yellow
+    try {
+        Remove-NetQosPolicy -Name "FiveM_Extreme" -ErrorAction SilentlyContinue -Confirm:$false
+        Remove-NetQosPolicy -Name "FiveM_Extreme_GTAProcess" -ErrorAction SilentlyContinue -Confirm:$false
 
-# ==============================================================================================
-# 4. สั่งตัด Traffic ส่วนเกินของระบบ Windows ทั้งหมด (Network Isolation)
-# ==============================================================================================
-$BITSPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS"
-if (!(Test-Path $BITSPath)) { New-Item -Path $BITSPath -Force | Out-Null }
-# Limit the maximum network bandwidth for BITS background transfers
-Set-ItemProperty -Path $BITSPath -Name "EnableBITSMaxBandwidth" -Value 1 -Type DWord -Force
-Set-ItemProperty -Path $BITSPath -Name "MaxTransferRateOnSchedule" -Value 1 -Type DWord -Force
-Set-ItemProperty -Path $BITSPath -Name "MaxTransferRateOffSchedule" -Value 1 -Type DWord -Force
-Set-ItemProperty -Path $BITSPath -Name "MaxBandwidthValidFrom" -Value 0 -Type DWord -Force
-Set-ItemProperty -Path $BITSPath -Name "MaxBandwidthValidTo" -Value 23 -Type DWord -Force
+        New-NetQosPolicy -Name "FiveM_Extreme" -AppPathNameMatchCondition "FiveM.exe" -IPProtocolMatchCondition UDP -DSCPAction 46 -NetworkProfile All | Out-Null
+        New-NetQosPolicy -Name "FiveM_Extreme_GTAProcess" -AppPathNameMatchCondition "FiveM_b3258_GTAProcess.exe" -IPProtocolMatchCondition UDP -DSCPAction 46 -NetworkProfile All | Out-Null
+        Write-Host "     [OK] FiveM QoS Policies created (DSCP: 46, Protocol: UDP)." -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "     [!] Failed to set QoS Policy: $_"
+    }
 
-$NCSIPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator"
-if (!(Test-Path $NCSIPath)) { New-Item -Path $NCSIPath -Force | Out-Null }
-# Specify Global DNS: Enabled -> 1.1.1.1
-Set-ItemProperty -Path $NCSIPath -Name "UseGlobalDNS" -Value 1 -Type DWord -Force
-Set-ItemProperty -Path $NCSIPath -Name "GlobalDNS" -Value "1.1.1.1" -Type String -Force
+    # 2. ปิดระบบสแกนและตรวจสอบข้อมูล Network ของ Windows (Pacer & Offloading)
+    Write-Host " [+] Tuning QoS Packet Scheduler (Pacer & Offloading)..." -ForegroundColor Yellow
+    $PschedPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
+    if (!(Test-Path $PschedPath)) { New-Item -Path $PschedPath -Force | Out-Null }
+    Set-ItemProperty -Path $PschedPath -Name "TimerResolution" -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $PschedPath -Name "MaxOutstandingSends" -Value 0 -Type DWord -Force
+    Write-Host "     [OK] Psched: TimerResolution=1, MaxOutstandingSends=0 set." -ForegroundColor Green
 
-# Refresh Group Policy ทันทีเพื่อให้ค่าที่ตั้งทำงาน
-gpupdate /force | Out-Null
+    # 3. ปิดระบบลบและรีเฟรช DNS (Disable Negative DNS Caching & LLMNR)
+    Write-Host " [+] Disabling LLMNR & Smart Multi-Homed Name Resolution..." -ForegroundColor Yellow
+    $DNSClientPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+    if (!(Test-Path $DNSClientPath)) { New-Item -Path $DNSClientPath -Force | Out-Null }
+    Set-ItemProperty -Path $DNSClientPath -Name "EnableMulticast" -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $DNSClientPath -Name "DisableSmartNameResolution" -Value 1 -Type DWord -Force
+    Write-Host "     [OK] DNS Client: Multicast & Smart Multi-Homed Resolution disabled." -ForegroundColor Green
+
+    # 4. สั่งตัด Traffic ส่วนเกินของระบบ Windows ทั้งหมด (BITS & NCSI)
+    Write-Host " [+] Restricting BITS background bandwidth & Setting Global DNS..." -ForegroundColor Yellow
+    $BITSPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS"
+    if (!(Test-Path $BITSPath)) { New-Item -Path $BITSPath -Force | Out-Null }
+    Set-ItemProperty -Path $BITSPath -Name "EnableBITSMaxBandwidth" -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $BITSPath -Name "MaxTransferRateOnSchedule" -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $BITSPath -Name "MaxTransferRateOffSchedule" -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $BITSPath -Name "MaxBandwidthValidFrom" -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $BITSPath -Name "MaxBandwidthValidTo" -Value 23 -Type DWord -Force
+
+    $NCSIPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator"
+    if (!(Test-Path $NCSIPath)) { New-Item -Path $NCSIPath -Force | Out-Null }
+    Set-ItemProperty -Path $NCSIPath -Name "UseGlobalDNS" -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $NCSIPath -Name "GlobalDNS" -Value "1.1.1.1" -Type String -Force
+    Write-Host "     [OK] BITS throttled to 1 Kbps & NCSI Global DNS set to 1.1.1.1." -ForegroundColor Green
+
+    # 5. Refresh Group Policy
+    Write-Host " [+] Refreshing Group Policy..." -ForegroundColor Yellow
+    Start-Process -FilePath "gpupdate.exe" -ArgumentList "/force" -NoNewWindow -Wait -ErrorAction SilentlyContinue
+
+    Write-Host "============================================================" -ForegroundColor Green
+    Write-Host " Network & QoS Policy Tuning Complete!" -ForegroundColor Green
+    Write-Host "============================================================" -ForegroundColor Green
+}
+
+# Auto-execute
+Optimize-NetworkAndQoSGroupPolicy
