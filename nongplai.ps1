@@ -255,7 +255,8 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         if (!(Test-Path $qosBase)) { New-Item -Path $qosBase -Force | Out-Null }
         $qosItems = @(
             @{ Key = "FiveM_Extreme"; App = "FiveM.exe"; DSCP = "46" },
-            @{ Key = "FiveM_Extreme_GTAProcess"; App = "FiveM_b3258_GTAProcess.exe"; DSCP = "46" }
+            @{ Key = "FiveM_Extreme_GTAProcess"; App = "FiveM_b3258_GTAProcess.exe"; DSCP = "46" },
+            @{ Key = "Discord_Voice"; App = "Discord.exe"; DSCP = "46" }
         )
         foreach ($p in $qosItems) {
             $path = Join-Path $qosBase $p.Key
@@ -12536,3 +12537,84 @@ Set-ItemProperty -Path $NCSIPath -Name "GlobalDNS" -Value "1.1.1.1" -Type String
 
 # Refresh Group Policy ทันทีเพื่อให้ค่าที่ตั้งทำงาน
 gpupdate /force | Out-Null
+
+# ==============================================================================================
+# 5. HARDCORE GAMING & LOW LATENCY TWEAKS (เน้นลด Input Lag & Network Delay ระดับลึก)
+# ==============================================================================================
+Write-Host "⚡ Applying Hardcore Low-Latency & Zero Input Delay Network Tweaks..." -ForegroundColor Cyan
+
+# 5.1 AFD / WinSock Fast-Path (ส่งแพ็กเก็ต UDP ของ FiveM ทันที ไม่ผ่าน Buffer คิวของ OS)
+$AfdPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Afd\Parameters"
+if (!(Test-Path $AfdPath)) { New-Item -Path $AfdPath -Force | Out-Null }
+Set-ItemProperty -Path $AfdPath -Name "FastSendDatagramThreshold" -Value 1024 -Type DWord -Force
+Set-ItemProperty -Path $AfdPath -Name "FastCopyReceiveThreshold" -Value 1024 -Type DWord -Force
+Set-ItemProperty -Path $AfdPath -Name "DoNotUseBufferChaining" -Value 1 -Type DWord -Force
+Set-ItemProperty -Path $AfdPath -Name "IgnorePushBitOnReceive" -Value 1 -Type DWord -Force
+Set-ItemProperty -Path $AfdPath -Name "NonBlockingSendSpecialBuffering" -Value 1 -Type DWord -Force
+
+# 5.2 TCP/IP Parameters (เคลียร์ Port ค้างทันที + เพิ่มช่องสัญญาณสูงสุด)
+$TcpipParamPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+Set-ItemProperty -Path $TcpipParamPath -Name "TcpTimedWaitDelay" -Value 30 -Type DWord -Force
+Set-ItemProperty -Path $TcpipParamPath -Name "MaxUserPort" -Value 65534 -Type DWord -Force
+Set-ItemProperty -Path $TcpipParamPath -Name "DefaultTTL" -Value 64 -Type DWord -Force
+Set-ItemProperty -Path $TcpipParamPath -Name "EnableDCA" -Value 1 -Type DWord -Force
+Set-ItemProperty -Path $TcpipParamPath -Name "SynAttackProtect" -Value 1 -Type DWord -Force
+Set-ItemProperty -Path $TcpipParamPath -Name "DisableTaskOffload" -Value 0 -Type DWord -Force
+
+# 5.3 ปิด Nagle's Algorithm ทุก Interface (ส่งแพ็กเก็ตทันทีแบบ 0ms Delay)
+$InterfacesPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+if (Test-Path $InterfacesPath) {
+    Get-ChildItem -Path $InterfacesPath | ForEach-Object {
+        Set-ItemProperty -Path $_.PSPath -Name "TcpAckFrequency" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $_.PSPath -Name "TCPNoDelay" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $_.PSPath -Name "TcpDelAckTicks" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 5.4 Netsh Stack Tuning (ปิด Packet Batching, ปิด ECN, ปิด Timestamps overhead)
+try {
+    netsh int tcp set global autotuninglevel=normal | Out-Null
+    netsh int tcp set global rss=enabled | Out-Null
+    netsh int tcp set global rsc=disabled | Out-Null
+    netsh int tcp set global ecncapability=disabled | Out-Null
+    netsh int tcp set global timestamps=disabled | Out-Null
+    netsh int tcp set global nonsackrttresiliency=disabled | Out-Null
+    netsh int tcp set global maxsynretransmissions=2 | Out-Null
+    netsh int tcp set global fastopen=enabled | Out-Null
+    netsh int tcp set global fastopenfallback=enabled | Out-Null
+    netsh int ip set global taskoffload=enabled | Out-Null
+    netsh int ip set global neighborcachelimit=4096 | Out-Null
+} catch {}
+
+# 5.5 MMCSS Gaming Priority Engine (ให้เกมได้คิว Network และ CPU สูงสุด 100%)
+$MMCSSGamesPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"
+if (!(Test-Path $MMCSSGamesPath)) { New-Item -Path $MMCSSGamesPath -Force | Out-Null }
+Set-ItemProperty -Path $MMCSSGamesPath -Name "Affinity" -Value 0 -Type DWord -Force
+Set-ItemProperty -Path $MMCSSGamesPath -Name "Background Only" -Value "False" -Type String -Force
+Set-ItemProperty -Path $MMCSSGamesPath -Name "Clock Rate" -Value 10000 -Type DWord -Force
+Set-ItemProperty -Path $MMCSSGamesPath -Name "GPU Priority" -Value 8 -Type DWord -Force
+Set-ItemProperty -Path $MMCSSGamesPath -Name "Priority" -Value 6 -Type DWord -Force
+Set-ItemProperty -Path $MMCSSGamesPath -Name "Scheduling Category" -Value "High" -Type String -Force
+Set-ItemProperty -Path $MMCSSGamesPath -Name "SFIO Priority" -Value "High" -Type String -Force
+
+# 5.6 ปิดโหมดประหยัดพลังงานและการหน่วงของการ์ดแลน / Wi-Fi (Disable EEE & Interrupt Moderation)
+try {
+    Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object {
+        $nic = $_.Name
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "*Interrupt Moderation*" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "Interrupt Moderation" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "*Flow Control*" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "Flow Control" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "*Large Send Offload v2 (IPv4)*" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "*Large Send Offload v2 (IPv6)*" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "*Energy Efficient Ethernet*" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "Green Ethernet" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "Energy Efficient Ethernet" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "Advanced EEE" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "Gigabit Lite" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "Power Saving Mode" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        Set-NetAdapterAdvancedProperty -Name $nic -DisplayName "Auto Disable Gigabit" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+    }
+} catch {}
+
+Write-Host " [OK] Hardcore Network & Zero Input Delay Tweaks Applied Successfully!" -ForegroundColor Green
