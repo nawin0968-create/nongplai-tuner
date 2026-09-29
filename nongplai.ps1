@@ -1,4 +1,37 @@
-﻿# NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
+# ---------------------------------------------------------------------------
+# Thai / UTF-8 encoding — must be the very first executable lines.
+#
+# WHY ALL FOUR LINES ARE NEEDED (PowerShell 5.1 on Windows):
+#
+#   1. chcp 65001
+#      Sets the Windows console code page to UTF-8 so that the underlying
+#      Win32 console window can receive and display multi-byte characters
+#      (Thai, emoji, box-drawing). Without this the console stays on the
+#      system OEM code page (874 for Thai Windows, 850 for most others)
+#      and every non-ASCII character comes out as '?' or garbage.
+#
+#   2. [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+#      Tells the .NET Console class how to encode the bytes it writes.
+#      PowerShell's Write-Host goes through this encoding; if it doesn't
+#      match the console code page set above, the bytes mis-match and Thai
+#      text is still garbled even after chcp 65001.
+#
+#   3. [Console]::InputEncoding = [System.Text.Encoding]::UTF8
+#      Mirrors OutputEncoding for the standard-input side. Read-Host and
+#      piped input (e.g. irm | iex) are decoded through InputEncoding.
+#      Without this, any Thai characters the user *types* arrive mangled.
+#
+#   4. $OutputEncoding = [System.Text.Encoding]::UTF8
+#      Controls how PowerShell encodes text when it pipes output into
+#      external commands (netsh, bcdedit, fsutil …). The pipe uses this
+#      encoding, not [Console]::OutputEncoding. Missing this line means
+#      Thai text passed to external tools comes out as '?'.
+# ---------------------------------------------------------------------------
+try { & "$env:SystemRoot\System32\chcp.com" 65001 | Out-Null } catch {}
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+$OutputEncoding           = [System.Text.Encoding]::UTF8
+# NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
 # Requires Windows PowerShell 5.1 or later (built into Windows 10/11 by default).
 # Rewritten from the original .cmd to fix reliability issues caused by
 # batch's fragile multi-line parsing and by spawning a fresh powershell.exe
@@ -199,6 +232,28 @@ $script:HwInfo = $null
 $script:GuiReady = $false
 $script:PowerShellExe = Get-PowerShellExePath
 
+# Central safety/configuration switches.  The Apply menu asks for each category
+# before changing anything; these values are also used by the apply pipeline so
+# the answer is enforced instead of being display-only.
+$script:Config = [ordered]@{
+    VerifyAfterApply      = $true
+    CreateRestorePoint    = $true
+    EnableAggressive      = $false
+    EnableDefenderExclude = $false
+}
+$script:ApplyPlan = [ordered]@{
+    Core     = $true
+    CPU      = $true
+    GPU      = $true
+    RAM      = $true
+    Storage  = $true
+    Network  = $true
+    Input    = $true
+    Aggressive = $false
+    Defender = $false
+    NetworkProfile = 'Balanced'
+}
+
 function Get-RequestedAction {
     $selected = New-Object System.Collections.Generic.List[string]
     if ($Apply)            { $selected.Add('Apply') }
@@ -281,15 +336,15 @@ function Show-MainMenuConsole {
         Write-BoxTop
         Write-BoxCenter 'NONGPLAISHOP - CONSOLE MODE' 'Cyan'
         Write-BoxDivider
-        Write-MenuItem -Key '1' -Label 'APPLY EVERYTHING' -Desc 'ปรับจูนทั้งหมดทันที'
+        Write-MenuItem -Key '1' -Label 'APPLY ALL' -Desc 'ปรับค่าทั้งหมดตามโปรไฟล์ของสคริปต์'
         Write-MenuItem -Key '2' -Label 'RESET ALL' -Desc 'คืนค่าจาก backup ล่าสุด' -KeyColor 'Yellow'
-        Write-MenuItem -Key '0' -Label 'EXIT' -Desc 'ปิดโปรแกรม' -KeyColor 'Red'
+        Write-MenuItem -Key '3' -Label 'EXIT' -Desc 'ปิดโปรแกรม' -KeyColor 'Red'
         Write-BoxBottom
         Write-Host ""
         switch (Read-Host 'Select') {
             '1' { Invoke-DoEverything; return }
             '2' { Invoke-ResetUltra; return }
-            '0' { return }
+            '3' { return }
             default {
                 Write-Warn2 'กรุณาเลือกหมายเลขที่ถูกต้อง'
                 Read-Host 'Press Enter to continue' | Out-Null
@@ -429,14 +484,90 @@ function Write-Log {
     }
 }
 
+function Write-VerificationResult {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [ValidateSet('PASS','FAIL','SKIPPED','UNSUPPORTED')][string]$Status,
+        [string]$Before = '',
+        [string]$After = '',
+        [string]$Detail = ''
+    )
+    $record = [PSCustomObject]@{
+        Kind='Verification'; Name=$Name; Status=$Status
+        Before=$Before; After=$After; Detail=$Detail
+        Timestamp=(Get-Date).ToString('o')
+    }
+    if (-not $script:VerificationResults) {
+        $script:VerificationResults = New-Object System.Collections.Generic.List[Object]
+    }
+    $script:VerificationResults.Add($record)
+    Write-Log ("VERIFY {0}: {1} | before={2} | after={3} | {4}" -f $Status,$Name,$Before,$After,$Detail)
+    $color = switch ($Status) { 'PASS' {'Green'} 'FAIL' {'Red'} 'UNSUPPORTED' {'Yellow'} default {'DarkGray'} }
+    Write-Host ("  [{0}] {1}" -f $Status,$Name) -ForegroundColor $color
+    return $record
+}
+
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Command,
+        [scriptblock]$Verify = $null
+    )
+    try {
+        $output = @(& $Command 2>&1)
+        $exitCode = [int]$LASTEXITCODE
+        if ($exitCode -ne 0) {
+            Write-VerificationResult -Name $Name -Status FAIL -After (($output -join ' ') | Select-Object -First 1) -Detail "exit code $exitCode"
+            return $false
+        }
+        if ($Verify) {
+            $verified = [bool](& $Verify)
+            if (-not $verified) {
+                Write-VerificationResult -Name $Name -Status FAIL -Detail 'command returned success but post-check failed'
+                return $false
+            }
+        }
+        Write-VerificationResult -Name $Name -Status PASS -Detail "exit code $exitCode"
+        return $true
+    } catch {
+        Write-VerificationResult -Name $Name -Status FAIL -Detail $_.Exception.Message
+        return $false
+    }
+}
+
+function Save-SystemSnapshot {
+    param([Parameter(Mandatory)][string]$BackupDir)
+    try {
+        $bcd = @(bcdedit.exe /enum '{current}' 2>&1)
+        $power = @(powercfg.exe /getactivescheme 2>&1)
+        $snapshot = [ordered]@{
+            SchemaVersion=2
+            CapturedAt=(Get-Date).ToString('o')
+            DynamicTick=if (($bcd -join "`n") -match '(?im)disabledynamictick\s+(Yes|No)') { $Matches[1] } else { 'Absent' }
+            ActivePowerScheme=if (($power -join "`n") -match '(?i)([0-9a-f]{8}-[0-9a-f-]{27})') { $Matches[1] } else { '' }
+            TcpGlobal=@(netsh.exe int tcp show global 2>&1)
+            UdpGlobal=@(netsh.exe int udp show global 2>&1)
+        }
+        $path=Join-Path $BackupDir 'system-snapshot.json'
+        $snapshot | ConvertTo-Json -Depth 6 | Set-Content -Path $path -Encoding UTF8
+        Write-Log "System snapshot saved: $path"
+        return $path
+    } catch {
+        Write-Log "System snapshot failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function New-BackupFolder {
     $ts = Get-Date -Format "yyMMdd_HHmmss"
     $dir = Join-Path $env:TEMP "NPBK_$ts"
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
     $script:BackupDir = $dir
     $script:LogFile = Join-Path $dir "apply.log"
+    $script:VerificationResults = New-Object System.Collections.Generic.List[Object]
     New-Item -Path $script:LogFile -ItemType File -Force | Out-Null
     Write-Log "Apply started"
+    Save-SystemSnapshot -BackupDir $dir | Out-Null
     return $dir
 }
 
@@ -481,10 +612,14 @@ function Set-Reg {
         $prop = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
         if ($null -ne $prop -and ($prop.PSObject.Properties.Name -contains $Name)) { $had = $true; $old = $prop.$Name }
         New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+        $afterProp = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+        $afterValue = $afterProp.$Name
         $script:Changes.Add([PSCustomObject]@{
             Kind = 'RegValue'; Path = $Path; Name = $Name
             KeyCreated = (-not $keyExisted); HadValue = $had; OldValue = $old; Type = $Type
         })
+        $matches = if ($Value -is [byte[]]) { (([byte[]]$afterValue) -join ',') -eq (([byte[]]$Value) -join ',') } else { [string]$afterValue -eq [string]$Value }
+        Write-VerificationResult -Name ("Registry {0}\{1}" -f $Path,$Name) -Status $(if ($matches) { 'PASS' } else { 'FAIL' }) -Before ([string]$old) -After ([string]$afterValue)
         return $true
     } catch {
         if (-not $keyExisted -and (Test-Path $Path)) {
@@ -520,6 +655,10 @@ function Set-SvcStart {
         $oldStart = if ($wmi) { $wmi.StartMode } else { 'Automatic' }
         Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop
         $script:Changes.Add([PSCustomObject]@{ Kind='Service'; Name=$Name; OldStart=$oldStart })
+        $afterStart = (Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop).StartMode
+        $expectedStart = switch ($StartupType) { 'Automatic' {'Auto'} 'Manual' {'Manual'} 'Disabled' {'Disabled'} }
+        $serviceOk = ([string]$afterStart -eq $expectedStart)
+        Write-VerificationResult -Name ("Service $Name startup") -Status $(if ($serviceOk) { 'PASS' } else { 'FAIL' }) -Before ([string]$oldStart) -After ([string]$afterStart)
         if ($StartupType -ne 'Automatic' -and $svc.Status -eq 'Running') {
             Stop-Service -Name $Name -Force -ErrorAction Stop
         } elseif ($StartupType -eq 'Automatic' -and $svc.Status -ne 'Running') {
@@ -532,11 +671,43 @@ function Set-SvcStart {
     }
 }
 
+function Get-ApplyStepCategory {
+    param([string]$Description)
+    $d = [string]$Description
+    if ($d -match '(?i)defender|exclusion') { return 'Defender' }
+    if ($d -match '(?i)network|tcp|udp|dns|mtu|qos|adapter|offload|rsc|nagle|chimney|virtual/remote') { return 'Network' }
+    if ($d -match '(?i)cpu|processor|power plan|core parking|throttl|priority|timer|hibernation') { return 'CPU' }
+    if ($d -match '(?i)gpu|graphics|fullscreen|M[SI] Mode for real GPUs|NVIDIA') { return 'GPU' }
+    if ($d -match '(?i)ram|memory|pagefile|paging|compression') { return 'RAM' }
+    if ($d -match '(?i)disk|storage|trim|NTFS|8\.3|write cache|defrag') { return 'Storage' }
+    if ($d -match '(?i)mouse|keyboard|HID|USB|input') { return 'Input' }
+    return 'Core'
+}
+
+function Test-ApplyStepEnabled {
+    param([string]$Description)
+    $category = Get-ApplyStepCategory -Description $Description
+    if (-not $script:ApplyPlan) { return $true }
+    if ($category -eq 'Defender') { return [bool]$script:ApplyPlan.Defender }
+    if ($category -eq 'CPU' -and $script:ApplyPlan.CPU) { return $true }
+    if ($category -eq 'GPU' -and $script:ApplyPlan.GPU) { return $true }
+    if ($category -eq 'RAM' -and $script:ApplyPlan.RAM) { return $true }
+    if ($category -eq 'Storage' -and $script:ApplyPlan.Storage) { return $true }
+    if ($category -eq 'Network' -and $script:ApplyPlan.Network) { return $true }
+    if ($category -eq 'Input' -and $script:ApplyPlan.Input) { return $true }
+    return [bool]$script:ApplyPlan.Core
+}
+
 function Invoke-Step {
     param(
         [int]$Number, [int]$Total, [string]$Description, [scriptblock]$Action
     )
     $label = "[$Number/$Total] $Description"
+    if (-not (Test-ApplyStepEnabled -Description $Description)) {
+        Write-Info2 ("Skipped {0} by Apply plan ({1})" -f $Description, (Get-ApplyStepCategory -Description $Description))
+        Write-Log "$label [SKIPPED BY APPLY PLAN]"
+        return
+    }
     Write-ProgressBar -Current ($Number - 1) -Total $Total -Label $Description
     Write-Log $label
     try {
@@ -544,6 +715,8 @@ function Invoke-Step {
     } catch {
         Write-Bad "Step failed: $($_.Exception.Message)"
         Write-Log "  ! Step failed: $($_.Exception.Message)"
+        $script:Failed.Add($label)
+        Write-VerificationResult -Name $Description -Status FAIL -Detail $_.Exception.Message | Out-Null
     }
     # Save after every step (not just at the very end) so that if the script is
     # interrupted mid-run, Reset can still undo whatever was actually applied.
@@ -778,14 +951,18 @@ function Invoke-MultiGameOptimize {
         # Fullscreen optimizations off - lets exclusive/borderless fullscreen bypass DWM composition.
         Set-Reg 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers' $exePath '~ DISABLEDXMAXIMIZEDWINDOWEDMODE HIGHDPIAWARE' 'String' | Out-Null
 
-        # Defender process exclusion - removes real-time per-frame scan overhead.
-        try {
-            Add-MpPreference -ExclusionProcess $game.ExeName -ErrorAction Stop
-            $script:Changes.Add([PSCustomObject]@{ Kind='DefenderExclusionProcess'; Name=$game.ExeName })
-            Write-Host "$($game.Label): Defender process exclusion added"
-        } catch {
-            $script:PendingExclusions.Processes.Add($game.ExeName) | Out-Null
-            Write-Host "$($game.Label): Defender process exclusion skipped (see diagnosis at the end of this run)"
+        # Defender process exclusion is opt-in because it reduces real-time protection.
+        if ($script:Config.EnableDefenderExclude) {
+            try {
+                Add-MpPreference -ExclusionProcess $game.ExeName -ErrorAction Stop
+                $script:Changes.Add([PSCustomObject]@{ Kind='DefenderExclusionProcess'; Name=$game.ExeName })
+                Write-Host "$($game.Label): Defender process exclusion added"
+            } catch {
+                $script:PendingExclusions.Processes.Add($game.ExeName) | Out-Null
+                Write-Host "$($game.Label): Defender process exclusion skipped (see diagnosis at the end of this run)"
+            }
+        } else {
+            Write-Info2 "$($game.Label): Defender process exclusion skipped by user selection"
         }
 
         if ($game.AntiCheatSensitive) {
@@ -988,7 +1165,11 @@ function Invoke-ApplyUltra {
         Write-Host ("RAM: " + [math]::Round($cs.TotalPhysicalMemory/1GB,1) + " GB")
         Write-Host ("GPU: " + $gpuNames)
     } catch {}
-    $fiveMRoot = Find-FiveMRoot
+        if (-not $script:Config.EnableDefenderExclude) {
+            Write-Info2 'Defender folder exclusion skipped by user selection'
+            return
+        }
+        $fiveMRoot = Find-FiveMRoot
     if (Test-Path $fiveMRoot) { Write-Host "FiveM: detected at $fiveMRoot" } else { Write-Host "FiveM: not found on this PC; continuing without folder-specific tweaks" }
     $gtaName = Find-GtaProcessName
     if ($gtaName) { Write-Host "GTA process file: $gtaName" }
@@ -1459,6 +1640,10 @@ function Invoke-ApplyUltra {
     }
 
     Invoke-Step (++$n) $Total "Adding process-level Defender exclusions for FiveM/GTA..." {
+        if (-not $script:Config.EnableDefenderExclude) {
+            Write-Info2 'Defender process exclusions skipped by user selection'
+            return
+        }
         # Folder exclusion alone still lets real-time protection scan the running process's
         # memory/IO; excluding the process names removes that per-frame scanning overhead.
         try {
@@ -1797,6 +1982,31 @@ function Invoke-ApplyUltra {
 # ---------------------------------------------------------------------------
 # RESET
 # ---------------------------------------------------------------------------
+function Restore-SystemSnapshot {
+    param([Parameter(Mandatory)][string]$BackupDir)
+    $path = Join-Path $BackupDir 'system-snapshot.json'
+    if (-not (Test-Path $path)) { return $false }
+    try {
+        $snapshot = Get-Content $path -Raw | ConvertFrom-Json
+        if ($snapshot.DynamicTick -eq 'Yes') {
+            Invoke-NativeChecked -Name 'Restore BCD DynamicTick=Yes' -Command { bcdedit.exe /set disabledynamictick yes } | Out-Null
+        } elseif ($snapshot.DynamicTick -eq 'No') {
+            Invoke-NativeChecked -Name 'Restore BCD DynamicTick=No' -Command { bcdedit.exe /set disabledynamictick no } | Out-Null
+        } else {
+            Invoke-NativeChecked -Name 'Restore BCD DynamicTick=Absent' -Command { bcdedit.exe /deletevalue disabledynamictick } | Out-Null
+        }
+        if ($snapshot.ActivePowerScheme -match '^[0-9a-f-]{36}$') {
+            $scheme = $snapshot.ActivePowerScheme
+            Invoke-NativeChecked -Name 'Restore active Power Scheme' -Command { powercfg.exe /setactive $scheme } | Out-Null
+        }
+        Write-VerificationResult -Name 'System Snapshot restore' -Status PASS -After 'BCD and active power scheme restore attempted' | Out-Null
+        return $true
+    } catch {
+        Write-VerificationResult -Name 'System Snapshot restore' -Status FAIL -Detail $_.Exception.Message | Out-Null
+        return $false
+    }
+}
+
 function Invoke-ResetUltra {
     $script:GuiStage = 'reset'
     Clear-Host
@@ -2009,6 +2219,7 @@ function Invoke-ResetUltra {
             Write-Ok 'Restored exact DNS/MTU/network-profile state from additive network snapshot.'
         }
     } catch { Write-Warn2 "Additive network snapshot restore skipped: $($_.Exception.Message)" }
+    try { Restore-SystemSnapshot -BackupDir $dir | Out-Null } catch { Write-Warn2 "System snapshot restore skipped: $($_.Exception.Message)" }
 
     # v2.1: Verify reset success
     Write-Host "Verifying reset success..."
@@ -3365,6 +3576,80 @@ function Invoke-InputUsbAdaptive {
 }
 
 
+function Set-AdapterPropertyIfSupported {
+    param(
+        [Parameter(Mandatory)][string]$AdapterName,
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][string]$DisplayValue,
+        [string]$Profile = 'Balanced'
+    )
+    try {
+        $prop = Get-NetAdapterAdvancedProperty -Name $AdapterName -ErrorAction Stop |
+            Where-Object { $_.DisplayName -eq $DisplayName } | Select-Object -First 1
+        if (-not $prop) {
+            Write-VerificationResult -Name "$AdapterName / $DisplayName" -Status UNSUPPORTED -Detail 'property not exposed by this driver' | Out-Null
+            return $false
+        }
+        $valid = @($prop.ValidDisplayValues)
+        if ($valid.Count -gt 0 -and $valid -notcontains $DisplayValue) {
+            Write-VerificationResult -Name "$AdapterName / $DisplayName" -Status UNSUPPORTED -Before ([string]$prop.DisplayValue) -Detail "driver does not expose '$DisplayValue'" | Out-Null
+            return $false
+        }
+        $before = [string]$prop.DisplayValue
+        if ($script:DryRun) {
+            Write-VerificationResult -Name "$AdapterName / $DisplayName" -Status SKIPPED -Before $before -After $DisplayValue -Detail "DRYRUN profile=$Profile" | Out-Null
+            return $true
+        }
+        Set-NetAdapterAdvancedProperty -Name $AdapterName -DisplayName $DisplayName -DisplayValue $DisplayValue -NoRestart -ErrorAction Stop
+        $after = [string]((Get-NetAdapterAdvancedProperty -Name $AdapterName -DisplayName $DisplayName -ErrorAction Stop | Select-Object -First 1).DisplayValue)
+        $ok = ($after -eq $DisplayValue)
+        Write-VerificationResult -Name "$AdapterName / $DisplayName" -Status $(if ($ok) { 'PASS' } else { 'FAIL' }) -Before $before -After $after -Detail "profile=$Profile" | Out-Null
+        return $ok
+    } catch {
+        Write-VerificationResult -Name "$AdapterName / $DisplayName" -Status FAIL -Detail $_.Exception.Message | Out-Null
+        return $false
+    }
+}
+
+function Invoke-NativeNetworkProfile {
+    param(
+        [Parameter(Mandatory)]$NicList,
+        $Cpu = $null,
+        [ValidateSet('Safe','Balanced','Extreme')][string]$Profile = 'Balanced'
+    )
+    if (@($NicList).Count -eq 0) { Write-Info2 'Network profile skipped: no active physical adapter'; return }
+    Write-Host "  Network profile: $Profile (adaptive, driver-capability checked)" -ForegroundColor Cyan
+
+    # These are conservative, broadly supported global settings. Do not force
+    # RSC/LSO/ECN off globally because their best values vary by NIC and driver.
+    if ($Profile -ne 'Safe') {
+        Invoke-NativeChecked -Name 'TCP autotuning=normal' -Command { netsh.exe int tcp set global autotuninglevel=normal } | Out-Null
+        Invoke-NativeChecked -Name 'TCP RSS=enabled' -Command { netsh.exe int tcp set global rss=enabled } | Out-Null
+    }
+
+    foreach ($nic in @($NicList)) {
+        if ($Profile -eq 'Safe') { continue }
+        Set-AdapterPropertyIfSupported -AdapterName $nic.Name -DisplayName 'Jumbo Packet' -DisplayValue 'Disabled' -Profile $Profile | Out-Null
+        if ($Profile -eq 'Extreme') {
+            Set-AdapterPropertyIfSupported -AdapterName $nic.Name -DisplayName 'Energy Efficient Ethernet' -DisplayValue 'Disabled' -Profile $Profile | Out-Null
+            Set-AdapterPropertyIfSupported -AdapterName $nic.Name -DisplayName 'Energy-Efficient Ethernet' -DisplayValue 'Disabled' -Profile $Profile | Out-Null
+            Set-AdapterPropertyIfSupported -AdapterName $nic.Name -DisplayName 'Interrupt Moderation' -DisplayValue 'Disabled' -Profile $Profile | Out-Null
+            Set-AdapterPropertyIfSupported -AdapterName $nic.Name -DisplayName 'Flow Control' -DisplayValue 'Disabled' -Profile $Profile | Out-Null
+        }
+    }
+
+    if ($Profile -eq 'Extreme') {
+        # This is the Group Policy equivalent of Computer Configuration\Network
+        # Scheduler\Limit reservable bandwidth. It is opt-in and fully tracked.
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched' 'NonBestEffortLimit' 0 'DWord' | Out-Null
+        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'NetworkThrottlingIndex' 0xffffffff 'DWord' | Out-Null
+        Write-Info2 'Extreme policy values applied: QoS reservable bandwidth=0 and multimedia network throttling disabled'
+    }
+
+    try { Clear-DnsClientCache -ErrorAction Stop; Write-VerificationResult -Name 'DNS client cache clear' -Status PASS | Out-Null }
+    catch { Write-VerificationResult -Name 'DNS client cache clear' -Status FAIL -Detail $_.Exception.Message | Out-Null }
+}
+
 function Invoke-NetworkAdaptive {
     param([Parameter(Mandatory)]$NicList, $Cpu = $null)
     if ($NicList.Count -eq 0) { Write-Warn2 "No active physical NIC detected - skipping network deep tweaks"; return }
@@ -3379,7 +3664,9 @@ function Invoke-NetworkAdaptive {
         elseif ($Cpu.Threads -ge 4) { $rssQueues = 2 }
         else { $rssQueues = 1 }
     }
-    $canSetIrqAffinity = [bool]($Cpu -and $Cpu.Threads -ge 2)
+    # IRQ steering is topology-sensitive; keep the fixed mask disabled unless
+    # the user explicitly selected the Extreme network profile.
+    $canSetIrqAffinity = [bool]($Cpu -and $Cpu.Threads -ge 2 -and $script:ApplyPlan.NetworkProfile -eq 'Extreme')
     $irqMask = [byte[]](2,0,0,0,0,0,0,0)
 
     foreach ($nic in $NicList) {
@@ -3820,12 +4107,42 @@ function Invoke-ExportReport {
     if (-not $FromGui) { Clear-Host }
     Write-Host "  EXPORT HARDWARE + TWEAK REPORT (HTML)" -ForegroundColor Cyan
     $outPath = Join-Path ([Environment]::GetFolderPath('Desktop')) ("NongPlai_Tuner_Report_{0}.html" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-    $html = @(
-        '<!doctype html><html><head><meta charset="utf-8"><title>NongPlaiShop Report</title></head><body>'
-        '<h1>NongPlaiShop Smart Adaptive Tuner</h1>'
-        ("<p>Generated: {0}</p>" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
-        '</body></html>'
-    ) -join [Environment]::NewLine
+    try {
+        $hw = Invoke-HardwareScan
+        $backup = Find-LatestBackup
+        $changes = @()
+        if ($backup) {
+            $changesFile = Join-Path $backup 'changes.json'
+            if (Test-Path $changesFile) { $changes = @(Get-Content $changesFile -Raw | ConvertFrom-Json) }
+        }
+        $verification = @($script:VerificationResults)
+        $esc = { param($v) [System.Net.WebUtility]::HtmlEncode([string]$v) }
+        $rows = foreach ($c in $changes) {
+            '<tr><td>{0}</td><td>{1}</td><td>{2}</td></tr>' -f (&$esc $c.Kind), (&$esc $c.Path), (&$esc $c.Name)
+        }
+        if (-not $rows) { $rows = '<tr><td colspan="3">ยังไม่พบ changes.json จากการ Apply ล่าสุด</td></tr>' }
+        $verifyRows = foreach ($v in $verification) {
+            '<tr><td>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td></tr>' -f (&$esc $v.Status), (&$esc $v.Name), (&$esc $v.Before), (&$esc $v.After)
+        }
+        if (-not $verifyRows) { $verifyRows = '<tr><td colspan="4">ยังไม่มีผล Verify ใน Session นี้</td></tr>' }
+        $html = @(
+            '<!doctype html><html><head><meta charset="utf-8"><title>NongPlaiShop Report</title><style>body{font-family:Segoe UI,Arial;margin:32px;background:#111;color:#eee}h1,h2{color:#56ccf2}table{border-collapse:collapse;width:100%}td,th{border:1px solid #444;padding:7px;text-align:left}th{background:#222}.muted{color:#aaa}</style></head><body>'
+            '<h1>NongPlaiShop Smart Adaptive Tuner</h1>'
+            ("<p class='muted'>Generated: {0}</p>" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+            '<h2>Hardware</h2>'
+            ("<ul><li>CPU: {0}</li><li>RAM: {1} GB</li><li>GPU: {2}</li><li>Storage: {3} device(s)</li><li>Network: {4} adapter(s)</li></ul>" -f (&$esc $hw.Cpu.Brand), (&$esc $hw.Ram.TotalGB), (&$esc (($hw.Gpu | ForEach-Object Model) -join ', ')), @($hw.Storage).Count, @($hw.Nic).Count)
+            '<h2>Apply plan</h2>'
+            ("<p>{0}</p>" -f (&$esc (($script:ApplyPlan.GetEnumerator() | ForEach-Object { "{0}={1}" -f $_.Key,$_.Value }) -join ', ')))
+            ("<p>Latest backup: {0}</p>" -f (&$esc $backup))
+            '<h2>Tracked changes</h2><table><tr><th>Kind</th><th>Path</th><th>Name</th></tr>'
+            ($rows -join [Environment]::NewLine)
+            '</table><h2>Verification</h2><table><tr><th>Status</th><th>Name</th><th>Before</th><th>After</th></tr>'
+            ($verifyRows -join [Environment]::NewLine)
+            '</table></body></html>'
+        ) -join [Environment]::NewLine
+    } catch {
+        $html = '<!doctype html><html><body><h1>NongPlaiShop Report</h1><p>Report generation error: ' + [System.Net.WebUtility]::HtmlEncode($_.Exception.Message) + '</p></body></html>'
+    }
     try {
         Set-Content -Path $outPath -Value $html -Encoding UTF8
         Write-Ok "Report saved: $outPath"
@@ -4065,6 +4382,76 @@ function Invoke-AggressiveOptimization {
     }
 }
 
+function Select-ApplyPlan {
+    param([Parameter(Mandatory)]$Hw)
+
+    # Worker mode is retained for compatibility with old launches; console mode
+    # is interactive and always asks the user before applying changes.
+    if ($script:GuiWorker) {
+        $script:ApplyPlan = [ordered]@{
+            Core=$true; CPU=$true; GPU=$true; RAM=$true; Storage=$true
+            Network=$true; Input=$true; Aggressive=$false; Defender=$false
+        }
+        return $true
+    }
+
+    Write-Host ""
+    Write-Host "  เลือกหมวดที่ต้องการปรับก่อนเริ่ม Apply" -ForegroundColor Cyan
+    Write-Host "  ตอบ Y = ปรับ, N = ข้าม โดยสคริปต์จะแสดงค่าที่เสนอให้ก่อนทุกหมวด" -ForegroundColor DarkGray
+    Write-Host "  หมายเหตุ: Defender Exclusion และ Aggressive จะปิดไว้เป็นค่าเริ่มต้นเพื่อความปลอดภัย" -ForegroundColor Yellow
+    Write-Host ""
+
+    $items = @(
+        @{ Key='Core'; Name='Windows Core + Services'; Desc='Power plan, system profile, services และค่าพื้นฐาน'; Default='Y' },
+        @{ Key='CPU'; Name='CPU + Power'; Desc="ปรับตาม CPU ที่ตรวจพบ: $($Hw.Cpu.Brand), $($Hw.Cpu.Threads) threads"; Default='Y' },
+        @{ Key='GPU'; Name='GPU + Game Profile'; Desc="ปรับตาม GPU ที่ตรวจพบ: $((@($Hw.Gpu | ForEach-Object Brand) -join ', '))"; Default='Y' },
+        @{ Key='RAM'; Name='RAM + Memory'; Desc="ปรับตาม RAM $($Hw.Ram.TotalGB) GB"; Default='Y' },
+        @{ Key='Storage'; Name='Storage'; Desc='ตรวจและปรับตาม NVMe / SSD / HDD ที่ตรวจพบ'; Default='Y' },
+        @{ Key='Network'; Name='Network'; Desc="ปรับตาม NIC ที่ตรวจพบ $(@($Hw.Nic).Count) ตัว"; Default='Y' },
+        @{ Key='Input'; Name='Mouse / Keyboard / USB'; Desc='ลด power saving และ input latency ของอุปกรณ์ที่รองรับ'; Default='Y' },
+        @{ Key='Aggressive'; Name='Aggressive Tweaks'; Desc='Dynamic Tick, C-State, offload และค่าที่มีความเสี่ยง/ใช้ไฟเพิ่ม'; Default='N' },
+        @{ Key='Defender'; Name='Defender Exclusion'; Desc='เพิ่ม Exclusion ให้ FiveM/GTA (ลดการตรวจสอบความปลอดภัย)'; Default='N' }
+    )
+
+    foreach ($item in $items) {
+        Write-Host ("  [{0}] {1}" -f $item.Key, $item.Name) -ForegroundColor White
+        Write-Host ("      {0}" -f $item.Desc) -ForegroundColor DarkGray
+        $answer = (Read-Host ("      ปรับหมวดนี้หรือไม่? (Y/N, Enter={0})" -f $item.Default)).Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $item.Default }
+        while ($answer -notin @('Y','N')) {
+            $answer = (Read-Host '      กรุณาตอบ Y หรือ N').Trim().ToUpperInvariant()
+        }
+        $script:ApplyPlan[$item.Key] = ($answer -eq 'Y')
+        if ($item.Key -eq 'Network' -and $answer -eq 'Y') {
+            Write-Host '      Network profile:' -ForegroundColor Cyan
+            Write-Host '        [1] Safe     - รักษาค่า Driver เดิม เน้นความเข้ากันได้' -ForegroundColor Green
+            Write-Host '        [2] Balanced - ปรับค่าที่ตรวจพบจริง เน้น latency/1% low' -ForegroundColor Yellow
+            Write-Host '        [3] Extreme  - รวม Group Policy/QoS และค่าลด power saving (เสี่ยงกว่า)' -ForegroundColor Red
+            $profileAnswer = (Read-Host '      เลือกโปรไฟล์ (1/2/3, Enter=2)').Trim()
+            if ([string]::IsNullOrWhiteSpace($profileAnswer)) { $profileAnswer = '2' }
+            while ($profileAnswer -notin @('1','2','3')) { $profileAnswer = (Read-Host '      กรุณาเลือก 1, 2 หรือ 3').Trim() }
+            $script:ApplyPlan.NetworkProfile = switch ($profileAnswer) { '1' { 'Safe' } '3' { 'Extreme' } default { 'Balanced' } }
+        }
+    }
+
+    $script:Config.EnableAggressive = [bool]$script:ApplyPlan.Aggressive
+    $script:Config.EnableDefenderExclude = [bool]$script:ApplyPlan.Defender
+    $selected = @($items | Where-Object { $script:ApplyPlan[$_.Key] } | ForEach-Object Name)
+    if ($selected.Count -eq 0) {
+        Write-Warn2 'ไม่ได้เลือกหมวดใดเลย ยกเลิกการ Apply'
+        return $false
+    }
+    Write-Host ""
+    Write-Host 'สรุปหมวดที่จะปรับ:' -ForegroundColor Cyan
+    $selected | ForEach-Object { Write-Host "  - $_" -ForegroundColor Green }
+    $confirm = (Read-Host 'ยืนยันเริ่มปรับค่าตามรายการนี้หรือไม่? (Y/N)').Trim().ToUpperInvariant()
+    if ($confirm -ne 'Y') {
+        Write-Warn2 'ยกเลิกการ Apply ตามคำสั่งผู้ใช้'
+        return $false
+    }
+    return $true
+}
+
 function Invoke-DoEverything {
     if (-not $script:GuiWorker) { try { Clear-Host } catch {} }
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
@@ -4092,8 +4479,21 @@ function Invoke-DoEverything {
     Show-HardwareSummary -Hw $hw
     Write-Host ""
 
+    if (-not (Select-ApplyPlan -Hw $hw)) {
+        if (-not $script:GuiWorker) { Read-Host 'กด Enter เพื่อกลับเมนู' | Out-Null }
+        return
+    }
+
+    # Capture the exact network state before any selected module can touch it.
+    # Reset restores this snapshot after the legacy default restoration pass.
+    if (-not $script:DryRun) {
+        if (-not $script:BackupDir) { New-BackupFolder | Out-Null }
+        try { New-NetworkSnapshot -BackupDir $script:BackupDir -Quiet | Out-Null }
+        catch { Write-Warn2 "Network snapshot skipped: $($_.Exception.Message)" }
+    }
+
     # Apply level-specific tweaks
-    if ($script:OptimizationLevel -eq 'Aggressive') {
+    if ($script:OptimizationLevel -eq 'Aggressive' -and $script:ApplyPlan.Aggressive) {
         Write-Host "🔥 Applying AGGRESSIVE optimization tweaks..." -ForegroundColor Red
         Invoke-AggressiveOptimization
     } elseif ($script:OptimizationLevel -eq 'Balanced') {
@@ -4107,20 +4507,31 @@ function Invoke-DoEverything {
     # --- Part 1: full legacy 39-step Apply Ultra (creates backup folder + restore point) ---
     $script:GuiStage = 'legacy'
     $script:LegacyStepCount = 0
-    Invoke-ApplyUltra
+    if ($script:ApplyPlan.Core) { Invoke-ApplyUltra }
+    else { Write-Info2 'ข้าม Windows Core + Services ตามที่เลือก' }
 
     # Full Gaming extras are included in Apply Everything.
-    Invoke-FullGamingExtras
-    Invoke-DeepAggressiveTuning
-    Invoke-NetworkAggressiveTuning
+    if ($script:ApplyPlan.GPU) { Invoke-FullGamingExtras }
+    if ($script:ApplyPlan.CPU -and $script:ApplyPlan.Aggressive) { Invoke-DeepAggressiveTuning }
+    elseif ($script:ApplyPlan.CPU) { Write-Info2 'ข้าม CPU Deep Aggressive ตามที่เลือก' }
+    if ($script:ApplyPlan.Network -and $script:ApplyPlan.Aggressive) { Invoke-NetworkAggressiveTuning }
+    elseif ($script:ApplyPlan.Network) { Write-Info2 'ข้าม Network Aggressive ตามที่เลือก' }
 
     # Hardware/capability data was already collected at the very top of this
     # function (before any write happened) - reuse it here instead of
     # re-scanning, so the whole run works from one single, consistent
     # snapshot of the machine's hardware/capabilities.
     $script:GuiStage = 'adaptive'
-    Invoke-SystemAdaptiveProfile -Hw $hw
-    Invoke-AdaptiveFiveMRuntime -Hw $hw
+    if ($script:ApplyPlan.Core -or $script:ApplyPlan.CPU -or $script:ApplyPlan.GPU -or $script:ApplyPlan.RAM -or $script:ApplyPlan.Storage -or $script:ApplyPlan.Network -or $script:ApplyPlan.Input) {
+        Invoke-SystemAdaptiveProfile -Hw $hw
+    } else {
+        Write-Info2 'Skipped System Adaptive Profile: no applicable category selected'
+    }
+    if ($script:ApplyPlan.CPU -or $script:ApplyPlan.GPU) {
+        Invoke-AdaptiveFiveMRuntime -Hw $hw
+    } else {
+        Write-Info2 'Skipped FiveM Runtime Profile: CPU/GPU category not selected'
+    }
 
     # --- Part 2: apply hardware-specific adaptive modules and layer on adaptive CPU/GPU/RAM/Storage/Network tweaks ---
     Write-Host ""
@@ -4131,13 +4542,22 @@ function Invoke-DoEverything {
     if (-not $script:BackupDir) { New-BackupFolder | Out-Null }
 
     $modules = @(
-        @{ Name = 'CPU adaptive tweaks';     Action = { Invoke-CpuAdaptive -Cpu $hw.Cpu -IsLaptop $hw.IsLaptop } },
-        @{ Name = 'GPU adaptive tweaks';     Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
-        @{ Name = 'RAM adaptive tweaks';     Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
-        @{ Name = 'Storage adaptive tweaks'; Action = { Invoke-StorageAdaptive -StorageList $hw.Storage } },
-        @{ Name = 'Input/USB adaptive tweaks'; Action = { Invoke-InputUsbAdaptive -Cpu $hw.Cpu } },
-        @{ Name = 'Network adaptive tweaks'; Action = { Invoke-NetworkAdaptive -NicList $hw.Nic -Cpu $hw.Cpu } }
+        @{ Name = 'CPU adaptive tweaks';     Enabled=$script:ApplyPlan.CPU; Action = { Invoke-CpuAdaptive -Cpu $hw.Cpu -IsLaptop $hw.IsLaptop } },
+        @{ Name = 'GPU adaptive tweaks';     Enabled=$script:ApplyPlan.GPU; Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
+        @{ Name = 'RAM adaptive tweaks';     Enabled=$script:ApplyPlan.RAM; Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
+        @{ Name = 'Storage adaptive tweaks'; Enabled=$script:ApplyPlan.Storage; Action = { Invoke-StorageAdaptive -StorageList $hw.Storage } },
+        @{ Name = 'Input/USB adaptive tweaks'; Enabled=$script:ApplyPlan.Input; Action = { Invoke-InputUsbAdaptive -Cpu $hw.Cpu } },
+        @{ Name = 'Network adaptive tweaks'; Enabled=$script:ApplyPlan.Network; Action = {
+                $profile = if ($script:ApplyPlan.NetworkProfile) { [string]$script:ApplyPlan.NetworkProfile } else { 'Balanced' }
+                if ($profile -eq 'Safe') {
+                    Invoke-NativeNetworkProfile -NicList $hw.Nic -Cpu $hw.Cpu -Profile Safe
+                } else {
+                    Invoke-NetworkAdaptive -NicList $hw.Nic -Cpu $hw.Cpu
+                    Invoke-NativeNetworkProfile -NicList $hw.Nic -Cpu $hw.Cpu -Profile $profile
+                }
+            } }
     )
+    $modules = @($modules | Where-Object Enabled)
     $total = $modules.Count
     $i = 0
     foreach ($m in $modules) {
@@ -5528,7 +5948,11 @@ if (($NetworkDiagnose -or $NetworkCustom) -and -not $ConsoleOnly) {
 
 if ($ConsoleOnly -or $NoGui) {
     try {
-        Show-MainMenuConsole
+        if ($script:RequestedAction) {
+            Invoke-RequestedAction -Action $script:RequestedAction
+        } else {
+            Show-MainMenuConsole
+        }
     } catch {
         Write-Host ""
         Write-Host "  FATAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
@@ -5813,3 +6237,54 @@ function Invoke-AllTuningsWithVerification {
     Write-Host "📊 TUNING VERIFICATION COMPLETE" -ForegroundColor Green
     Write-Host "════════════════════════════════════════" -ForegroundColor Green
 }
+# ==============================================================================================
+# 1. ล็อก DSCP Value ระดับ Layer 2/3 (DSCP & CoS Value) สำหรับ FiveM
+# ==============================================================================================
+# ลบ Policy เดิมทิ้งก่อนถ้ามี (เพื่อป้องกัน Error ตอนสร้างใหม่)
+Remove-NetQosPolicy -Name "FiveM_Extreme" -ErrorAction SilentlyContinue -Confirm:$false
+Remove-NetQosPolicy -Name "FiveM_Extreme_GTAProcess" -ErrorAction SilentlyContinue -Confirm:$false
+
+# สร้าง Policy ใหม่
+New-NetQosPolicy -Name "FiveM_Extreme" -AppPathNameMatchCondition "FiveM.exe" -IPProtocolMatchCondition UDP -DSCPAction 46 -NetworkProfile All | Out-Null
+New-NetQosPolicy -Name "FiveM_Extreme_GTAProcess" -AppPathNameMatchCondition "FiveM_b3258_GTAProcess.exe" -IPProtocolMatchCondition UDP -DSCPAction 46 -NetworkProfile All | Out-Null
+
+# ==============================================================================================
+# 2. ปิดระบบสแกนและตรวจสอบข้อมูล Network ของ Windows (Pacer & Offloading)
+# ==============================================================================================
+$PschedPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
+if (!(Test-Path $PschedPath)) { New-Item -Path $PschedPath -Force | Out-Null }
+# Set timer resolution: Enabled -> 1
+Set-ItemProperty -Path $PschedPath -Name "TimerResolution" -Value 1 -Type DWord -Force
+# Limit outstanding packets: Enabled -> 0
+Set-ItemProperty -Path $PschedPath -Name "MaxOutstandingSends" -Value 0 -Type DWord -Force
+
+# ==============================================================================================
+# 3. ปิดระบบลบและรีเฟรช DNS (Disable Negative DNS Caching)
+# ==============================================================================================
+$DNSClientPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+if (!(Test-Path $DNSClientPath)) { New-Item -Path $DNSClientPath -Force | Out-Null }
+# Turn off multicast name resolution (LLMNR): Enabled
+Set-ItemProperty -Path $DNSClientPath -Name "EnableMulticast" -Value 0 -Type DWord -Force
+# Turn off smart multi-homed name resolution: Enabled
+Set-ItemProperty -Path $DNSClientPath -Name "DisableSmartNameResolution" -Value 1 -Type DWord -Force
+
+# ==============================================================================================
+# 4. สั่งตัด Traffic ส่วนเกินของระบบ Windows ทั้งหมด (Network Isolation)
+# ==============================================================================================
+$BITSPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS"
+if (!(Test-Path $BITSPath)) { New-Item -Path $BITSPath -Force | Out-Null }
+# Limit the maximum network bandwidth for BITS background transfers
+Set-ItemProperty -Path $BITSPath -Name "EnableBITSMaxBandwidth" -Value 1 -Type DWord -Force
+Set-ItemProperty -Path $BITSPath -Name "MaxTransferRateOnSchedule" -Value 1 -Type DWord -Force
+Set-ItemProperty -Path $BITSPath -Name "MaxTransferRateOffSchedule" -Value 1 -Type DWord -Force
+Set-ItemProperty -Path $BITSPath -Name "MaxBandwidthValidFrom" -Value 0 -Type DWord -Force
+Set-ItemProperty -Path $BITSPath -Name "MaxBandwidthValidTo" -Value 23 -Type DWord -Force
+
+$NCSIPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator"
+if (!(Test-Path $NCSIPath)) { New-Item -Path $NCSIPath -Force | Out-Null }
+# Specify Global DNS: Enabled -> 1.1.1.1
+Set-ItemProperty -Path $NCSIPath -Name "UseGlobalDNS" -Value 1 -Type DWord -Force
+Set-ItemProperty -Path $NCSIPath -Name "GlobalDNS" -Value "1.1.1.1" -Type String -Force
+
+# Refresh Group Policy ทันทีเพื่อให้ค่าที่ตั้งทำงาน
+gpupdate /force | Out-Null
