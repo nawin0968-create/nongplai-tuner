@@ -212,13 +212,13 @@ $ProgressPreference = 'SilentlyContinue'
 # ==============================================================================
 function Set-NongPlaiGroupPolicyNetworkTweaks {
     try {
-        # 1. NetQosPolicy
-        Remove-NetQosPolicy -Name "fivem" -ErrorAction SilentlyContinue -Confirm:$false
-        Remove-NetQosPolicy -Name "fivem_gta" -ErrorAction SilentlyContinue -Confirm:$false
-        New-NetQosPolicy -Name "fivem" -AppPathNameMatchCondition "FiveM.exe" -IPProtocolMatchCondition Both -DSCPAction 46 -NetworkProfile All -Precedence 127 -ErrorAction SilentlyContinue | Out-Null
-        New-NetQosPolicy -Name "fivem_gta" -AppPathNameMatchCondition "FiveM_b3258_GTAProcess.exe" -IPProtocolMatchCondition Both -DSCPAction 46 -NetworkProfile All -Precedence 127 -ErrorAction SilentlyContinue | Out-Null
+        # 1. NetQosPolicy (PowerShell / WMI Level)
+        Remove-NetQosPolicy -Name "FiveM_Extreme" -ErrorAction SilentlyContinue -Confirm:$false
+        Remove-NetQosPolicy -Name "FiveM_Extreme_GTAProcess" -ErrorAction SilentlyContinue -Confirm:$false
+        New-NetQosPolicy -Name "FiveM_Extreme" -AppPathNameMatchCondition "FiveM.exe" -IPProtocolMatchCondition Both -DSCPAction 46 -NetworkProfile All -Precedence 127 -ErrorAction SilentlyContinue | Out-Null
+        New-NetQosPolicy -Name "FiveM_Extreme_GTAProcess" -AppPathNameMatchCondition "FiveM_b3258_GTAProcess.exe" -IPProtocolMatchCondition Both -DSCPAction 46 -NetworkProfile All -Precedence 127 -ErrorAction SilentlyContinue | Out-Null
 
-        # 2. Update Registry
+        # 2. Update Registry Policies
         $PschedPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
         if (!(Test-Path $PschedPath)) { New-Item -Path $PschedPath -Force | Out-Null }
         Set-ItemProperty -Path $PschedPath -Name "NonBestEffortLimit" -Value 0 -Type DWord -Force
@@ -234,17 +234,28 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         if (!(Test-Path $DOPath)) { New-Item -Path $DOPath -Force | Out-Null }
         Set-ItemProperty -Path $DOPath -Name "DODownloadMode" -Value 0 -Type DWord -Force
 
+        $BITSPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS"
+        if (!(Test-Path $BITSPath)) { New-Item -Path $BITSPath -Force | Out-Null }
+        Set-ItemProperty -Path $BITSPath -Name "EnableBITSMaxBandwidth" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $BITSPath -Name "MaxTransferRateOnSchedule" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $BITSPath -Name "MaxTransferRateOffSchedule" -Value 1 -Type DWord -Force
+
         $MMCSSPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
         if (!(Test-Path $MMCSSPath)) { New-Item -Path $MMCSSPath -Force | Out-Null }
         Set-ItemProperty -Path $MMCSSPath -Name "NetworkThrottlingIndex" -Value 0xFFFFFFFF -Type DWord -Force
         Set-ItemProperty -Path $MMCSSPath -Name "SystemResponsiveness" -Value 0 -Type DWord -Force
 
-        # Policy-based QoS Registry
+        # NLA Bypass so QoS works on standalone/gaming PCs
+        $tcpQosPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\QoS"
+        if (!(Test-Path $tcpQosPath)) { New-Item -Path $tcpQosPath -Force | Out-Null }
+        Set-ItemProperty -Path $tcpQosPath -Name "Do not use NLA" -Value "1" -Type String -Force
+
+        # Policy-based QoS Registry (HKLM)
         $qosBase = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\QoS"
         if (!(Test-Path $qosBase)) { New-Item -Path $qosBase -Force | Out-Null }
         $qosItems = @(
-            @{ Key = "fivem"; App = "FiveM.exe" },
-            @{ Key = "fivem_gta"; App = "FiveM_b3258_GTAProcess.exe" }
+            @{ Key = "FiveM_Extreme"; App = "FiveM.exe"; DSCP = "46" },
+            @{ Key = "FiveM_Extreme_GTAProcess"; App = "FiveM_b3258_GTAProcess.exe"; DSCP = "46" }
         )
         foreach ($p in $qosItems) {
             $path = Join-Path $qosBase $p.Key
@@ -258,7 +269,7 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
             Set-ItemProperty -Path $path -Name "Remote Port" -Value "*" -Type String -Force
             Set-ItemProperty -Path $path -Name "Remote IP" -Value "*" -Type String -Force
             Set-ItemProperty -Path $path -Name "Remote IP Prefix Length" -Value "*" -Type String -Force
-            Set-ItemProperty -Path $path -Name "DSCP Value" -Value "46" -Type String -Force
+            Set-ItemProperty -Path $path -Name "DSCP Value" -Value $p.DSCP -Type String -Force
             Set-ItemProperty -Path $path -Name "Throttle Rate" -Value "-1" -Type String -Force
         }
 
@@ -302,6 +313,7 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
             $w.Write([char]']')
         }
 
+        # Add Network Policies
         Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Psched" "NonBestEffortLimit" 0
         Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Psched" "TimerResolution" 1
         Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Psched" "MaxOutstandingSends" 0
@@ -312,6 +324,7 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         Add-PolDWord $writer "Software\Policies\Microsoft\Windows\BITS" "MaxTransferRateOnSchedule" 1
         Add-PolDWord $writer "Software\Policies\Microsoft\Windows\BITS" "MaxTransferRateOffSchedule" 1
 
+        # Add QoS Policies into Registry.pol for gpedit.msc UI display
         foreach ($p in $qosItems) {
             $baseK = "Software\Policies\Microsoft\Windows\QoS\" + $p.Key
             Add-PolString $writer $baseK "Version" "1.0"
@@ -323,7 +336,7 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
             Add-PolString $writer $baseK "Remote Port" "*"
             Add-PolString $writer $baseK "Remote IP" "*"
             Add-PolString $writer $baseK "Remote IP Prefix Length" "*"
-            Add-PolString $writer $baseK "DSCP Value" "46"
+            Add-PolString $writer $baseK "DSCP Value" $p.DSCP
             Add-PolString $writer $baseK "Throttle Rate" "-1"
         }
 
@@ -332,286 +345,7 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         $stream.Close()
 
         Start-Process -FilePath "$env:windir\System32\gpupdate.exe" -ArgumentList "/force" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
-        Write-Host " [OK] Group Policy (gpedit.msc) QoS and Network Settings Applied!" -ForegroundColor Green
-    } catch {
-        Write-Warning "Cannot set gpedit settings: (see log)"
-    }
-}
-# Thai / UTF-8 encoding — must be the very first executable lines.
-#
-# WHY ALL FOUR LINES ARE NEEDED (PowerShell 5.1 on Windows):
-#
-#   1. chcp 65001
-#      Sets the Windows console code page to UTF-8 so that the underlying
-#      Win32 console window can receive and display multi-byte characters
-#      (Thai, emoji, box-drawing). Without this the console stays on the
-#      system OEM code page (874 for Thai Windows, 850 for most others)
-#      and every non-ASCII character comes out as '?' or garbage.
-#
-#   2. [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-#      Tells the .NET Console class how to encode the bytes it writes.
-#      PowerShell's Write-Host goes through this encoding; if it doesn't
-#      match the console code page set above, the bytes mis-match and Thai
-#      text is still garbled even after chcp 65001.
-#
-#   3. [Console]::InputEncoding = [System.Text.Encoding]::UTF8
-#      Mirrors OutputEncoding for the standard-input side. Read-Host and
-#      piped input (e.g. irm | iex) are decoded through InputEncoding.
-#      Without this, any Thai characters the user *types* arrive mangled.
-#
-#   4. $OutputEncoding = [System.Text.Encoding]::UTF8
-#      Controls how PowerShell encodes text when it pipes output into
-#      external commands (netsh, bcdedit, fsutil …). The pipe uses this
-#      encoding, not [Console]::OutputEncoding. Missing this line means
-#      Thai text passed to external tools comes out as '?'.
-# ---------------------------------------------------------------------------
-try { & "$env:SystemRoot\System32\chcp.com" 65001 | Out-Null } catch {}
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
-$OutputEncoding           = [System.Text.Encoding]::UTF8
-# NongPlaiShop - FiveM Performance Tuner (PowerShell edition)
-# Requires Windows PowerShell 5.1 or later (built into Windows 10/11 by default).
-# Rewritten from the original .cmd to fix reliability issues caused by
-# batch's fragile multi-line parsing and by spawning a fresh powershell.exe
-# process for almost every step. This version runs as a single PowerShell
-# session: fewer spawned processes, real try/catch per step, and a proper
-# JSON-based backup so Reset can undo exactly what was changed.
-#
-# v2.0 additions: Hardware Scan Engine + Adaptive Deep Tweak.
-# Before applying anything, v2 scans the actual CPU/GPU/RAM/Storage/NIC in this PC and
-# only applies the tweaks that make sense for that hardware (e.g. Intel vs AMD CPU tweaks,
-# NVMe vs SATA SSD vs HDD tweaks, Realtek vs Intel NIC tweaks). Same safe change-tracking
-# and Reset as v1 - every adaptive tweak goes through the same Set-Reg/Set-SvcStart helpers
-# so it is fully undoable.
-#
-# Usage:
-#     Right-click > Run with PowerShell
-#     .\nongplai.ps1                 -> เปิดเมนูหลัก (GUI ถ้ามี / console fallback ถ้าไม่มี GUI)
-#     .\nongplai.ps1 -Apply          -> Apply Everything ผ่าน command line
-#     .\nongplai.ps1 -Reset          -> Reset คืนค่าล่าสุดผ่าน command line
-#     .\nongplai.ps1 -Scan           -> สแกนฮาร์ดแวร์อย่างเดียว
-#     .\nongplai.ps1 -Report         -> สร้างรายงาน HTML บน Desktop
-#     .\nongplai.ps1 -HpetToggle     -> เปิดเครื่องมือ HPET
-#     .\nongplai.ps1 -NoGui          -> บังคับใช้เมนูแบบ console
-#     .\nongplai.ps1 -DryRun         -> แสดงรายการที่จะเปลี่ยนโดยไม่แก้ไขระบบ
-#
-# หมายเหตุ: สคริปต์นี้ออกแบบให้เปิดจากไฟล์ nongplai.ps1 ที่บันทึกอยู่ในเครื่องเท่านั้น
-
-# --- Manual argument parsing (NOT using param()) ---------------------------
-# This script deliberately does NOT use a formal param() block. param() must
-# be the literal first statement in the file, and if a stray UTF-8 BOM
-# character ever leaks into the executed text (this happens under some
-# invocation paths - right-click "Run with PowerShell", `irm | iex`, etc,
-# which use -Command semantics instead of -File), the corrupted first
-# "statement" bumps param() out of first position and the whole file fails
-# to parse. Reading $args manually has no such positional requirement, so a
-# leaked BOM only ever produces one harmless, non-fatal error on line 1
-# instead of breaking the entire script. See also the header note above.
-function Test-SwitchArg { param([string]$Name) return ($args -contains "-$Name") }
-$script:RawScriptArgs = @($args)
-$Apply             = $args -contains '-Apply'
-$Reset             = $args -contains '-Reset'
-$Scan              = $args -contains '-Scan'
-$Report            = $args -contains '-Report'
-$NoGui             = $args -contains '-NoGui'
-$Help              = $args -contains '-Help'
-$HpetToggle        = $args -contains '-HpetToggle'
-$DryRun            = $args -contains '-DryRun'
-$NetworkDiagnose   = $args -contains '-NetworkDiagnose'
-$NetworkCustom     = $args -contains '-NetworkCustom'
-$Worker            = $args -contains '-Worker'
-$WorkerUi          = $args -contains '-WorkerUi'
-$Advanced          = $args -contains '-Advanced'
-$CustomTuning      = $args -contains '-CustomTuning'
-# This build is intentionally console-only. All tuning and backup functions
-# remain available; only the WPF/WinForms presentation layer is bypassed.
-$ConsoleOnly       = $true
-$NoGui             = $true
-function Get-NamedArgValue {
-    param([string]$Name, [string]$Default = '')
-    # `$args inside this function contains only unnamed arguments passed to the
-    # function, not the script's original command-line arguments. The worker
-    # launcher passes -WorkerAction and -GuiLogPath as script arguments, so read
-    # the captured script-level array instead.
-    for ($i = 0; $i -lt $script:RawScriptArgs.Count - 1; $i++) {
-        if ([string]$script:RawScriptArgs[$i] -ieq "-$Name") {
-            return [string]$script:RawScriptArgs[$i + 1]
-        }
-    }
-    return $Default
-}
-$WorkerAction      = Get-NamedArgValue -Name 'WorkerAction' -Default ''
-$GuiLogPath        = Get-NamedArgValue -Name 'GuiLogPath' -Default ''
-$OptimizationLevel = Get-NamedArgValue -Name 'OptimizationLevel' -Default 'Balanced'
-if ($OptimizationLevel -notin @('Safe','Balanced','Aggressive')) { $OptimizationLevel = 'Balanced' }
-if ($WorkerAction -and $WorkerAction -notin @('','Apply','Reset','Scan','Hpet','Report','NetworkDiagnose','NetworkCustom')) { $WorkerAction = '' }
-# -----------------------------------------------------------------------------
-
-$script:ScriptPath = $MyInvocation.MyCommand.Path
-$script:OptimizationLevel = $OptimizationLevel
-
-# When loaded with irm | iex, persist the in-memory script so elevated and GUI
-# worker processes can relaunch the same code.
-if ([string]::IsNullOrWhiteSpace($script:ScriptPath)) {
-    $inlineScript = $null
-    $sourceVariable = $null
-    try { $sourceVariable = $ExecutionContext.SessionState.PSVariable.Get('s').Value } catch {}
-    if ($sourceVariable -is [string] -and $sourceVariable -match '(?s)NongPlaiShop.*function Invoke-ApplyUltra') {
-        $inlineScript = $sourceVariable
-    }
-    if ([string]::IsNullOrWhiteSpace($inlineScript)) {
-        $urlMatch = [regex]::Match([string]$MyInvocation.Line, '(https?://[^\s"'']+\.ps1(?:\?[^\s"'']*)?)')
-        if ($urlMatch.Success) {
-            try {
-                $inlineScript = (New-Object System.Net.WebClient).DownloadString($urlMatch.Groups[1].Value).TrimStart([char]0xFEFF)
-            } catch {}
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($inlineScript)) {
-        $inlineScript = $MyInvocation.MyCommand.Definition
-    }
-    if ([string]::IsNullOrWhiteSpace($inlineScript)) {
-        throw 'ไม่พบเนื้อหาสคริปต์สำหรับเริ่มการทำงาน'
-    }
-    $script:ScriptPath = Join-Path $env:TEMP ('NongPlai_{0}.ps1' -f ([guid]::NewGuid().ToString('N')))
-    try {
-        Set-Content -Path $script:ScriptPath -Value $inlineScript -Encoding UTF8 -ErrorAction Stop
-        if ((Get-Item -LiteralPath $script:ScriptPath -ErrorAction Stop).Length -lt 1000) {
-            Remove-Item -LiteralPath $script:ScriptPath -Force -ErrorAction SilentlyContinue
-            throw 'source ของ irm | iex ไม่ครบ จึงไม่สามารถเริ่ม worker ได้ กรุณาใช้รูปแบบ $s = irm "URL"; iex ($s.TrimStart([char]0xFEFF))'
-        }
-    } catch {
-        throw "ไม่สามารถเตรียมไฟล์ชั่วคราวสำหรับการทำงานแบบ irm | iex: $($_.Exception.Message)"
-    }
-}
-
-if (-not (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
-    throw 'ไม่พบไฟล์ nongplai.ps1 สำหรับเริ่มการทำงาน'
-}
-
-# ยกระดับสิทธิ์เป็น Administrator เมื่อจำเป็น
-$currentId = [Security.Principal.WindowsIdentity]::GetCurrent()
-$currentPrincipal = New-Object Security.Principal.WindowsPrincipal($currentId)
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $launchConsole = [bool]($Apply -or $Reset -or $Scan -or $Report -or $HpetToggle -or $NetworkDiagnose -or $NetworkCustom -or $Help -or $NoGui)
-    $launcherPowerShell = Join-Path $PSHOME 'powershell.exe'
-    if (-not (Test-Path $launcherPowerShell)) { $launcherPowerShell = 'powershell.exe' }
-    $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $($script:ScriptPath))
-    if (-not $launchConsole -or $Worker -or $WorkerUi) { $argList += @('-WindowStyle', 'Hidden') }
-    if ($Apply) { $argList += '-Apply' }
-    if ($Reset) { $argList += '-Reset' }
-    if ($Scan) { $argList += '-Scan' }
-    if ($Report) { $argList += '-Report' }
-    if ($NetworkDiagnose) { $argList += '-NetworkDiagnose' }
-    if ($NetworkCustom) { $argList += '-NetworkCustom' }
-    if ($NoGui) { $argList += '-NoGui' }
-    if ($Help) { $argList += '-Help' }
-    if ($HpetToggle) { $argList += '-HpetToggle' }
-    if ($DryRun) { $argList += '-DryRun' }
-    if ($Worker) { $argList += '-Worker' }
-    if ($WorkerUi) { $argList += '-WorkerUi' }
-    if ($WorkerAction) { $argList += @('-WorkerAction', $WorkerAction) }
-    if ($GuiLogPath) { $argList += @('-GuiLogPath', $GuiLogPath) }
-    try {
-        if (-not $launchConsole -or $Worker -or $WorkerUi) {
-            Start-Process -FilePath $launcherPowerShell -ArgumentList $argList -Verb RunAs -WindowStyle Hidden | Out-Null
-        } else {
-            Start-Process -FilePath $launcherPowerShell -ArgumentList $argList -Verb RunAs | Out-Null
-        }
-    } catch {
-        try {
-            Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
-            [System.Windows.MessageBox]::Show('ยกเลิกหรือยกระดับสิทธิ์ไม่สำเร็จ โปรแกรมนี้ต้องทำงานด้วยสิทธิ์ Administrator', 'NongPlaiShop', 'OK', 'Warning') | Out-Null
-        } catch {}
-    }
-    exit 0
-}
-
-# คืนค่าพาธของไฟล์สคริปต์จริงสำหรับโปรเซสลูกของ GUI
-function Confirm-ScriptPersisted {
-    if (-not (Test-Path $script:ScriptPath -ErrorAction SilentlyContinue)) {
-        throw 'ไม่พบไฟล์ nongplai.ps1 สำหรับเริ่มงานเบื้องหลัง'
-    }
-    return $script:ScriptPath
-}
-
-function Get-PowerShellExePath {
-    $preferred = Join-Path $PSHOME 'powershell.exe'
-    if (Test-Path $preferred) { return $preferred }
-    $cmd = Get-Command 'powershell.exe' -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    throw 'ไม่พบ powershell.exe บนเครื่องนี้'
-}
-
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-# ==============================================================================
-# Auto-Apply Group Policy Network Tweaks immediately at startup (gpedit.msc)
-# ==============================================================================
-function Set-NongPlaiGroupPolicyNetworkTweaks {
-    try {
-        # 1. Update Registry
-        $PschedPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
-        if (!(Test-Path $PschedPath)) { New-Item -Path $PschedPath -Force | Out-Null }
-        Set-ItemProperty -Path $PschedPath -Name "NonBestEffortLimit" -Value 0 -Type DWord -Force
-        Set-ItemProperty -Path $PschedPath -Name "TimerResolution" -Value 1 -Type DWord -Force
-        Set-ItemProperty -Path $PschedPath -Name "MaxOutstandingSends" -Value 0 -Type DWord -Force
-
-        $DNSClientPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
-        if (!(Test-Path $DNSClientPath)) { New-Item -Path $DNSClientPath -Force | Out-Null }
-        Set-ItemProperty -Path $DNSClientPath -Name "EnableMulticast" -Value 0 -Type DWord -Force
-        Set-ItemProperty -Path $DNSClientPath -Name "DisableSmartNameResolution" -Value 1 -Type DWord -Force
-
-        $DOPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
-        if (!(Test-Path $DOPath)) { New-Item -Path $DOPath -Force | Out-Null }
-        Set-ItemProperty -Path $DOPath -Name "DODownloadMode" -Value 0 -Type DWord -Force
-
-        $MMCSSPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
-        if (!(Test-Path $MMCSSPath)) { New-Item -Path $MMCSSPath -Force | Out-Null }
-        Set-ItemProperty -Path $MMCSSPath -Name "NetworkThrottlingIndex" -Value 0xFFFFFFFF -Type DWord -Force
-        Set-ItemProperty -Path $MMCSSPath -Name "SystemResponsiveness" -Value 0 -Type DWord -Force
-
-        # 2. Write Binary Registry.pol for gpedit.msc UI
-        $polDir = "$env:windir\System32\GroupPolicy\Machine"
-        if (!(Test-Path $polDir)) { New-Item -ItemType Directory -Path $polDir -Force | Out-Null }
-        $polFile = Join-Path $polDir "Registry.pol"
-
-        $header = [byte[]](0x50,0x52,0x65,0x67, 0x01,0x00,0x00,0x00)
-        $stream = [System.IO.MemoryStream]::new()
-        $stream.Write($header, 0, $header.Length)
-        $writer = [System.IO.BinaryWriter]::new($stream, [System.Text.Encoding]::Unicode)
-
-        function local:Add-PolDWord($w, [string]$key, [string]$val, [int]$data) {
-            $w.Write([char]'[')
-            $w.Write($key.ToCharArray()); $w.Write([char]0)
-            $w.Write([char]';')
-            $w.Write($val.ToCharArray()); $w.Write([char]0)
-            $w.Write([char]';')
-            $w.Write([int]4)
-            $w.Write([char]';')
-            $w.Write([int]4)
-            $w.Write([char]';')
-            $bytes = [System.BitConverter]::GetBytes([int]$data)
-            $w.Write($bytes, 0, 4)
-            $w.Write([char]']')
-        }
-
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Psched" "NonBestEffortLimit" 0
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Psched" "TimerResolution" 1
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Psched" "MaxOutstandingSends" 0
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows NT\DNSClient" "EnableMulticast" 0
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows NT\DNSClient" "DisableSmartNameResolution" 1
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\DeliveryOptimization" "DODownloadMode" 0
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\BITS" "EnableBITSMaxBandwidth" 1
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\BITS" "MaxTransferRateOnSchedule" 1
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\BITS" "MaxTransferRateOffSchedule" 1
-
-        [System.IO.File]::WriteAllBytes($polFile, $stream.ToArray())
-        $writer.Close()
-        $stream.Close()
-
-        Start-Process -FilePath "$env:windir\System32\gpupdate.exe" -ArgumentList "/force" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
-        Write-Host " [OK] Group Policy (gpedit.msc) Network Settings Applied!" -ForegroundColor Green
+        Write-Host " [OK] Group Policy (gpedit.msc) Network & QoS Settings Applied!" -ForegroundColor Green
     } catch {
         Write-Warning "Cannot set gpedit settings: $_"
     }
