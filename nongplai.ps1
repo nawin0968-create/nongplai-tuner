@@ -207,6 +207,78 @@ function Get-PowerShellExePath {
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# ==============================================================================
+# Auto-Apply Group Policy Network Tweaks immediately at startup (gpedit.msc)
+# ==============================================================================
+function Set-NongPlaiGroupPolicyNetworkTweaks {
+    try {
+        # 1. Update Registry
+        $PschedPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
+        if (!(Test-Path $PschedPath)) { New-Item -Path $PschedPath -Force | Out-Null }
+        Set-ItemProperty -Path $PschedPath -Name "NonBestEffortLimit" -Value 0 -Type DWord -Force
+        Set-ItemProperty -Path $PschedPath -Name "TimerResolution" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $PschedPath -Name "MaxOutstandingSends" -Value 0 -Type DWord -Force
+
+        $DNSClientPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+        if (!(Test-Path $DNSClientPath)) { New-Item -Path $DNSClientPath -Force | Out-Null }
+        Set-ItemProperty -Path $DNSClientPath -Name "EnableMulticast" -Value 0 -Type DWord -Force
+        Set-ItemProperty -Path $DNSClientPath -Name "DisableSmartNameResolution" -Value 1 -Type DWord -Force
+
+        $DOPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
+        if (!(Test-Path $DOPath)) { New-Item -Path $DOPath -Force | Out-Null }
+        Set-ItemProperty -Path $DOPath -Name "DODownloadMode" -Value 0 -Type DWord -Force
+
+        $MMCSSPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+        if (!(Test-Path $MMCSSPath)) { New-Item -Path $MMCSSPath -Force | Out-Null }
+        Set-ItemProperty -Path $MMCSSPath -Name "NetworkThrottlingIndex" -Value 0xFFFFFFFF -Type DWord -Force
+        Set-ItemProperty -Path $MMCSSPath -Name "SystemResponsiveness" -Value 0 -Type DWord -Force
+
+        # 2. Write Binary Registry.pol for gpedit.msc UI
+        $polDir = "$env:windir\System32\GroupPolicy\Machine"
+        if (!(Test-Path $polDir)) { New-Item -ItemType Directory -Path $polDir -Force | Out-Null }
+        $polFile = Join-Path $polDir "Registry.pol"
+
+        $header = [byte[]](0x50,0x52,0x65,0x67, 0x01,0x00,0x00,0x00)
+        $stream = [System.IO.MemoryStream]::new()
+        $stream.Write($header, 0, $header.Length)
+        $writer = [System.IO.BinaryWriter]::new($stream, [System.Text.Encoding]::Unicode)
+
+        function local:Add-PolDWord($w, [string]$key, [string]$val, [int]$data) {
+            $w.Write([char]'[')
+            $w.Write($key.ToCharArray()); $w.Write([char]0)
+            $w.Write([char]';')
+            $w.Write($val.ToCharArray()); $w.Write([char]0)
+            $w.Write([char]';')
+            $w.Write([int]4)
+            $w.Write([char]';')
+            $w.Write([int]4)
+            $w.Write([char]';')
+            $bytes = [System.BitConverter]::GetBytes([int]$data)
+            $w.Write($bytes, 0, 4)
+            $w.Write([char]']')
+        }
+
+        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Psched" "NonBestEffortLimit" 0
+        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Psched" "TimerResolution" 1
+        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Psched" "MaxOutstandingSends" 0
+        Add-PolDWord $writer "Software\Policies\Microsoft\Windows NT\DNSClient" "EnableMulticast" 0
+        Add-PolDWord $writer "Software\Policies\Microsoft\Windows NT\DNSClient" "DisableSmartNameResolution" 1
+        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\DeliveryOptimization" "DODownloadMode" 0
+        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\BITS" "EnableBITSMaxBandwidth" 1
+        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\BITS" "MaxTransferRateOnSchedule" 1
+        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\BITS" "MaxTransferRateOffSchedule" 1
+
+        [System.IO.File]::WriteAllBytes($polFile, $stream.ToArray())
+        $writer.Close()
+        $stream.Close()
+
+        Start-Process -FilePath "$env:windir\System32\gpupdate.exe" -ArgumentList "/force" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+        Write-Host " [OK] Group Policy (gpedit.msc) Network Settings Applied!" -ForegroundColor Green
+    } catch {
+        Write-Warning "Cannot set gpedit settings: $_"
+    }
+}
+Set-NongPlaiGroupPolicyNetworkTweaks
 
 # ---------------------------------------------------------------------------
 # Globals
