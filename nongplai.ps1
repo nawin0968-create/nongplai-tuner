@@ -1,4 +1,4 @@
-﻿# ---------------------------------------------------------------------------
+﻿﻿# ---------------------------------------------------------------------------
 # Thai / UTF-8 encoding — must be the very first executable lines.
 #
 # WHY ALL FOUR LINES ARE NEEDED (PowerShell 5.1 on Windows):
@@ -334,7 +334,9 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         Start-Process -FilePath "$env:windir\System32\gpupdate.exe" -ArgumentList "/force" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
         Write-Host " [OK] Group Policy (gpedit.msc) QoS and Network Settings Applied!" -ForegroundColor Green
     } catch {
-        Write-Warning "Cannot set gpedit settings: # ---------------------------------------------------------------------------
+        Write-Warning "Cannot set gpedit settings: (see log)"
+    }
+}
 # Thai / UTF-8 encoding — must be the very first executable lines.
 #
 # WHY ALL FOUR LINES ARE NEEDED (PowerShell 5.1 on Windows):
@@ -6707,9 +6709,6 @@ Set-ItemProperty -Path $NCSIPath -Name "GlobalDNS" -Value "1.1.1.1" -Type String
 
 # Refresh Group Policy ทันทีเพื่อให้ค่าที่ตั้งทำงาน
 gpupdate /force | Out-Null
-"
-    }
-}
 Set-NongPlaiGroupPolicyNetworkTweaks
 
 # ---------------------------------------------------------------------------
