@@ -1,4 +1,4 @@
-﻿﻿# ---------------------------------------------------------------------------
+﻿# ---------------------------------------------------------------------------
 # Thai / UTF-8 encoding — must be the very first executable lines.
 #
 # WHY ALL FOUR LINES ARE NEEDED (PowerShell 5.1 on Windows):
