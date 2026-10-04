@@ -1,4 +1,4 @@
-# ---------------------------------------------------------------------------
+﻿# ---------------------------------------------------------------------------
 # Thai / UTF-8 encoding — must be the very first executable lines.
 #
 # WHY ALL FOUR LINES ARE NEEDED (PowerShell 5.1 on Windows):
@@ -214,83 +214,40 @@ $ProgressPreference = 'SilentlyContinue'
 # ==============================================================================
 # Auto-Apply Group Policy Network Tweaks immediately at startup (gpedit.msc)
 # ==============================================================================
-# ==============================================================================
-# Scan this PC for FiveM's game-process exe: FiveM_b<build>_GTAProcess.exe
-# The build number in the name changes with the game build FiveM/the server uses
-# (b2060, b2189, b2802, b3258, ...), so it can't be hard-coded. Returns a hashtable
-# of  exe name -> full path  for everything it finds.
-# ==============================================================================
-function Find-NongPlaiFiveMGameProcess {
-    $found = @{}
-    $appDirs = New-Object System.Collections.Generic.List[string]
-
-    # 1) FiveM running right now: exact process name + path, no guessing.
-    try {
-        foreach ($proc in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like '*GTAProcess' })) {
-            $pth = $null
-            try { $pth = $proc.Path } catch {}
-            $found["$($proc.ProcessName).exe"] = if ($pth) { $pth } else { '(running process)' }
-        }
-        foreach ($proc in @(Get-Process -Name 'FiveM' -ErrorAction SilentlyContinue)) {
-            try { if ($proc.Path) { $appDirs.Add((Join-Path (Split-Path -Parent $proc.Path) 'FiveM.app')) } } catch {}
-        }
-    } catch {}
-
-    # 2) Default install: every user profile's AppData\Local\FiveM\FiveM.app
-    try {
-        Get-ChildItem -Path (Join-Path $env:SystemDrive 'Users') -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
-            $appDirs.Add((Join-Path $_.FullName 'AppData\Local\FiveM\FiveM.app'))
-        }
-    } catch {}
-
-    # 3) Custom install location: look for a folder named FiveM.app on every fixed drive
-    #    (a few levels deep, skipping Windows/system folders so it stays quick).
-    $skipTop = @('Windows', 'Users', '$Recycle.Bin', 'System Volume Information', 'ProgramData', 'Recovery', 'PerfLogs', 'MSOCache', '$WinREAgent')
-    try {
-        $drives = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | ForEach-Object { $_.DeviceID + '\' })
-        foreach ($drv in $drives) {
-            foreach ($top in @(Get-ChildItem -Path $drv -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $skipTop -notcontains $_.Name })) {
-                if ($top.Name -eq 'FiveM.app') { $appDirs.Add($top.FullName) }
-                Get-ChildItem -Path $top.FullName -Directory -Recurse -Depth 3 -Force -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -eq 'FiveM.app' } | ForEach-Object { $appDirs.Add($_.FullName) }
-            }
-        }
-    } catch {}
-
-    # 4) Look inside every FiveM.app folder found. Known spots first (fast), then the whole
-    #    folder. Recurse unfiltered and match the name afterwards: -Filter combined with
-    #    -Depth is known to silently miss matches on some PowerShell versions.
-    foreach ($dir in @($appDirs | Select-Object -Unique)) {
-        if (-not (Test-Path -LiteralPath $dir)) { continue }
-        $hits = @()
-        foreach ($sub in @('data\cache\subprocess', 'data\cache', '')) {
-            $look = if ($sub) { Join-Path $dir $sub } else { $dir }
-            if (Test-Path -LiteralPath $look) {
-                $hits += @(Get-ChildItem -LiteralPath $look -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*GTAProcess.exe' })
-            }
-        }
-        if ($hits.Count -eq 0) {
-            $hits = @(Get-ChildItem -LiteralPath $dir -File -Recurse -Depth 8 -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*GTAProcess.exe' })
-        }
-        foreach ($h in $hits) { if (-not $found.ContainsKey($h.Name)) { $found[$h.Name] = $h.FullName } }
-    }
-    return $found
-}
-
 function Set-NongPlaiGroupPolicyNetworkTweaks {
     try {
         # 1. NetQosPolicy (PowerShell / WMI Level)
         # FiveM renames its game process per build (FiveM_b3258_GTAProcess.exe, ...),
         # so detect the builds that are really installed instead of hard-coding one.
         $qosApps = New-Object System.Collections.Generic.List[object]
-        $gtaFound = Find-NongPlaiFiveMGameProcess
-        $gtaProcNames = @($gtaFound.Keys | Sort-Object)
-        if ($gtaProcNames.Count -gt 0) {
-            Write-Host "  FiveM game process found on this PC:" -ForegroundColor Green
-            foreach ($gn in $gtaProcNames) { Write-Host "    $gn   <-  $($gtaFound[$gn])" -ForegroundColor Green }
+        $qosApps.Add(@{ Key = "FiveM_Extreme"; App = "FiveM.exe" })
+        $gtaProcNames = @()
+        # Most reliable source: the actual running process, if FiveM is open right now.
+        # The subprocess cache folder below only has this exe in it while FiveM is
+        # actually running - it gets cleared when FiveM is closed - so checking the
+        # live process first catches builds the disk search alone would miss.
+        try {
+            $gtaProcNames = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like 'FiveM_*GTAProcess' } |
+                ForEach-Object { try { Split-Path -Leaf $_.Path } catch { "$($_.ProcessName).exe" } } | Select-Object -Unique)
+        } catch {}
+        if ($gtaProcNames.Count -eq 0) {
+            try {
+                # Fallback: search the disk. The exe lives several folders deep, e.g.
+                # ...\FiveM.app\data\cache\subprocess\FiveM_b3258_GTAProcess.exe
+                # -Filter combined with -Depth is known to silently miss matches on some
+                # PowerShell versions, so recurse unfiltered and match the name afterward
+                # with Where-Object instead - slower per-file but actually reliable.
+                $gtaProcNames = @(Get-ChildItem -Path "$env:SystemDrive\Users\*\AppData\Local\FiveM\FiveM.app" -File -Recurse -Depth 8 -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like 'FiveM_*GTAProcess.exe' } |
+                    Select-Object -ExpandProperty Name -Unique)
+            } catch {}
+            if ($gtaProcNames.Count -gt 0) {
+                Write-Host "GTAProcess.exe found on disk: $($gtaProcNames -join ', ')" -ForegroundColor Green
+            } else {
+                Write-Host "GTAProcess.exe not found (FiveM not running and no cached copy on disk yet) - its QoS policy will be added next time this runs while FiveM is open, or once it's been run at least once." -ForegroundColor Yellow
+            }
         } else {
-            Write-Host "  No FiveM_b*_GTAProcess.exe found on disk yet (FiveM not installed or never launched) - using FiveM_b3258_GTAProcess.exe as a placeholder. Re-run this after opening FiveM once." -ForegroundColor Yellow
-            $gtaProcNames = @("FiveM_b3258_GTAProcess.exe")
+            Write-Host "GTAProcess.exe found from the running process: $($gtaProcNames -join ', ')" -ForegroundColor Green
         }
         foreach ($gn in $gtaProcNames) {
             $gk = if ($gn -eq "FiveM_b3258_GTAProcess.exe") { "FiveM_Extreme_GTAProcess" } else { "FiveM_Extreme_" + [System.IO.Path]::GetFileNameWithoutExtension($gn) }
@@ -341,41 +298,6 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         if (!(Test-Path $tcpQosPath)) { New-Item -Path $tcpQosPath -Force | Out-Null }
         Set-ItemProperty -Path $tcpQosPath -Name "Do not use NLA" -Value "1" -Type String -Force
 
-        # --- TCP/IP: Nagle off, ACK tuning, low-latency flags ---
-        # Applied per network adapter so it works on all interfaces (Wi-Fi + LAN).
-        $tcpParamsPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
-        Set-ItemProperty -Path $tcpParamsPath -Name "DefaultTTL"        -Value 64   -Type DWord -Force
-        Set-ItemProperty -Path $tcpParamsPath -Name "EnablePMTUDiscovery" -Value 1  -Type DWord -Force
-        Set-ItemProperty -Path $tcpParamsPath -Name "Tcp1323Opts"        -Value 3   -Type DWord -Force
-        Set-ItemProperty -Path $tcpParamsPath -Name "TcpMaxDupAcks"      -Value 2   -Type DWord -Force
-
-        $ifacesRoot = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
-        try {
-            Get-ChildItem -Path $ifacesRoot -ErrorAction SilentlyContinue | ForEach-Object {
-                $ip = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DhcpIPAddress
-                if (-not $ip) { $ip = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).IPAddress | Select-Object -First 1 }
-                if ($ip -and $ip -ne '0.0.0.0') {
-                    Set-ItemProperty -Path $_.PSPath -Name "TcpAckFrequency" -Value 1  -Type DWord -Force  # ACK every packet
-                    Set-ItemProperty -Path $_.PSPath -Name "TCPNoDelay"      -Value 1  -Type DWord -Force  # Nagle off
-                    Set-ItemProperty -Path $_.PSPath -Name "TcpDelAckTicks"  -Value 0  -Type DWord -Force  # No delayed ACK
-                }
-            }
-        } catch {}
-
-        # --- Teredo / IPv6 tunnelling off (reduces spurious DNS lookups & tunnel overhead) ---
-        try { & netsh.exe interface teredo set state disabled 2>$null | Out-Null } catch {}
-        try { & netsh.exe interface 6to4 set state disabled 2>$null | Out-Null } catch {}
-        try { & netsh.exe interface isatap set state disabled 2>$null | Out-Null } catch {}
-        $ipv6Comps = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"
-        if (!(Test-Path $ipv6Comps)) { New-Item -Path $ipv6Comps -Force | Out-Null }
-        Set-ItemProperty -Path $ipv6Comps -Name "DisabledComponents" -Value 0xFF -Type DWord -Force
-
-        # --- MMCSS: Network Throttling completely off ---
-        $mmcssPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
-        if (!(Test-Path $mmcssPath)) { New-Item -Path $mmcssPath -Force | Out-Null }
-        Set-ItemProperty -Path $mmcssPath -Name "NetworkThrottlingIndex" -Value 0xFFFFFFFF -Type DWord -Force
-        Set-ItemProperty -Path $mmcssPath -Name "SystemResponsiveness"   -Value 0          -Type DWord -Force
-
         # Policy-based QoS Registry (HKLM)
         $qosBase = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\QoS"
         if (!(Test-Path $qosBase)) { New-Item -Path $qosBase -Force | Out-Null }
@@ -384,11 +306,6 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         if (Test-Path $discordQosPath) { Remove-Item -Path $discordQosPath -Recurse -Force -ErrorAction SilentlyContinue }
         try { Get-NetQosPolicy -Name 'NongPlai_Discord_Voice' -ErrorAction SilentlyContinue | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue } catch {}
 
-        # Remove FiveM QoS keys left behind by older builds so gpedit only lists what exists now.
-        try {
-            Get-ChildItem -Path $qosBase -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like 'FiveM_Extreme*' } |
-                ForEach-Object { Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue }
-        } catch {}
         $qosItems = @($qosApps | ForEach-Object { @{ Key = $_.Key; App = $_.App; DSCP = "46" } })
         foreach ($p in $qosItems) {
             $path = Join-Path $qosBase $p.Key
@@ -465,16 +382,6 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         Add-PolDWord $writer "Software\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator" "UseGlobalDNS" 1
         Add-PolString $writer "Software\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator" "GlobalDNS" "1.1.1.1"
 
-        # TCP/IP global params in pol
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Tcpip\Parameters" "DefaultTTL" 64
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Tcpip\Parameters" "Tcp1323Opts" 3
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Tcpip\Parameters" "TcpMaxDupAcks" 2
-        # MMCSS
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 0xFFFFFFFF
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "SystemResponsiveness" 0
-        # IPv6 / Teredo
-        Add-PolDWord $writer "Software\Policies\Microsoft\Windows\Tcpip6\Parameters" "DisabledComponents" 255
-
         # Add QoS Policies into Registry.pol for gpedit.msc UI display
         foreach ($p in $qosItems) {
             $baseK = "Software\Policies\Microsoft\Windows\QoS\" + $p.Key
@@ -494,20 +401,6 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         [System.IO.File]::WriteAllBytes($polFile, $stream.ToArray())
         $writer.Close()
         $stream.Close()
-
-        # Read Registry.pol back and confirm every QoS policy really is in the file.
-        try {
-            $polBytes = [System.IO.File]::ReadAllBytes($polFile)
-            $polText = [System.Text.Encoding]::Unicode.GetString($polBytes, 8, $polBytes.Length - 8)
-            $notInPol = @($qosItems | Where-Object { -not $polText.Contains("QoS\$($_.Key)") })
-            if ($notInPol.Count -eq 0) {
-                Write-Host "  Registry.pol verified - gpedit.msc > Computer Configuration > Windows Settings > Policy-based QoS now holds:" -ForegroundColor Cyan
-                foreach ($p in $qosItems) { Write-Host ("    - {0}  ->  {1}  (DSCP {2})" -f $p.Key, $p.App, $p.DSCP) -ForegroundColor Cyan }
-                Write-Host "  Close and re-open gpedit.msc to see them (an already-open window does not refresh)." -ForegroundColor Cyan
-            } else {
-                Write-Host ("  WARNING: these QoS policies are missing from Registry.pol: " + (($notInPol | ForEach-Object { $_.Key }) -join ', ')) -ForegroundColor Yellow
-            }
-        } catch {}
 
         Start-Process -FilePath "$env:windir\System32\gpupdate.exe" -ArgumentList "/force" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
         Write-Host " [OK] Group Policy (gpedit.msc) Network & QoS Settings Applied!" -ForegroundColor Green
@@ -1459,7 +1352,11 @@ function Invoke-NetworkAggressiveTuning {
     # a common, easy-to-miss source of random latency spikes/brief disconnects,
     # especially on laptops - same PnPCapabilities technique already used for GPU/HID.
     try {
-        $activeNics = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+        # Wired Ethernet only - some WiFi chipset drivers (common on Realtek/Broadcom)
+        # don't handle this registry-level power-management override well and can drop
+        # the adapter entirely, so wireless is deliberately left untouched here.
+        $activeNics = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'Up' -and $_.PhysicalMediaType -ne 'Native 802.11' -and $_.PhysicalMediaType -notmatch '802\.11' })
         foreach ($nic in $activeNics) {
             try {
                 $devPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($nic.PnPDeviceID)\Device Parameters"
@@ -1921,9 +1818,12 @@ function Invoke-ApplyUltra {
         # under load" fix on many boards. Helps every online game equally (PUBG/Valorant/FiveM),
         # since it works below the game - at the network driver level.
         try {
-            $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+            # Wired only - many WiFi drivers (Realtek/Broadcom especially) don't handle
+            # MSI mode reliably and can drop the adapter entirely when it's forced on.
+            $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+                Where-Object { $_.Status -eq 'Up' -and $_.PhysicalMediaType -ne 'Native 802.11' -and $_.PhysicalMediaType -notmatch '802\.11' }
             if (-not $adapters -or $adapters.Count -eq 0) {
-                Write-Host "NIC MSI Mode: no active physical network adapter found, skipped"
+                Write-Host "NIC MSI Mode: no active wired network adapter found, skipped (Wi-Fi is intentionally left untouched here)"
             } else {
                 foreach ($nic in $adapters) {
                     try {
@@ -2458,21 +2358,10 @@ public static class NongPlaiTimer {
                         # Also clean up old Scheduled Task / watcher if they still exist from a previous version
                         try { Unregister-ScheduledTask -TaskName 'NongPlaiShop_TimerResolutionLock' -Confirm:$false -ErrorAction SilentlyContinue } catch {}
                         Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-                            Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and ($_.CommandLine -like "*TimerResolutionHold.ps1*" -or $_.CommandLine -like "*NongPlaiShop*TimerHold*") } |
+                            Where-Object { $_.CommandLine -and $_.CommandLine -like "*TimerResolutionHold.ps1*" } |
                             ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
                         $oldHelper = Join-Path $env:ProgramData 'NongPlaiShop\TimerResolutionHold.ps1'
                         if (Test-Path $oldHelper) { Remove-Item -Path $oldHelper -Force -ErrorAction SilentlyContinue }
-                    } catch {}
-                }
-                'TimerResolutionRegistry' {
-                    try {
-                        Remove-ItemProperty -Path $c.TimerPath -Name 'IdealResolution' -Force -ErrorAction SilentlyContinue
-                        Remove-ItemProperty -Path $c.TimerPath -Name 'MinimumResolution' -Force -ErrorAction SilentlyContinue
-                        Remove-ItemProperty -Path $c.TimerPath -Name 'MaximumResolution' -Force -ErrorAction SilentlyContinue
-                        if ((Get-Item -Path $c.TimerPath -ErrorAction SilentlyContinue).ValueCount -eq 0) {
-                            Remove-Item -Path $c.TimerPath -Force -ErrorAction SilentlyContinue
-                        }
-                        Remove-ItemProperty -Path $c.KernelPath -Name 'GlobalTimerResolutionRequests' -Force -ErrorAction SilentlyContinue
                     } catch {}
                 }
                 'TimerResolutionTask' {
@@ -2480,10 +2369,9 @@ public static class NongPlaiTimer {
                         # Stop the watcher process, remove its scheduled task, and delete the
                         # helper script - timer resolution falls back to Windows' normal default
                         # as soon as the watcher process ends, nothing else needs undoing.
-                        if ($c.TaskName) { try { Unregister-ScheduledTask -TaskName $c.TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {} }
-                        try { Unregister-ScheduledTask -TaskName 'NongPlaiShop_TimerResolutionLock' -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                        if ($c.TaskName) { Unregister-ScheduledTask -TaskName $c.TaskName -Confirm:$false -ErrorAction SilentlyContinue }
                         Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-                            Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and ($_.CommandLine -like "*NtSetTimerResolution*5000*" -or $_.CommandLine -like "*TimerResolutionHold.ps1*") } |
+                            Where-Object { $_.CommandLine -and $_.CommandLine -like "*TimerResolutionHold.ps1*" } |
                             ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
                         if ($c.HelperPath -and (Test-Path $c.HelperPath)) { Remove-Item -Path $c.HelperPath -Force -ErrorAction SilentlyContinue }
                     } catch {}
@@ -2791,46 +2679,71 @@ function Invoke-RemoveDefenderPolicy {
 # v2.1 — MMCSS (Multimedia Class Scheduler) REGISTRATION FOR FiveM
 # ===========================================================================
 function Invoke-TimerResolutionLock {
-    # Sets two registry values that make Windows boot at 0.5ms - no process, no task, no files.
-    # GlobalTimerResolutionRequests: lets any process actually receive the resolution it requests (all Windows versions).
-    # kernel\TimerResolution\5000: tells Windows to boot at 0.5ms (Windows 11 22H2+ / Windows 10 KB5006738+).
-    # Requires one reboot to take effect. After that, 0.5ms is active from boot, always.
+    # v5.0: Windows timer resolution is a live kernel API state (NtSetTimerResolution),
+    # NOT a registry value - verified with Windows' own "Set Timer Resolution" tool:
+    # a registry-only approach leaves the system at its default ~1ms, not 0.5ms, because
+    # nothing is actually holding the request open. The only real way to keep 0.5ms
+    # continuously is a lightweight process that calls NtSetTimerResolution once and
+    # then just stays alive (no need to re-call on a loop - the OS holds the resolution
+    # for as long as the requesting process exists).
     try {
+        $rootDir = Join-Path $env:ProgramData 'NongPlaiShop'
+        if (-not (Test-Path $rootDir)) { New-Item -ItemType Directory -Path $rootDir -Force | Out-Null }
+        $helperPath = Join-Path $rootDir 'TimerResolutionHold.ps1'
+        $taskName = 'NongPlaiShop_TimerResolutionLock'
+
         if ($script:DryRun) {
-            Write-Host "  [DRYRUN] would set GlobalTimerResolutionRequests=1 and kernel TimerResolution=5000 (0.5ms at boot, no process/task/files needed)" -ForegroundColor DarkCyan
+            Write-Host "  [DRYRUN] would create $helperPath and register scheduled task $taskName (0.5ms timer resolution held by a small watcher process, starts at every logon, survives reboot)" -ForegroundColor DarkCyan
             return $true
         }
 
-        $kernelPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'
-
-        # 1) GlobalTimerResolutionRequests - already set elsewhere but set here too for safety
-        Set-ItemProperty -Path $kernelPath -Name 'GlobalTimerResolutionRequests' -Value 1 -Type DWord -Force
-
-        # 2) Boot-time timer resolution = 5000 x 100ns = 0.5ms
-        #    Windows 11 22H2+ reads this subkey at boot and applies it system-wide before any process starts.
-        #    On older Windows it is silently ignored (no harm done).
-        $timerPath = Join-Path $kernelPath 'TimerResolution'
-        if (-not (Test-Path $timerPath)) { New-Item -Path $timerPath -Force | Out-Null }
-        Set-ItemProperty -Path $timerPath -Name 'IdealResolution'  -Value 5000 -Type DWord -Force
-        Set-ItemProperty -Path $timerPath -Name 'MinimumResolution' -Value 5000 -Type DWord -Force
-        Set-ItemProperty -Path $timerPath -Name 'MaximumResolution' -Value 5000 -Type DWord -Force
-
-        # 3) Apply right now too (no reboot needed for this session)
-        Add-Type -TypeDefinition @'
-using System; using System.Runtime.InteropServices;
+        # Written to disk (not in-memory) on purpose: the scheduled task needs a stable
+        # file to point at so it can relaunch the watcher after every reboot.
+        $helperSource = @'
+# NongPlaiShop - holds Windows timer resolution at 0.5ms for as long as this process
+# is alive. Started by the "NongPlaiShop_TimerResolutionLock" scheduled task at logon.
+# Safe to end this process any time (Task Manager, or Reset in NongPlaiShop) - timer
+# resolution just falls back to Windows' normal default, nothing else is affected.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
 public static class NongPlaiTimer {
-    [DllImport("ntdll.dll")] public static extern int NtSetTimerResolution(uint r, bool s, ref uint c);
+    [DllImport("ntdll.dll", SetLastError = true)]
+    public static extern int NtSetTimerResolution(uint DesiredResolution, bool SetResolution, ref uint CurrentResolution);
 }
-'@ -ErrorAction SilentlyContinue
-        $cur = [uint32]0
-        try { [NongPlaiTimer]::NtSetTimerResolution(5000, $true, [ref]$cur) | Out-Null } catch {}
+"@
+$current = [uint32]0
+# One call is enough - NtSetTimerResolution holds 0.5ms (5000 x 100ns) for as long as
+# this process stays alive, so there's no need to loop/re-call it.
+[NongPlaiTimer]::NtSetTimerResolution(5000, $true, [ref]$current) | Out-Null
+while ($true) { Start-Sleep -Seconds 3600 }
+'@
+        Set-Content -Path $helperPath -Value $helperSource -Encoding UTF8 -Force
 
-        $script:Changes.Add([PSCustomObject]@{
-            Kind       = 'TimerResolutionRegistry'
-            KernelPath = $kernelPath
-            TimerPath  = $timerPath
-        })
-        Write-Ok "Timer resolution set to 0.5ms now (this session) and at every boot via registry - no scheduled task, no background process, no files. Reboot once to confirm."
+        # Kill any previous holder before registering (idempotent - safe to re-apply).
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like "*TimerResolutionHold.ps1*" } |
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+
+        try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$helperPath`""
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force | Out-Null
+
+        # Start the watcher right now too so 0.5ms is already active this session,
+        # without waiting for the next logon.
+        Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $helperPath) `
+            -WindowStyle Hidden | Out-Null
+
+        $script:Changes.Add([PSCustomObject]@{ Kind='TimerResolutionTask'; TaskName=$taskName; HelperPath=$helperPath })
+        Write-Ok "Timer resolution locked at 0.5ms via a small watcher ('$taskName') - starts automatically at every logon, survives reboot. Visible in Task Manager as a background powershell.exe process; Reset removes it cleanly."
         return $true
     } catch {
         Write-Warn2 "Timer resolution lock skipped: $($_.Exception.Message)"
