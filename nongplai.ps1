@@ -408,7 +408,7 @@ function Set-NongPlaiGroupPolicyNetworkTweaks {
         Write-Warning "Cannot set gpedit settings: $_"
     }
 }
-if (-not ($NetworkHealth -or $FiveMFull)) {
+if (-not ($NetworkHealth -or $FiveMFull -or $Scan -or $Report -or $Reset -or $Help -or $DryRun -or $NetworkDiagnose)) {
     Set-NongPlaiGroupPolicyNetworkTweaks
 }
 
@@ -421,7 +421,7 @@ $script:LogFile   = $null
 $script:OK        = 0
 $script:Total     = 0
 $script:Failed    = New-Object System.Collections.Generic.List[string]
-$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v2.1"
+$Host.UI.RawUI.WindowTitle = "NongPlaiShop - Smart Adaptive Tuner v3.1"
 
 $script:DefenderPolicyValues = $null
 $script:PendingExclusions = @{ Paths = New-Object System.Collections.Generic.List[string]; Processes = New-Object System.Collections.Generic.List[string] }
@@ -3304,6 +3304,8 @@ function Get-HwGpu {
         try {
             if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) { $vramGB = [math]::Round($g.AdapterRAM / 1GB, 1) }
         } catch {}
+        # AdapterRAM is 32-bit (caps at ~4GB); prefer the real 64-bit size from the driver key.
+        try { $realVram = Get-NpVramGB -GpuName $g.Name; if ($realVram -gt $vramGB) { $vramGB = $realVram } } catch {}
         # Tier real GPUs by VRAM - drives which tweaks are worth the risk on that specific card.
         $tier = 'Unknown'
         if (-not $isVirtual) {
@@ -4323,6 +4325,7 @@ function Invoke-SmartApply {
     }
 
     $modules = @(
+        @{ Name = 'Capability tier tuning (priority/services/power)'; Action = { Invoke-CapabilityTuning -Hw $hw } },
         @{ Name = 'CPU adaptive tweaks';     Action = { Invoke-CpuAdaptive -Cpu $hw.Cpu -IsLaptop $hw.IsLaptop } },
         @{ Name = 'GPU adaptive tweaks';     Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
         @{ Name = 'RAM adaptive tweaks';     Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
@@ -4711,6 +4714,299 @@ function Select-ApplyPlan {
     return $true
 }
 
+# ===========================================================================
+# v3.1 - CAPABILITY TIERS (scan -> score -> pick a level PER COMPONENT)
+# ---------------------------------------------------------------------------
+# Goal: never apply the same "High" to every PC. Each component is scored from
+# what the scan actually found, and each tweak only goes as high as that
+# component can sustain without starving something else (the usual cause of
+# bad 1% / 0.1% lows). Every write goes through Set-Reg / Set-SvcStart, so
+# Reset undoes it exactly like the rest of the script.
+#
+# Deliberate design choice: REALTIME priority is never applied automatically.
+# Realtime lets the game preempt kernel threads (mouse/keyboard/audio/disk/
+# network drivers). On any PC that makes frametimes WORSE, not better, and can
+# freeze the whole system. The highest automatic level is High (+ I/O High,
+# MMCSS High, GPU priority 8) - which is what actually helps 1% / 0.1% lows.
+# ===========================================================================
+$script:NpDecisions = New-Object System.Collections.Generic.List[object]
+
+function Add-NpDecision {
+    param([string]$Status, [string]$Item, [string]$Detail = '')
+    $script:NpDecisions.Add([PSCustomObject]@{ Status = $Status; Item = $Item; Detail = $Detail })
+}
+
+# Win32_VideoController.AdapterRAM is a 32-bit field, so any card with more
+# than 4 GB VRAM is reported as ~4 GB. The real 64-bit size lives in the
+# display-class driver key.
+function Get-NpVramGB {
+    param([string]$GpuName)
+    $best = 0.0
+    try {
+        $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+        foreach ($k in @(Get-ChildItem -Path $classKey -ErrorAction SilentlyContinue)) {
+            if ($k.PSChildName -notmatch '^\d{4}$') { continue }
+            $p = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+            if (-not $p) { continue }
+            if ($GpuName -and ([string]$p.DriverDesc -ne $GpuName)) { continue }
+            $q = $p.'HardwareInformation.qwMemorySize'
+            if ($null -eq $q) { continue }
+            $bytes = 0.0
+            if ($q -is [byte[]] -and $q.Length -ge 8) { $bytes = [double][BitConverter]::ToUInt64($q, 0) }
+            else { $bytes = [double]$q }
+            $gb = [math]::Round($bytes / 1GB, 1)
+            if ($gb -gt $best) { $best = $gb }
+        }
+    } catch {}
+    return $best
+}
+
+function Get-NpSystemDiskKind {
+    $kind = 'Unknown'; $freePct = 100
+    try {
+        $letter = ([string]$env:SystemDrive).TrimEnd(':')
+        $dn = (Get-Partition -DriveLetter $letter -ErrorAction Stop).DiskNumber
+        $d = Get-PhysicalDisk -ErrorAction Stop | Where-Object { [int]$_.DeviceId -eq [int]$dn } | Select-Object -First 1
+        if ($d) {
+            if ($d.BusType -eq 'NVMe') { $kind = 'NVMe' }
+            elseif ($d.MediaType -eq 'SSD') { $kind = 'SATA SSD' }
+            elseif ($d.MediaType -eq 'HDD') { $kind = 'HDD' }
+        }
+        $vol = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
+        if ($vol -and $vol.Size -gt 0) { $freePct = [math]::Round(($vol.SizeRemaining / $vol.Size) * 100, 0) }
+    } catch {}
+    [PSCustomObject]@{ Kind = $kind; FreePercent = $freePct }
+}
+
+function Get-NpCapabilityProfile {
+    param([Parameter(Mandatory)]$Hw)
+    $threads = [int]$Hw.Cpu.Threads
+    $laptop  = [bool]$Hw.IsLaptop
+    $ramGB   = [double]$Hw.Ram.TotalGB
+
+    $cpuClass = 'Weak'
+    if ($threads -ge 12) { $cpuClass = 'Strong' } elseif ($threads -ge 6) { $cpuClass = 'Mid' }
+
+    $ramClass = 'Low'
+    if ($ramGB -ge 32) { $ramClass = 'Max' } elseif ($ramGB -ge 16) { $ramClass = 'High' } elseif ($ramGB -ge 8) { $ramClass = 'Mid' }
+
+    # GPU: use the best REAL adapter, with the corrected 64-bit VRAM size.
+    $gpuClass = 'None'; $gpuName = ''; $vram = 0.0
+    foreach ($g in @($Hw.Gpu | Where-Object { -not $_.IsVirtual })) {
+        $v = Get-NpVramGB -GpuName $g.Name
+        if ($g.VramGB -gt $v) { $v = [double]$g.VramGB }
+        $integrated = ($g.Brand -eq 'Intel' -and $g.Name -notmatch 'Arc') -or
+                      ($g.Name -match '(?i)^AMD Radeon(\(TM\))? Graphics$|Vega \d+ Graphics|Radeon\(TM\) \d+M Graphics')
+        $cls = 'Entry'
+        if ($integrated) { $cls = 'Integrated' }
+        elseif ($v -ge 8) { $cls = 'High' }
+        elseif ($v -ge 4) { $cls = 'Mid' }
+        $rank = @{ None = 0; Integrated = 1; Entry = 2; Mid = 3; High = 4 }
+        if ($rank[$cls] -gt $rank[$gpuClass]) { $gpuClass = $cls; $gpuName = $g.Name; $vram = $v }
+    }
+
+    $sys = Get-NpSystemDiskKind
+    $storClass = 'Slow'
+    if ($sys.Kind -eq 'NVMe') { $storClass = 'Fast' } elseif ($sys.Kind -eq 'SATA SSD') { $storClass = 'Mid' }
+
+    $pts = 0
+    $pts += @{ Weak = 0; Mid = 1; Strong = 2 }[$cpuClass]
+    $pts += @{ Low = 0; Mid = 1; High = 2; Max = 2 }[$ramClass]
+    $pts += @{ None = 0; Integrated = 0; Entry = 0; Mid = 1; High = 2 }[$gpuClass]
+    $pts += @{ Slow = 0; Mid = 1; Fast = 2 }[$storClass]
+    $overall = 'Light'
+    if ($pts -ge 6) { $overall = 'Performance' } elseif ($pts -ge 4) { $overall = 'Balanced' }
+
+    [PSCustomObject]@{
+        CpuClass = $cpuClass; RamClass = $ramClass; GpuClass = $gpuClass; GpuName = $gpuName; VramGB = $vram
+        StorageClass = $storClass; SystemDisk = $sys.Kind; SystemFreePct = $sys.FreePercent
+        Threads = $threads; RamGB = $ramGB; IsLaptop = $laptop
+        Score = $pts; Overall = $overall
+        SingleChannel = ($Hw.Ram.ChannelConfig -eq 'Single-channel')
+        Hybrid = [bool]$Hw.Cpu.Hybrid
+    }
+}
+
+function Show-NpProfile {
+    param([Parameter(Mandatory)]$P)
+    Write-Host ""
+    Write-Host "  ============ CAPABILITY TIER (ระดับความแรงของเครื่องนี้) ============" -ForegroundColor Cyan
+    Write-Host ("  CPU     : {0}  ({1} threads)" -f $P.CpuClass, $P.Threads) -ForegroundColor White
+    Write-Host ("  RAM     : {0}  ({1} GB){2}" -f $P.RamClass, $P.RamGB, $(if ($P.SingleChannel) { '  [single-channel]' } else { '' })) -ForegroundColor White
+    Write-Host ("  GPU     : {0}  {1}  VRAM={2} GB" -f $P.GpuClass, $P.GpuName, $P.VramGB) -ForegroundColor White
+    Write-Host ("  Storage : {0}  (ไดรฟ์ระบบ = {1}, ว่าง {2}%)" -f $P.StorageClass, $P.SystemDisk, $P.SystemFreePct) -ForegroundColor White
+    Write-Host ("  รวม     : {0}  (คะแนน {1}/8){2}" -f $P.Overall, $P.Score, $(if ($P.IsLaptop) { '  [Laptop: จำกัดค่าที่ทำให้ร้อน/กินไฟ]' } else { '' })) -ForegroundColor Yellow
+    Write-Host "  =====================================================================" -ForegroundColor Cyan
+}
+
+# Only write when the value really differs; keeps backups clean and the report honest.
+function Set-NpReg {
+    param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord', [string]$Item, [string]$Why)
+    try {
+        $cur = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+        if ($cur -and ($cur.PSObject.Properties.Name -contains $Name) -and ([string]$cur.$Name -eq [string]$Value)) {
+            Add-NpDecision 'SKIP' $Item 'ค่าตรงอยู่แล้ว'
+            return
+        }
+    } catch {}
+    $res = @(Set-Reg $Path $Name $Value $Type)
+    if ($res.Count -gt 0 -and $res[-1] -eq $true) { Add-NpDecision 'SET' $Item $Why }
+    else { Add-NpDecision 'FAIL' $Item 'เขียนค่าไม่สำเร็จ' }
+}
+
+# --- Power plan: desktops only. Laptops keep their battery-aware plan. -------
+function Invoke-NpPowerPlan {
+    param($P)
+    if ($P.IsLaptop) { Add-NpDecision 'SKIP' 'Power plan' 'Laptop - ไม่บังคับ plan (กันแบตหมด/ร้อน)'; return }
+    if ($P.CpuClass -eq 'Weak' -and $P.RamClass -eq 'Low') { Add-NpDecision 'SKIP' 'Power plan' 'เครื่องเบา - ไม่ดันค่าจนความร้อนกินงบเครื่อง'; return }
+    try {
+        $active = (@(powercfg.exe /getactivescheme 2>$null) -join ' ')
+        if ($active -match '(?i)ultimate|high performance|ประสิทธิภาพสูง|Ryzen') { Add-NpDecision 'SKIP' 'Power plan' 'ใช้ plan ประสิทธิภาพสูงอยู่แล้ว'; return }
+        if ($script:DryRun) { Add-NpDecision 'SET' 'Power plan' '(dry run) จะเปลี่ยนเป็น Ultimate/High Performance'; return }
+        $newGuid = $null
+        $dup = (@(powercfg.exe /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>$null) -join ' ')
+        if ($dup -match '([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})') { $newGuid = $Matches[1] }
+        if (-not $newGuid) { $newGuid = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c' }   # High Performance fallback
+        powercfg.exe /setactive $newGuid 2>$null | Out-Null
+        Add-NpDecision 'SET' 'Power plan' 'เปลี่ยนเป็น Ultimate/High Performance (Reset จะคืน plan เดิมจาก snapshot)'
+    } catch { Add-NpDecision 'FAIL' 'Power plan' $_.Exception.Message }
+}
+
+# --- Game process priority: scaled to what the CPU/disk can afford ----------
+function Invoke-NpGameProcessPriority {
+    param($P)
+    $ifeo = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+    # CpuPriorityClass: 2=Normal 6=AboveNormal 3=High.  (4=Realtime is intentionally never used.)
+    $cpuPrio = 6; $cpuWhy = 'CPU < 8 threads -> Above Normal (High จะแย่ง thread ของ OS/เสียง/เน็ต ทำให้ 0.1% low แย่ลง)'
+    if ($P.Threads -ge 8) { $cpuPrio = 3; $cpuWhy = 'CPU >= 8 threads -> High (เหลือ thread ให้ระบบพอ)' }
+    $ioPrio = $null
+    if ($P.StorageClass -ne 'Slow' -and $P.SystemDisk -ne 'Unknown') { $ioPrio = 3 }
+
+    $exes = New-Object System.Collections.Generic.List[string]
+    $exes.Add('FiveM.exe')
+    try { $gta = Find-GtaProcessName; if ($gta) { $exes.Add($gta) } } catch {}
+    foreach ($exe in ($exes | Select-Object -Unique)) {
+        $path = "$ifeo\$exe\PerfOptions"
+        Set-NpReg $path 'CpuPriorityClass' $cpuPrio 'DWord' "CPU priority: $exe = $cpuPrio" $cpuWhy
+        if ($null -ne $ioPrio) {
+            Set-NpReg $path 'IoPriority' $ioPrio 'DWord' "I/O priority: $exe = High" 'ไดรฟ์ระบบเป็น SSD/NVMe - รับ I/O ลำดับสูงได้'
+        } else {
+            Add-NpDecision 'SKIP' "I/O priority: $exe" 'HDD/ไม่ทราบชนิดดิสก์ - I/O High ทำให้ระบบสะดุดมากกว่าช่วย'
+        }
+    }
+}
+
+# --- MMCSS "Games" task: scheduling class for the render/audio threads ------
+function Invoke-NpMmcss {
+    param($P)
+    $t = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games'
+    if ($P.GpuClass -in @('Mid', 'High', 'Entry')) {
+        Set-NpReg $t 'GPU Priority' 8 'DWord' 'MMCSS Games: GPU Priority = 8' 'มี GPU จริง'
+    } else {
+        Add-NpDecision 'SKIP' 'MMCSS GPU Priority' 'ไม่มี GPU แยก/จอเสมือน - ไม่มีประโยชน์'
+    }
+    if ($P.Overall -eq 'Light') {
+        Add-NpDecision 'SKIP' 'MMCSS Priority/Scheduling' 'เครื่องเบา - ปล่อยค่า default เพื่อไม่แย่งงานระบบ'
+    } else {
+        Set-NpReg $t 'Priority' 6 'DWord' 'MMCSS Games: Priority = 6' 'เครื่องรับได้'
+        Set-NpReg $t 'Scheduling Category' 'High' 'String' 'MMCSS Games: Scheduling = High' 'เครื่องรับได้'
+        Set-NpReg $t 'SFIO Priority' 'High' 'String' 'MMCSS Games: SFIO = High' 'เครื่องรับได้'
+    }
+}
+
+# --- Game Mode on, Game DVR/background capture off (frametime variance) -----
+function Invoke-NpGameMode {
+    param($P)
+    Set-NpReg 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled' 1 'DWord' 'Windows Game Mode = ON' 'จัดสรรทรัพยากรให้เกม'
+    Set-NpReg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0 'DWord' 'Game DVR = OFF' 'ลดการ capture เบื้องหลัง'
+    Set-NpReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 'DWord' 'Background capture = OFF' 'ลดโหลด GPU/ดิสก์เบื้องหลัง'
+}
+
+# --- Services: only the ones that are safe FOR THIS PC ----------------------
+function Test-NpHasRealPrinter {
+    try {
+        $real = @(Get-Printer -ErrorAction Stop | Where-Object { $_.Name -notmatch 'PDF|XPS|OneNote|Fax|Send To|Snagit|Virtual' })
+        return ($real.Count -gt 0)
+    } catch { return $true }   # if unsure, assume there is one and keep the spooler
+}
+function Test-NpHasBluetooth {
+    try { return (@(Get-PnpDevice -Class Bluetooth -PresentOnly -ErrorAction Stop).Count -gt 0) } catch { return $true }
+}
+
+function Invoke-NpServices {
+    param($P)
+    $fast = ($P.StorageClass -ne 'Slow')
+    $weak = ($P.CpuClass -eq 'Weak' -or $P.RamClass -eq 'Low')
+    $lap  = $P.IsLaptop
+    $hasPrinter = Test-NpHasRealPrinter
+    $hasBt      = Test-NpHasBluetooth
+
+    # Name, target, condition(bool), reason
+    $plan = @(
+        @('DiagTrack',        'Disabled', $true,                'Telemetry - กิน CPU/ดิสก์เบื้องหลัง'),
+        @('dmwappushservice', 'Disabled', $true,                'ส่งข้อมูล telemetry'),
+        @('WerSvc',           'Disabled', $true,                'Windows Error Reporting'),
+        @('MapsBroker',       'Disabled', $true,                'ดาวน์โหลดแผนที่ offline'),
+        @('RetailDemo',       'Disabled', $true,                'โหมดโชว์เครื่องร้านค้า'),
+        @('Fax',              'Disabled', $true,                'ไม่มีใครใช้แฟกซ์'),
+        @('WMPNetworkSvc',    'Disabled', $true,                'แชร์สื่อ Windows Media Player'),
+        @('RemoteRegistry',   'Disabled', $true,                'ปิดช่องแก้ registry ระยะไกล (ปลอดภัยขึ้นด้วย)'),
+        @('DoSvc',            'Manual',   $true,                'Delivery Optimization - ไม่ให้อัปโหลด/ดาวน์โหลดแย่งเน็ต'),
+        @('SysMain',          'Disabled', $fast,                'SSD/NVMe ไม่ต้อง prefetch - HDD จะคงไว้'),
+        @('WSearch',          'Manual',   $true,                'Indexing สะดุดตอนเล่นเกม - ยังค้นหาได้ (Manual)'),
+        @('Spooler',          'Disabled', (-not $hasPrinter),   'ไม่พบเครื่องพิมพ์จริง'),
+        @('bthserv',          'Disabled', ((-not $hasBt) -and (-not $lap)), 'ไม่พบอุปกรณ์ Bluetooth'),
+        @('BthAvctpSvc',      'Disabled', ((-not $hasBt) -and (-not $lap)), 'ไม่พบอุปกรณ์ Bluetooth'),
+        @('BTAGService',      'Disabled', ((-not $hasBt) -and (-not $lap)), 'ไม่พบอุปกรณ์ Bluetooth'),
+        @('lfsvc',            'Manual',   (-not $lap),          'Geolocation - Laptop เก็บไว้'),
+        @('CDPSvc',           'Manual',   $weak,                'เครื่องเบา - ลดงานเบื้องหลัง'),
+        @('WdiServiceHost',   'Manual',   $weak,                'เครื่องเบา - ลดงาน Diagnostics'),
+        @('WdiSystemHost',    'Manual',   $weak,                'เครื่องเบา - ลดงาน Diagnostics'),
+        @('TrkWks',           'Manual',   $weak,                'เครื่องเบา - ลดงานเบื้องหลัง')
+    )
+
+    foreach ($row in $plan) {
+        $name = $row[0]; $target = $row[1]; $cond = [bool]$row[2]; $why = $row[3]
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if (-not $svc) { continue }   # not on this Windows edition - nothing to do
+        if (-not $cond) { Add-NpDecision 'KEEP' "Service $name" "เก็บไว้: เงื่อนไขไม่ผ่านสำหรับเครื่องนี้ ($why)"; continue }
+        $running = @($svc.DependentServices | Where-Object { $_.Status -eq 'Running' })
+        if ($running.Count -gt 0) { Add-NpDecision 'KEEP' "Service $name" ('เก็บไว้: มี service อื่นพึ่งอยู่ (' + (($running | ForEach-Object Name) -join ', ') + ')'); continue }
+        if ([string]$svc.StartType -eq $target) { Add-NpDecision 'SKIP' "Service $name" "เป็น $target อยู่แล้ว"; continue }
+        $res = @(Set-SvcStart $name $target)
+        if ($res.Count -gt 0 -and $res[-1] -eq $true) { Add-NpDecision 'SET' "Service $name -> $target" $why }
+        else { Add-NpDecision 'FAIL' "Service $name" 'ตั้งค่าไม่สำเร็จ' }
+    }
+    Add-NpDecision 'KEEP' 'Services ที่ไม่แตะเลย' 'Xbox/GameBar (Game Pass, จอย), Windows Update, Audio, Network, Defender, Hyper-V/Virtualization, Print (ถ้ามีเครื่องพิมพ์)'
+}
+
+function Show-NpDecisionSummary {
+    Write-Host ""
+    Write-Host "  ---- สรุปการตัดสินใจ (ทำไมถึงปรับ / ทำไมถึงข้าม) ----" -ForegroundColor Cyan
+    foreach ($d in $script:NpDecisions) {
+        $color = switch ($d.Status) { 'SET' { 'Green' } 'FAIL' { 'Red' } 'KEEP' { 'Yellow' } default { 'DarkGray' } }
+        Write-Host ("  [{0,-4}] {1}  - {2}" -f $d.Status, $d.Item, $d.Detail) -ForegroundColor $color
+    }
+    $set = @($script:NpDecisions | Where-Object Status -eq 'SET').Count
+    $skip = @($script:NpDecisions | Where-Object { $_.Status -in @('SKIP','KEEP') }).Count
+    Write-Host ("  ปรับ {0} รายการ | ข้าม/คงไว้ {1} รายการ" -f $set, $skip) -ForegroundColor Cyan
+}
+
+function Invoke-CapabilityTuning {
+    param([Parameter(Mandatory)]$Hw)
+    $script:NpDecisions.Clear()
+    $p = Get-NpCapabilityProfile -Hw $Hw
+    Show-NpProfile -P $p
+    Invoke-NpPowerPlan -P $p
+    Invoke-NpGameProcessPriority -P $p
+    Invoke-NpMmcss -P $p
+    Invoke-NpGameMode -P $p
+    Invoke-NpServices -P $p
+    if ($p.SingleChannel) { Add-NpDecision 'KEEP' 'RAM single-channel' 'ซอฟต์แวร์แก้ไม่ได้ - ใส่แรมเพิ่มให้เป็น dual-channel ช่วย 1% low ได้มากกว่าทุกค่าที่ปรับ' }
+    if ($p.SystemFreePct -lt 15 -and $p.SystemDisk -ne 'HDD') { Add-NpDecision 'KEEP' 'ไดรฟ์ระบบเหลือน้อย' "เหลือ $($p.SystemFreePct)% - SSD ช้าลงเมื่อเต็ม เคลียร์พื้นที่ให้มากกว่า 15%" }
+    Show-NpDecisionSummary
+}
+
 function Invoke-DoEverything {
     if (-not $script:GuiWorker) { try { Clear-Host } catch {} }
     Write-Host ("   " + ("=" * 78)) -ForegroundColor Cyan
@@ -4801,6 +5097,7 @@ function Invoke-DoEverything {
     if (-not $script:BackupDir) { New-BackupFolder | Out-Null }
 
     $modules = @(
+        @{ Name = 'Capability tier tuning (priority/services/power)'; Enabled=($script:ApplyPlan.Core -or $script:ApplyPlan.CPU); Action = { Invoke-CapabilityTuning -Hw $hw } },
         @{ Name = 'CPU adaptive tweaks';     Enabled=$script:ApplyPlan.CPU; Action = { Invoke-CpuAdaptive -Cpu $hw.Cpu -IsLaptop $hw.IsLaptop } },
         @{ Name = 'GPU adaptive tweaks';     Enabled=$script:ApplyPlan.GPU; Action = { Invoke-GpuAdaptive -GpuList $hw.Gpu } },
         @{ Name = 'RAM adaptive tweaks';     Enabled=$script:ApplyPlan.RAM; Action = { Invoke-RamAdaptive -Ram $hw.Ram } },
